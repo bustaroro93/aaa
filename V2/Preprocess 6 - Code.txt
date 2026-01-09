@@ -1,0 +1,1089 @@
+# ===============================================
+# PREPROCESS 6 - H2H + TIEBREAK + BAGEL FEATURES
+# TennisTitan SOTA 2026 - GOD MODE
+# ===============================================
+#
+# Ce script génère les features les plus discriminantes
+# pour la prédiction tennis SOTA:
+#
+# 1. HEAD-TO-HEAD (H2H) Features:
+#    - Historique des confrontations directes
+#    - H2H par surface
+#    - H2H avec decay exponentiel (récence)
+#    - H2H dominance score
+#
+# 2. TIEBREAK Features:
+#    - Taux de victoire en tiebreak
+#    - Clutch performance (TB gagnés sous pression)
+#    - TB differential
+#
+# 3. BAGEL/BREADSTICK Features:
+#    - Taux de sets 6-0 donnés/reçus
+#    - Taux de sets 6-1 donnés/reçus
+#    - Dominance score
+#
+# Architecture: Anti-leakage strict (shift(1) avant rolling)
+# Format: Polars natif, partitionné par année
+# ===============================================
+
+from __future__ import annotations
+from pathlib import Path
+from datetime import datetime
+import time
+import json
+import numpy as np
+import polars as pl
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+MB_DIR_SCALED = DATA_CLEAN / "matches_base_scaled"
+MB_DIR_RAW = DATA_CLEAN / "matches_base"
+MB_DIR = MB_DIR_SCALED if MB_DIR_SCALED.exists() else MB_DIR_RAW
+
+FEATURES_DIR = DATA_CLEAN / "features"
+
+# Output directories
+OUT_H2H = FEATURES_DIR / "h2h_sota"
+OUT_TIEBREAK = FEATURES_DIR / "tiebreak_features"
+OUT_BAGEL = FEATURES_DIR / "bagel_features"
+
+for d in [OUT_H2H, OUT_TIEBREAK, OUT_BAGEL]:
+    d.mkdir(parents=True, exist_ok=True)
+
+GENDER = "atp"
+START_YEAR = 1990
+
+# H2H Parameters
+H2H_DECAY_HALFLIFE_DAYS = 365  # Demi-vie pour le decay exponentiel
+H2H_MIN_MATCHES = 1  # Minimum de matchs pour calculer H2H
+
+
+# ===============================================
+# SECTION 1: HEAD-TO-HEAD FEATURES
+# ===============================================
+
+def build_h2h_features(gender: str = GENDER) -> pl.DataFrame:
+    """
+    Calcule les features Head-to-Head entre joueurs.
+    
+    Features générées:
+    - h2h_matches: Nombre total de confrontations
+    - h2h_wins: Victoires du joueur
+    - h2h_win_rate: Taux de victoire H2H
+    - h2h_wins_surface: Victoires sur cette surface
+    - h2h_win_rate_surface: Taux de victoire sur cette surface
+    - h2h_last_5_wins: Victoires sur les 5 derniers H2H
+    - h2h_last_5_rate: Taux sur les 5 derniers
+    - h2h_weighted_wins: Victoires avec decay exponentiel
+    - h2h_weighted_rate: Taux avec decay
+    - h2h_dominance: Score de dominance (-1 à +1)
+    - h2h_streak: Série actuelle (positif = victoires, négatif = défaites)
+    - h2h_days_since_last: Jours depuis dernière confrontation
+    
+    ANTI-LEAKAGE: Toutes les features utilisent UNIQUEMENT les matchs AVANT le match courant.
+    """
+    t0 = time.perf_counter()
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 1: HEAD-TO-HEAD FEATURES (SOTA)")
+    print("=" * 70)
+    
+    # 1. Chargement
+    print("\n[1/6] Loading matches...")
+    df = pl.read_parquet(f"{MB_DIR}/**/*.parquet")
+    df = df.filter(
+        (pl.col("gender") == gender) &
+        (pl.col("year") >= START_YEAR) &
+        pl.col("winner_id").is_not_null() &
+        pl.col("loser_id").is_not_null()
+    )
+    
+    # Créer date si nécessaire
+    if "tourney_date_ta" in df.columns:
+        df = df.with_columns([
+            pl.col("tourney_date_ta").cast(pl.Date, strict=False).alias("match_date")
+        ])
+    elif "tourney_date_int" in df.columns:
+        df = df.with_columns([
+            pl.col("tourney_date_int").cast(pl.Utf8).str.strptime(pl.Date, "%Y%m%d", strict=False).alias("match_date")
+        ])
+    
+    df = df.sort(["match_date", "custom_match_id"])
+    print(f"  Matches: {len(df):,}")
+    
+    # 2. Créer pair_key (toujours alphabétique pour identifier la paire)
+    print("\n[2/6] Creating pair keys...")
+    df = df.with_columns([
+        pl.when(pl.col("winner_id") < pl.col("loser_id"))
+        .then(pl.col("winner_id") + "_vs_" + pl.col("loser_id"))
+        .otherwise(pl.col("loser_id") + "_vs_" + pl.col("winner_id"))
+        .alias("pair_key"),
+        
+        # winner_is_first: 1 si winner est le premier alphabétiquement
+        pl.when(pl.col("winner_id") < pl.col("loser_id"))
+        .then(pl.lit(1))
+        .otherwise(pl.lit(0))
+        .alias("winner_is_first")
+    ])
+    
+    # 3. Calculer H2H features par match (séquentiel pour éviter leakage)
+    print("\n[3/6] Computing H2H features (sequential - no leakage)...")
+    
+    # Colonnes nécessaires
+    matches_list = df.select([
+        "custom_match_id", "pair_key", "winner_id", "loser_id",
+        "winner_is_first", "match_date", "year",
+        "tourney_surface_ta"
+    ]).to_dicts()
+    
+    # Store pour H2H
+    h2h_store = {}  # {pair_key: list of (date, winner_is_first, surface)}
+    
+    results = []
+    
+    for i, match in enumerate(matches_list):
+        if i % 50000 == 0 and i > 0:
+            print(f"  Processed {i:,} / {len(matches_list):,}")
+        
+        pair_key = match["pair_key"]
+        winner_id = match["winner_id"]
+        loser_id = match["loser_id"]
+        winner_is_first = match["winner_is_first"]
+        match_date = match["match_date"]
+        surface = match.get("tourney_surface_ta", "Unknown")
+        year = match.get("year", 2000)
+        
+        # Récupérer historique AVANT ce match
+        history = h2h_store.get(pair_key, [])
+        
+        # Calculer features pour le joueur "first" (alphabétiquement premier)
+        # On calculera ensuite pour winner et loser
+        
+        if len(history) > 0:
+            # Total H2H
+            h2h_matches = len(history)
+            wins_first = sum(1 for h in history if h["winner_is_first"] == 1)
+            wins_second = h2h_matches - wins_first
+            
+            # Surface specific
+            history_surface = [h for h in history if h.get("surface") == surface]
+            h2h_matches_surface = len(history_surface)
+            wins_first_surface = sum(1 for h in history_surface if h["winner_is_first"] == 1)
+            wins_second_surface = h2h_matches_surface - wins_first_surface
+            
+            # Last 5
+            last_5 = history[-5:] if len(history) >= 5 else history
+            wins_first_last5 = sum(1 for h in last_5 if h["winner_is_first"] == 1)
+            wins_second_last5 = len(last_5) - wins_first_last5
+            
+            # Weighted by recency (exponential decay)
+            weighted_wins_first = 0.0
+            weighted_total = 0.0
+            
+            for h in history:
+                h_date = h["date"]
+                if h_date is not None and match_date is not None:
+                    try:
+                        days_ago = (match_date - h_date).days
+                        weight = 0.5 ** (days_ago / H2H_DECAY_HALFLIFE_DAYS)
+                    except:
+                        weight = 0.5
+                else:
+                    weight = 0.5
+                
+                weighted_total += weight
+                if h["winner_is_first"] == 1:
+                    weighted_wins_first += weight
+            
+            weighted_wins_second = weighted_total - weighted_wins_first
+            
+            # Streak (séquence actuelle)
+            streak_first = 0
+            for h in reversed(history):
+                if h["winner_is_first"] == 1:
+                    if streak_first >= 0:
+                        streak_first += 1
+                    else:
+                        break
+                else:
+                    if streak_first <= 0:
+                        streak_first -= 1
+                    else:
+                        break
+            streak_second = -streak_first
+            
+            # Days since last H2H
+            last_h2h_date = history[-1]["date"]
+            if last_h2h_date is not None and match_date is not None:
+                try:
+                    days_since_last = (match_date - last_h2h_date).days
+                except:
+                    days_since_last = None
+            else:
+                days_since_last = None
+            
+            # Features pour winner
+            if winner_is_first == 1:
+                h2h_wins_winner = wins_first
+                h2h_wins_loser = wins_second
+                h2h_wins_surface_winner = wins_first_surface
+                h2h_wins_surface_loser = wins_second_surface
+                h2h_wins_last5_winner = wins_first_last5
+                h2h_wins_last5_loser = wins_second_last5
+                h2h_weighted_winner = weighted_wins_first
+                h2h_weighted_loser = weighted_wins_second
+                h2h_streak_winner = streak_first
+                h2h_streak_loser = streak_second
+            else:
+                h2h_wins_winner = wins_second
+                h2h_wins_loser = wins_first
+                h2h_wins_surface_winner = wins_second_surface
+                h2h_wins_surface_loser = wins_first_surface
+                h2h_wins_last5_winner = wins_second_last5
+                h2h_wins_last5_loser = wins_first_last5
+                h2h_weighted_winner = weighted_wins_second
+                h2h_weighted_loser = weighted_wins_first
+                h2h_streak_winner = streak_second
+                h2h_streak_loser = streak_first
+            
+            # Rates
+            h2h_win_rate_winner = h2h_wins_winner / h2h_matches if h2h_matches > 0 else 0.5
+            h2h_win_rate_loser = h2h_wins_loser / h2h_matches if h2h_matches > 0 else 0.5
+            
+            h2h_win_rate_surface_winner = h2h_wins_surface_winner / h2h_matches_surface if h2h_matches_surface > 0 else 0.5
+            h2h_win_rate_surface_loser = h2h_wins_surface_loser / h2h_matches_surface if h2h_matches_surface > 0 else 0.5
+            
+            h2h_win_rate_last5_winner = h2h_wins_last5_winner / len(last_5) if len(last_5) > 0 else 0.5
+            h2h_win_rate_last5_loser = h2h_wins_last5_loser / len(last_5) if len(last_5) > 0 else 0.5
+            
+            h2h_weighted_rate_winner = h2h_weighted_winner / weighted_total if weighted_total > 0 else 0.5
+            h2h_weighted_rate_loser = h2h_weighted_loser / weighted_total if weighted_total > 0 else 0.5
+            
+            # Dominance score (-1 to +1)
+            h2h_dominance_winner = (h2h_win_rate_winner - 0.5) * 2
+            h2h_dominance_loser = (h2h_win_rate_loser - 0.5) * 2
+            
+        else:
+            # No H2H history
+            h2h_matches = 0
+            h2h_matches_surface = 0
+            h2h_wins_winner = 0
+            h2h_wins_loser = 0
+            h2h_wins_surface_winner = 0
+            h2h_wins_surface_loser = 0
+            h2h_wins_last5_winner = 0
+            h2h_wins_last5_loser = 0
+            h2h_weighted_winner = 0.0
+            h2h_weighted_loser = 0.0
+            h2h_streak_winner = 0
+            h2h_streak_loser = 0
+            h2h_win_rate_winner = 0.5
+            h2h_win_rate_loser = 0.5
+            h2h_win_rate_surface_winner = 0.5
+            h2h_win_rate_surface_loser = 0.5
+            h2h_win_rate_last5_winner = 0.5
+            h2h_win_rate_last5_loser = 0.5
+            h2h_weighted_rate_winner = 0.5
+            h2h_weighted_rate_loser = 0.5
+            h2h_dominance_winner = 0.0
+            h2h_dominance_loser = 0.0
+            days_since_last = None
+        
+        # Append result
+        results.append({
+            "custom_match_id": match["custom_match_id"],
+            "winner_id": winner_id,
+            "loser_id": loser_id,
+            "year": year,
+            
+            # H2H counts
+            "h2h_matches": h2h_matches,
+            "h2h_matches_surface": h2h_matches_surface,
+            
+            # Winner features
+            "h2h_wins_winner": h2h_wins_winner,
+            "h2h_win_rate_winner": h2h_win_rate_winner,
+            "h2h_wins_surface_winner": h2h_wins_surface_winner,
+            "h2h_win_rate_surface_winner": h2h_win_rate_surface_winner,
+            "h2h_wins_last5_winner": h2h_wins_last5_winner,
+            "h2h_win_rate_last5_winner": h2h_win_rate_last5_winner,
+            "h2h_weighted_wins_winner": h2h_weighted_winner,
+            "h2h_weighted_rate_winner": h2h_weighted_rate_winner,
+            "h2h_streak_winner": h2h_streak_winner,
+            "h2h_dominance_winner": h2h_dominance_winner,
+            
+            # Loser features
+            "h2h_wins_loser": h2h_wins_loser,
+            "h2h_win_rate_loser": h2h_win_rate_loser,
+            "h2h_wins_surface_loser": h2h_wins_surface_loser,
+            "h2h_win_rate_surface_loser": h2h_win_rate_surface_loser,
+            "h2h_wins_last5_loser": h2h_wins_last5_loser,
+            "h2h_win_rate_last5_loser": h2h_win_rate_last5_loser,
+            "h2h_weighted_wins_loser": h2h_weighted_loser,
+            "h2h_weighted_rate_loser": h2h_weighted_rate_loser,
+            "h2h_streak_loser": h2h_streak_loser,
+            "h2h_dominance_loser": h2h_dominance_loser,
+            
+            # Shared
+            "h2h_days_since_last": days_since_last,
+        })
+        
+        # Update store AFTER recording features (anti-leakage)
+        if pair_key not in h2h_store:
+            h2h_store[pair_key] = []
+        h2h_store[pair_key].append({
+            "date": match_date,
+            "winner_is_first": winner_is_first,
+            "surface": surface
+        })
+    
+    print(f"  Generated {len(results):,} H2H records")
+    
+    # 4. Convert to DataFrame
+    print("\n[4/6] Converting to DataFrame...")
+    out_df = pl.DataFrame(results)
+    
+    # 5. Add derived features
+    print("\n[5/6] Adding derived features...")
+    out_df = out_df.with_columns([
+        # Has H2H history flag
+        (pl.col("h2h_matches") > 0).cast(pl.Int8).alias("has_h2h_history"),
+        
+        # H2H advantage (winner - loser win rate)
+        (pl.col("h2h_win_rate_winner") - pl.col("h2h_win_rate_loser")).alias("h2h_advantage_winner"),
+        
+        # H2H experience diff
+        (pl.col("h2h_wins_winner") - pl.col("h2h_wins_loser")).alias("h2h_experience_diff"),
+        
+        # Recent form diff (last 5)
+        (pl.col("h2h_win_rate_last5_winner") - pl.col("h2h_win_rate_last5_loser")).alias("h2h_recent_form_diff"),
+        
+        # Weighted momentum diff
+        (pl.col("h2h_weighted_rate_winner") - pl.col("h2h_weighted_rate_loser")).alias("h2h_momentum_diff"),
+    ])
+    
+    # Add gender
+    out_df = out_df.with_columns([pl.lit(gender).alias("gender")])
+    
+    # Cast types
+    float_cols = [c for c in out_df.columns if any(x in c for x in ["rate", "weighted", "dominance", "advantage", "diff", "momentum"])]
+    for c in float_cols:
+        out_df = out_df.with_columns([pl.col(c).cast(pl.Float32)])
+    
+    int_cols = [c for c in out_df.columns if any(x in c for x in ["wins", "matches", "streak", "last5"]) and "rate" not in c]
+    for c in int_cols:
+        if c in out_df.columns:
+            out_df = out_df.with_columns([pl.col(c).cast(pl.Int32)])
+    
+    # 6. Write output
+    print("\n[6/6] Writing output...")
+    out_df.write_parquet(OUT_H2H, partition_by=["gender", "year"], compression="zstd")
+    
+    elapsed = time.perf_counter() - t0
+    print(f"\n✅ H2H features → {OUT_H2H}")
+    print(f"   Shape: {out_df.shape}")
+    print(f"   Features: {len([c for c in out_df.columns if c.startswith('h2h_')])}")
+    
+    # Sanity check
+    print(f"\n📊 SANITY CHECK:")
+    print(f"   h2h_matches: min={out_df['h2h_matches'].min()}, max={out_df['h2h_matches'].max()}, mean={out_df['h2h_matches'].mean():.2f}")
+    print(f"   has_h2h_history: {out_df['has_h2h_history'].sum():,} / {len(out_df):,} ({100*out_df['has_h2h_history'].mean():.1f}%)")
+    print(f"   Time: {elapsed:.1f}s")
+    
+    return out_df
+
+
+# ===============================================
+# SECTION 2: TIEBREAK FEATURES
+# ===============================================
+
+def build_tiebreak_features(gender: str = GENDER) -> pl.DataFrame:
+    """
+    Calcule les features de performance en tiebreak.
+    
+    Features générées (par joueur):
+    - tb_played_total: Nombre de tiebreaks joués
+    - tb_won_total: Nombre de tiebreaks gagnés
+    - tb_win_rate: Taux de victoire en TB
+    - tb_win_rate_r10: Taux sur les 10 derniers matchs avec TB
+    - tb_win_rate_r20: Taux sur les 20 derniers matchs avec TB
+    - tb_clutch_score: Performance sous pression (TB dans sets décisifs)
+    - tb_per_match: Moyenne de TB par match
+    - tb_momentum: Trend récent (+/-)
+    
+    ANTI-LEAKAGE: shift(1) avant tout rolling.
+    """
+    t0 = time.perf_counter()
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 2: TIEBREAK FEATURES (SOTA)")
+    print("=" * 70)
+    
+    # 1. Chargement
+    print("\n[1/5] Loading matches...")
+    df = pl.read_parquet(f"{MB_DIR}/**/*.parquet")
+    df = df.filter(
+        (pl.col("gender") == gender) &
+        (pl.col("year") >= START_YEAR)
+    )
+    print(f"  Matches: {len(df):,}")
+    
+    # 2. Parser le score pour extraire les tiebreaks
+    print("\n[2/5] Parsing scores for tiebreaks...")
+    
+    # Fonction pour compter les tiebreaks dans un score
+    # Score format: "6-4 7-6(5) 6-3" → 1 TB pour le joueur qui a gagné 7-6
+    
+    def parse_tiebreaks(score_str: str) -> tuple:
+        """
+        Parse score string and return (tb_won_winner, tb_won_loser, tb_total)
+        """
+        if score_str is None or not isinstance(score_str, str):
+            return (0, 0, 0)
+        
+        tb_winner = 0
+        tb_loser = 0
+        
+        sets = score_str.replace("RET", "").replace("W/O", "").strip().split()
+        
+        for s in sets:
+            # Check for tiebreak patterns
+            if "(" in s or "7-6" in s or "6-7" in s:
+                # Determine who won this set
+                try:
+                    parts = s.replace("(", "-").replace(")", "").split("-")
+                    if len(parts) >= 2:
+                        g1, g2 = int(parts[0]), int(parts[1])
+                        if g1 == 7 and g2 == 6:
+                            tb_winner += 1
+                        elif g1 == 6 and g2 == 7:
+                            tb_loser += 1
+                except:
+                    pass
+        
+        return (tb_winner, tb_loser, tb_winner + tb_loser)
+    
+    # Apply parsing
+    scores = df.select("score_ta").to_series().to_list()
+    parsed = [parse_tiebreaks(s) for s in scores]
+    
+    df = df.with_columns([
+        pl.Series("tb_won_winner", [p[0] for p in parsed]).cast(pl.Int8),
+        pl.Series("tb_won_loser", [p[1] for p in parsed]).cast(pl.Int8),
+        pl.Series("tb_total", [p[2] for p in parsed]).cast(pl.Int8),
+    ])
+    
+    tb_matches = df.filter(pl.col("tb_total") > 0).height
+    print(f"  Matches with tiebreaks: {tb_matches:,} ({100*tb_matches/len(df):.1f}%)")
+    
+    # 3. Create long format (player-level)
+    print("\n[3/5] Creating player-level features...")
+    
+    winner = df.select([
+        pl.col("custom_match_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("tb_won_winner").alias("tb_won"),
+        pl.col("tb_won_loser").alias("tb_lost"),
+        pl.col("tb_total"),
+        pl.col("best_of_ta"),
+        pl.col("score_ta"),
+    ])
+    
+    loser = df.select([
+        pl.col("custom_match_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("tb_won_loser").alias("tb_won"),
+        pl.col("tb_won_winner").alias("tb_lost"),
+        pl.col("tb_total"),
+        pl.col("best_of_ta"),
+        pl.col("score_ta"),
+    ])
+    
+    player_df = pl.concat([winner, loser])
+    player_df = player_df.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date, strict=False)
+    ])
+    player_df = player_df.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    
+    # 4. Calculate rolling features
+    print("\n[4/5] Computing rolling tiebreak features...")
+    
+    # ✅ ANTI-LEAKAGE: shift(1) before any rolling
+    player_df = player_df.with_columns([
+        pl.col("tb_won").shift(1).over("player_id").alias("tb_won_prev"),
+        pl.col("tb_lost").shift(1).over("player_id").alias("tb_lost_prev"),
+        pl.col("tb_total").shift(1).over("player_id").alias("tb_total_prev"),
+    ])
+    
+    # Cumulative stats
+    player_df = player_df.with_columns([
+        pl.col("tb_won_prev").cum_sum().over("player_id").alias("tb_won_cumsum"),
+        pl.col("tb_lost_prev").cum_sum().over("player_id").alias("tb_lost_cumsum"),
+        pl.col("tb_total_prev").cum_sum().over("player_id").alias("tb_total_cumsum"),
+    ])
+    
+    # Win rate (overall)
+    player_df = player_df.with_columns([
+        (pl.col("tb_won_cumsum") / (pl.col("tb_won_cumsum") + pl.col("tb_lost_cumsum") + 1e-6))
+        .fill_null(0.5)
+        .alias("tb_win_rate")
+    ])
+    
+    # Rolling window features (on matches with TBs)
+    # Mark matches with TBs
+    player_df = player_df.with_columns([
+        (pl.col("tb_total_prev") > 0).cast(pl.Int8).alias("had_tb_prev")
+    ])
+    
+    # Rolling 10 and 20 (approximation using all matches, weighted by TB count)
+    for w in [10, 20]:
+        player_df = player_df.with_columns([
+            pl.col("tb_won_prev")
+            .rolling_sum(window_size=w, min_periods=1)
+            .over("player_id")
+            .alias(f"tb_won_r{w}"),
+            
+            (pl.col("tb_won_prev") + pl.col("tb_lost_prev"))
+            .rolling_sum(window_size=w, min_periods=1)
+            .over("player_id")
+            .alias(f"tb_played_r{w}"),
+        ])
+        
+        player_df = player_df.with_columns([
+            (pl.col(f"tb_won_r{w}") / (pl.col(f"tb_played_r{w}") + 1e-6))
+            .fill_null(0.5)
+            .clip(0.0, 1.0)
+            .alias(f"tb_win_rate_r{w}")
+        ])
+    
+    # TB per match
+    player_df = player_df.with_columns([
+        pl.lit(1).alias("_one")
+    ])
+    player_df = player_df.with_columns([
+        pl.col("_one").cum_sum().over("player_id").alias("match_count")
+    ])
+    player_df = player_df.with_columns([
+        (pl.col("tb_total_cumsum") / (pl.col("match_count") + 1e-6))
+        .fill_null(0.0)
+        .alias("tb_per_match")
+    ])
+    
+    # Momentum (recent trend)
+    player_df = player_df.with_columns([
+        (pl.col("tb_win_rate_r10") - pl.col("tb_win_rate_r20"))
+        .fill_null(0.0)
+        .alias("tb_momentum")
+    ])
+    
+    # Clutch score (simplified: high TB win rate = clutch)
+    player_df = player_df.with_columns([
+        (pl.col("tb_win_rate") * 2 - 1)  # -1 to +1 scale
+        .fill_null(0.0)
+        .alias("tb_clutch_score")
+    ])
+    
+    # 5. Output
+    print("\n[5/5] Writing output...")
+    
+    output_cols = [
+        "custom_match_id", "player_id", "year",
+        "tb_won_cumsum", "tb_lost_cumsum", "tb_total_cumsum",
+        "tb_win_rate", "tb_win_rate_r10", "tb_win_rate_r20",
+        "tb_per_match", "tb_momentum", "tb_clutch_score"
+    ]
+    output_cols = [c for c in output_cols if c in player_df.columns]
+    
+    out_df = player_df.select(output_cols)
+    out_df = out_df.with_columns([pl.lit(gender).alias("gender")])
+    out_df = out_df.unique(subset=["custom_match_id", "player_id"], keep="last")
+    
+    # Cast to float
+    float_cols = [c for c in out_df.columns if "rate" in c or "score" in c or "momentum" in c or "per_" in c]
+    for c in float_cols:
+        out_df = out_df.with_columns([pl.col(c).cast(pl.Float32)])
+    
+    out_df.write_parquet(OUT_TIEBREAK, partition_by=["gender", "year"], compression="zstd")
+    
+    elapsed = time.perf_counter() - t0
+    print(f"\n✅ Tiebreak features → {OUT_TIEBREAK}")
+    print(f"   Shape: {out_df.shape}")
+    
+    print(f"\n📊 SANITY CHECK:")
+    print(f"   tb_win_rate: mean={out_df['tb_win_rate'].mean():.3f} (attendu: ~0.5)")
+    print(f"   tb_per_match: mean={out_df['tb_per_match'].mean():.3f}")
+    print(f"   Time: {elapsed:.1f}s")
+    
+    return out_df
+
+
+# ===============================================
+# SECTION 3: BAGEL/BREADSTICK FEATURES
+# ===============================================
+
+def build_bagel_features(gender: str = GENDER) -> pl.DataFrame:
+    """
+    Calcule les features de domination (bagels et breadsticks).
+    
+    Définitions:
+    - Bagel: Set 6-0
+    - Breadstick: Set 6-1
+    
+    Features générées (par joueur):
+    - bagel_given_total: Nombre de 6-0 infligés
+    - bagel_received_total: Nombre de 6-0 subis
+    - bagel_given_rate: Taux de sets 6-0 infligés
+    - bagel_received_rate: Taux de sets 6-0 subis
+    - breadstick_given_rate: Taux de 6-1 infligés
+    - breadstick_received_rate: Taux de 6-1 subis
+    - dominance_score: Score de domination (bagels donnés - reçus)
+    - crushing_ability: Capacité à écraser (bagels + breadsticks donnés)
+    - vulnerability_score: Vulnérabilité (bagels + breadsticks reçus)
+    
+    ANTI-LEAKAGE: shift(1) avant tout rolling.
+    """
+    t0 = time.perf_counter()
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 3: BAGEL/BREADSTICK FEATURES (SOTA)")
+    print("=" * 70)
+    
+    # 1. Chargement
+    print("\n[1/5] Loading matches...")
+    df = pl.read_parquet(f"{MB_DIR}/**/*.parquet")
+    df = df.filter(
+        (pl.col("gender") == gender) &
+        (pl.col("year") >= START_YEAR)
+    )
+    print(f"  Matches: {len(df):,}")
+    
+    # 2. Parser le score pour bagels/breadsticks
+    print("\n[2/5] Parsing scores for bagels/breadsticks...")
+    
+    def parse_domination(score_str: str) -> dict:
+        """
+        Parse score and return bagel/breadstick counts.
+        Returns dict with winner and loser stats.
+        """
+        result = {
+            "bagel_given_winner": 0,
+            "bagel_received_winner": 0,
+            "breadstick_given_winner": 0,
+            "breadstick_received_winner": 0,
+            "sets_won_winner": 0,
+            "sets_won_loser": 0,
+        }
+        
+        if score_str is None or not isinstance(score_str, str):
+            return result
+        
+        sets = score_str.replace("RET", "").replace("W/O", "").strip().split()
+        
+        for s in sets:
+            try:
+                # Remove tiebreak notation
+                s_clean = s.split("(")[0]
+                parts = s_clean.split("-")
+                
+                if len(parts) >= 2:
+                    g1, g2 = int(parts[0]), int(parts[1])
+                    
+                    if g1 > g2:
+                        result["sets_won_winner"] += 1
+                    else:
+                        result["sets_won_loser"] += 1
+                    
+                    # Bagel (6-0)
+                    if g1 == 6 and g2 == 0:
+                        result["bagel_given_winner"] += 1
+                        result["bagel_received_winner"] += 0  # loser perspective
+                    elif g1 == 0 and g2 == 6:
+                        result["bagel_received_winner"] += 1
+                        
+                    # Breadstick (6-1)
+                    if g1 == 6 and g2 == 1:
+                        result["breadstick_given_winner"] += 1
+                    elif g1 == 1 and g2 == 6:
+                        result["breadstick_received_winner"] += 1
+                        
+            except:
+                pass
+        
+        return result
+    
+    # Apply parsing
+    scores = df.select("score_ta").to_series().to_list()
+    parsed = [parse_domination(s) for s in scores]
+    
+    # Add columns
+    df = df.with_columns([
+        pl.Series("bagel_given_winner", [p["bagel_given_winner"] for p in parsed]).cast(pl.Int8),
+        pl.Series("bagel_received_winner", [p["bagel_received_winner"] for p in parsed]).cast(pl.Int8),
+        pl.Series("breadstick_given_winner", [p["breadstick_given_winner"] for p in parsed]).cast(pl.Int8),
+        pl.Series("breadstick_received_winner", [p["breadstick_received_winner"] for p in parsed]).cast(pl.Int8),
+        pl.Series("sets_played", [p["sets_won_winner"] + p["sets_won_loser"] for p in parsed]).cast(pl.Int8),
+    ])
+    
+    # Stats
+    bagel_matches = df.filter((pl.col("bagel_given_winner") > 0) | (pl.col("bagel_received_winner") > 0)).height
+    print(f"  Matches with bagels: {bagel_matches:,} ({100*bagel_matches/len(df):.1f}%)")
+    
+    # 3. Create long format
+    print("\n[3/5] Creating player-level features...")
+    
+    winner = df.select([
+        pl.col("custom_match_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("bagel_given_winner").alias("bagel_given"),
+        pl.col("bagel_received_winner").alias("bagel_received"),
+        pl.col("breadstick_given_winner").alias("breadstick_given"),
+        pl.col("breadstick_received_winner").alias("breadstick_received"),
+        pl.col("sets_played"),
+    ])
+    
+    # For loser: swap given/received
+    loser = df.select([
+        pl.col("custom_match_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("bagel_received_winner").alias("bagel_given"),  # Swapped
+        pl.col("bagel_given_winner").alias("bagel_received"),  # Swapped
+        pl.col("breadstick_received_winner").alias("breadstick_given"),
+        pl.col("breadstick_given_winner").alias("breadstick_received"),
+        pl.col("sets_played"),
+    ])
+    
+    player_df = pl.concat([winner, loser])
+    player_df = player_df.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date, strict=False)
+    ])
+    player_df = player_df.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    
+    # 4. Calculate rolling features
+    print("\n[4/5] Computing rolling bagel features...")
+    
+    # ✅ ANTI-LEAKAGE: shift(1) before rolling
+    for col in ["bagel_given", "bagel_received", "breadstick_given", "breadstick_received", "sets_played"]:
+        player_df = player_df.with_columns([
+            pl.col(col).shift(1).over("player_id").alias(f"{col}_prev")
+        ])
+    
+    # Cumulative sums
+    player_df = player_df.with_columns([
+        pl.col("bagel_given_prev").cum_sum().over("player_id").alias("bagel_given_cumsum"),
+        pl.col("bagel_received_prev").cum_sum().over("player_id").alias("bagel_received_cumsum"),
+        pl.col("breadstick_given_prev").cum_sum().over("player_id").alias("breadstick_given_cumsum"),
+        pl.col("breadstick_received_prev").cum_sum().over("player_id").alias("breadstick_received_cumsum"),
+        pl.col("sets_played_prev").cum_sum().over("player_id").alias("sets_played_cumsum"),
+    ])
+    
+    # Rates (per set played)
+    player_df = player_df.with_columns([
+        (pl.col("bagel_given_cumsum") / (pl.col("sets_played_cumsum") + 1e-6))
+        .fill_null(0.0).alias("bagel_given_rate"),
+        
+        (pl.col("bagel_received_cumsum") / (pl.col("sets_played_cumsum") + 1e-6))
+        .fill_null(0.0).alias("bagel_received_rate"),
+        
+        (pl.col("breadstick_given_cumsum") / (pl.col("sets_played_cumsum") + 1e-6))
+        .fill_null(0.0).alias("breadstick_given_rate"),
+        
+        (pl.col("breadstick_received_cumsum") / (pl.col("sets_played_cumsum") + 1e-6))
+        .fill_null(0.0).alias("breadstick_received_rate"),
+    ])
+    
+    # Rolling 20 matches
+    for col in ["bagel_given_prev", "bagel_received_prev", "breadstick_given_prev", "breadstick_received_prev"]:
+        player_df = player_df.with_columns([
+            pl.col(col)
+            .rolling_sum(window_size=20, min_periods=1)
+            .over("player_id")
+            .alias(f"{col.replace('_prev', '')}_r20")
+        ])
+    
+    player_df = player_df.with_columns([
+        pl.col("sets_played_prev")
+        .rolling_sum(window_size=20, min_periods=1)
+        .over("player_id")
+        .alias("sets_played_r20")
+    ])
+    
+    # Rolling rates
+    player_df = player_df.with_columns([
+        (pl.col("bagel_given_r20") / (pl.col("sets_played_r20") + 1e-6))
+        .fill_null(0.0).alias("bagel_given_rate_r20"),
+        
+        (pl.col("bagel_received_r20") / (pl.col("sets_played_r20") + 1e-6))
+        .fill_null(0.0).alias("bagel_received_rate_r20"),
+    ])
+    
+    # Derived features
+    player_df = player_df.with_columns([
+        # Dominance score: bagels given - received (normalized)
+        (pl.col("bagel_given_rate") - pl.col("bagel_received_rate"))
+        .alias("bagel_dominance_score"),
+        
+        # Crushing ability: bagels + breadsticks given
+        (pl.col("bagel_given_rate") + pl.col("breadstick_given_rate"))
+        .alias("crushing_ability"),
+        
+        # Vulnerability: bagels + breadsticks received
+        (pl.col("bagel_received_rate") + pl.col("breadstick_received_rate"))
+        .alias("vulnerability_score"),
+        
+        # Net dominance
+        ((pl.col("bagel_given_rate") + pl.col("breadstick_given_rate")) - 
+         (pl.col("bagel_received_rate") + pl.col("breadstick_received_rate")))
+        .alias("net_dominance_score"),
+    ])
+    
+    # 5. Output
+    print("\n[5/5] Writing output...")
+    
+    output_cols = [
+        "custom_match_id", "player_id", "year",
+        "bagel_given_cumsum", "bagel_received_cumsum",
+        "breadstick_given_cumsum", "breadstick_received_cumsum",
+        "bagel_given_rate", "bagel_received_rate",
+        "breadstick_given_rate", "breadstick_received_rate",
+        "bagel_given_rate_r20", "bagel_received_rate_r20",
+        "bagel_dominance_score", "crushing_ability",
+        "vulnerability_score", "net_dominance_score"
+    ]
+    output_cols = [c for c in output_cols if c in player_df.columns]
+    
+    out_df = player_df.select(output_cols)
+    out_df = out_df.with_columns([pl.lit(gender).alias("gender")])
+    out_df = out_df.unique(subset=["custom_match_id", "player_id"], keep="last")
+    
+    # Cast to float
+    float_cols = [c for c in out_df.columns if "rate" in c or "score" in c or "ability" in c or "dominance" in c or "vulnerability" in c]
+    for c in float_cols:
+        out_df = out_df.with_columns([pl.col(c).cast(pl.Float32)])
+    
+    out_df.write_parquet(OUT_BAGEL, partition_by=["gender", "year"], compression="zstd")
+    
+    elapsed = time.perf_counter() - t0
+    print(f"\n✅ Bagel features → {OUT_BAGEL}")
+    print(f"   Shape: {out_df.shape}")
+    
+    print(f"\n📊 SANITY CHECK:")
+    print(f"   bagel_given_rate: mean={out_df['bagel_given_rate'].mean():.4f}")
+    print(f"   bagel_received_rate: mean={out_df['bagel_received_rate'].mean():.4f}")
+    print(f"   net_dominance_score: mean={out_df['net_dominance_score'].mean():.4f} (attendu: ~0)")
+    print(f"   Time: {elapsed:.1f}s")
+    
+    return out_df
+
+
+# ===============================================
+# SECTION 4: MERGE INTO ML-READY
+# ===============================================
+
+def merge_new_features_to_ml_ready():
+    """
+    Merge les nouvelles features dans le dataset ML-ready SOTA_v2.
+    Output: SOTA_v3 (inclut PP_05 + PP_06)
+    """
+    print("\n" + "=" * 70)
+    print("   SECTION 4: MERGE NEW FEATURES TO ML-READY SOTA")
+    print("=" * 70)
+    
+    # ✅ CHANGÉ: Utiliser SOTA_v2 comme base (inclut déjà PP_05)
+    ML_READY_PATH = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v2.parquet"
+    
+    if not ML_READY_PATH.exists():
+        # Fallback sur SOTA ou base
+        for fallback in ["matches_ml_ready_SOTA.parquet", "matches_ml_ready.parquet"]:
+            alt_path = DATA_CLEAN / "ml_ready" / fallback
+            if alt_path.exists():
+                ML_READY_PATH = alt_path
+                print(f"  ⚠️ Using fallback: {fallback}")
+                break
+    
+    print(f"\n[1/4] Loading ML-ready dataset: {ML_READY_PATH.name}")
+    ml_df = pl.read_parquet(ML_READY_PATH)
+    original_cols = len(ml_df.columns)
+    print(f"  Shape: {ml_df.shape}")
+    
+    # Load H2H
+    print("\n[2/4] Merging H2H features...")
+    if OUT_H2H.exists():
+        h2h = pl.read_parquet(f"{OUT_H2H}/**/*.parquet")
+        
+        # H2H is at match level with winner/loser columns
+        h2h_cols = [c for c in h2h.columns if c.startswith("h2h_") or c.startswith("has_h2h")]
+        
+        # Rename for A/B format
+        h2h_A = h2h.select(["custom_match_id"] + [c for c in h2h_cols if "winner" in c])
+        rename_A = {c: c.replace("_winner", "_A") for c in h2h_A.columns if "winner" in c}
+        h2h_A = h2h_A.rename(rename_A)
+        
+        h2h_B = h2h.select(["custom_match_id"] + [c for c in h2h_cols if "loser" in c])
+        rename_B = {c: c.replace("_loser", "_B") for c in h2h_B.columns if "loser" in c}
+        h2h_B = h2h_B.rename(rename_B)
+        
+        # Also get shared columns
+        h2h_shared = h2h.select(["custom_match_id", "h2h_matches", "h2h_matches_surface", 
+                                  "h2h_days_since_last", "has_h2h_history"])
+        h2h_shared = h2h_shared.unique(subset=["custom_match_id"], keep="first")
+        
+        # Merge
+        ml_df = ml_df.join(h2h_shared, on="custom_match_id", how="left")
+        ml_df = ml_df.join(h2h_A.unique(subset=["custom_match_id"], keep="first"), on="custom_match_id", how="left")
+        ml_df = ml_df.join(h2h_B.unique(subset=["custom_match_id"], keep="first"), on="custom_match_id", how="left")
+        
+        print(f"  ✅ H2H merged: +{len([c for c in ml_df.columns if 'h2h' in c])} columns")
+    
+    # Load Tiebreak
+    print("\n[3/4] Merging Tiebreak features...")
+    if OUT_TIEBREAK.exists():
+        tb = pl.read_parquet(f"{OUT_TIEBREAK}/**/*.parquet")
+        
+        tb_cols = [c for c in tb.columns if c.startswith("tb_")]
+        
+        if "winner_id" in ml_df.columns:
+            # Winner (A)
+            tb_A = tb.select(["custom_match_id", "player_id"] + tb_cols)
+            rename_A = {c: f"{c}_A" for c in tb_cols}
+            tb_A = tb_A.rename(rename_A).rename({"player_id": "winner_id"})
+            ml_df = ml_df.join(tb_A.unique(subset=["custom_match_id", "winner_id"], keep="first"),
+                               on=["custom_match_id", "winner_id"], how="left")
+            
+            # Loser (B)
+            tb_B = tb.select(["custom_match_id", "player_id"] + tb_cols)
+            rename_B = {c: f"{c}_B" for c in tb_cols}
+            tb_B = tb_B.rename(rename_B).rename({"player_id": "loser_id"})
+            ml_df = ml_df.join(tb_B.unique(subset=["custom_match_id", "loser_id"], keep="first"),
+                               on=["custom_match_id", "loser_id"], how="left")
+            
+            print(f"  ✅ Tiebreak merged: +{len(tb_cols) * 2} columns")
+    
+    # Load Bagel
+    print("\n[4/4] Merging Bagel features...")
+    if OUT_BAGEL.exists():
+        bagel = pl.read_parquet(f"{OUT_BAGEL}/**/*.parquet")
+        
+        bagel_cols = [c for c in bagel.columns if any(x in c for x in ["bagel", "breadstick", "crushing", "vulnerability", "dominance"])]
+        
+        if "winner_id" in ml_df.columns:
+            # Winner (A)
+            bagel_A = bagel.select(["custom_match_id", "player_id"] + bagel_cols)
+            rename_A = {c: f"{c}_A" for c in bagel_cols}
+            bagel_A = bagel_A.rename(rename_A).rename({"player_id": "winner_id"})
+            ml_df = ml_df.join(bagel_A.unique(subset=["custom_match_id", "winner_id"], keep="first"),
+                               on=["custom_match_id", "winner_id"], how="left")
+            
+            # Loser (B)
+            bagel_B = bagel.select(["custom_match_id", "player_id"] + bagel_cols)
+            rename_B = {c: f"{c}_B" for c in bagel_cols}
+            bagel_B = bagel_B.rename(rename_B).rename({"player_id": "loser_id"})
+            ml_df = ml_df.join(bagel_B.unique(subset=["custom_match_id", "loser_id"], keep="first"),
+                               on=["custom_match_id", "loser_id"], how="left")
+            
+            print(f"  ✅ Bagel merged: +{len(bagel_cols) * 2} columns")
+    
+    # ✅ CHANGÉ: Output = SOTA_v3
+    output_path = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v3.parquet"
+    ml_df.write_parquet(output_path, compression="zstd")
+    
+    new_cols = len(ml_df.columns) - original_cols
+    print(f"\n✅ Updated ML-ready saved: {output_path}")
+    print(f"   Shape: {ml_df.shape} (+{new_cols} new columns)")
+    
+    # Summary
+    print("\n📊 NEW FEATURES SUMMARY:")
+    for prefix, name in [("h2h_", "H2H"), ("tb_", "Tiebreak"), ("bagel_", "Bagel"), ("breadstick_", "Breadstick")]:
+        cols = [c for c in ml_df.columns if c.startswith(prefix)]
+        if cols:
+            print(f"   {name}: {len(cols)} features")
+    
+    return ml_df
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    """Execute all feature generation."""
+    t_total = time.perf_counter()
+    
+    print("\n" + "=" * 70)
+    print("   PREPROCESS 6 - H2H + TIEBREAK + BAGEL")
+    print("   TennisTitan SOTA 2026 - GOD MODE")
+    print("=" * 70)
+    print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   Gender: {GENDER}")
+    print("=" * 70)
+    
+    # Section 1: H2H
+    build_h2h_features(GENDER)
+    
+    # Section 2: Tiebreak
+    build_tiebreak_features(GENDER)
+    
+    # Section 3: Bagel
+    build_bagel_features(GENDER)
+    
+    # Section 4: Merge (optional - can be done in preprocess 2.2)
+    print("\n" + "=" * 70)
+    print("   MERGE TO ML-READY (OPTIONAL)")
+    print("=" * 70)
+    print("\n  To merge these features into your ML-ready dataset, run:")
+    print("  >>> merge_new_features_to_ml_ready()")
+    print("\n  Or re-run preprocess 2.2 after adding these feature paths.")
+    
+    elapsed_total = time.perf_counter() - t_total
+    
+    # AJOUTER À LA FIN:
+    print("\n[AUTO-MERGE] Merging to SOTA_v3...")
+    merge_new_features_to_ml_ready()  # ← AJOUTER
+    
+    print("\n" + "=" * 70)
+    print("   ✅ ALL FEATURES GENERATED!")
+    print("=" * 70)
+    
+    print("\n📊 Features created:")
+    for name, path in [
+        ("H2H", OUT_H2H),
+        ("Tiebreak", OUT_TIEBREAK),
+        ("Bagel", OUT_BAGEL),
+    ]:
+        if path.exists():
+            n_files = len(list(path.rglob("*.parquet")))
+            print(f"  • {name}: {n_files} files → {path}")
+    
+    print(f"\n⏱️  Total time: {elapsed_total:.1f}s ({elapsed_total / 60:.1f} min)")
+    
+    print("""
+📋 NEXT STEPS:
+
+1. Option A: Re-run preprocess 2.2 (will auto-merge if paths are added)
+   - Add these paths to Preprocess 2.2:
+     H2H_DIR = FEATURES_DIR / "h2h_sota"
+     TIEBREAK_DIR = FEATURES_DIR / "tiebreak_features"
+     BAGEL_DIR = FEATURES_DIR / "bagel_features"
+
+2. Option B: Run merge_new_features_to_ml_ready() 
+   - Quick merge into existing ML-ready file
+   
+3. Then re-run preprocess 3 and training
+
+Expected improvement: +0.5-1% AUC from H2H features alone!
+""")
+
+
+if __name__ == "__main__":
+    main()

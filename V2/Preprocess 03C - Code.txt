@@ -1,0 +1,255 @@
+"""
+===============================================
+PP08F - GLICKO VS OPPONENT HAND
+===============================================
+À exécuter APRÈS:
+- PP02 (crée g2_vs_lefty_L/R/U_rating)
+- PP03B (crée hand_A, hand_B)
+
+Cette feature capture l'avantage d'un joueur habitué
+aux gauchers face à un gaucher.
+
+Exemple:
+- Nadal (gaucher) joue contre Federer (droitier)
+- On utilise le Glicko de Federer vs gauchers (g2_vs_lefty_L)
+- On utilise le Glicko de Nadal vs droitiers (g2_vs_lefty_R)
+===============================================
+"""
+
+import polars as pl
+from pathlib import Path
+import time
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+# Input: fichier ML_READY avec Glicko et Hand
+ML_READY_CANDIDATES = [
+    DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v7.parquet",  # Après PP03B merge
+    DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v6.parquet",
+]
+
+# Output
+OUTPUT_DIR = DATA_CLEAN / "ml_ready"
+
+
+def find_ml_ready():
+    for p in ML_READY_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def add_glicko_vs_opponent_hand(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Crée une feature qui utilise le Glicko rating spécifique
+    contre la main de l'adversaire.
+    
+    GOD SOTA: Capture l'avantage d'un joueur habitué aux gauchers
+    face à un gaucher.
+    """
+    print("\n" + "=" * 60)
+    print("ADDING GLICKO VS OPPONENT HAND FEATURES")
+    print("=" * 60)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 1. VÉRIFIER COLONNES REQUISES
+    # ═══════════════════════════════════════════════════════════════
+    
+    # Colonnes hand (de PP03B ou PP08)
+    hand_cols = ["hand_A", "hand_B"]
+    
+    # Colonnes Glicko vs lefty (de PP02)
+    # Format possible: g2_vs_lefty_L_rating_A ou glicko2_vs_lefty_L_A
+    glicko_patterns = [
+        # Pattern 1: g2_vs_lefty_{hand}_rating_{side}
+        ("g2_vs_lefty_L_rating_A", "g2_vs_lefty_R_rating_A", "g2_vs_lefty_U_rating_A",
+         "g2_vs_lefty_L_rating_B", "g2_vs_lefty_R_rating_B", "g2_vs_lefty_U_rating_B"),
+        # Pattern 2: glicko2_vs_lefty_{hand}_{side}
+        ("glicko2_vs_lefty_L_A", "glicko2_vs_lefty_R_A", "glicko2_vs_lefty_U_A",
+         "glicko2_vs_lefty_L_B", "glicko2_vs_lefty_R_B", "glicko2_vs_lefty_U_B"),
+    ]
+    
+    # Global rating pour fallback
+    global_rating_candidates = ["g2_global_rating_A", "g2_global_rating_B", 
+                                "glicko2_rating_A", "glicko2_rating_B",
+                                "glicko_rating_A", "glicko_rating_B"]
+    
+    # Chercher le bon pattern
+    glicko_cols = None
+    for pattern in glicko_patterns:
+        if all(c in df.columns for c in pattern[:3]):  # Vérifier juste les _A
+            glicko_cols = pattern
+            break
+    
+    # Vérifier hand
+    has_hand = all(c in df.columns for c in hand_cols)
+    
+    print(f"  Hand columns: {'✅' if has_hand else '❌'} {hand_cols}")
+    print(f"  Glicko vs lefty columns: {'✅' if glicko_cols else '❌'}")
+    
+    if not has_hand:
+        print("\n  ⚠️ Missing hand columns!")
+        print("     Run PP03B first to add hand_A/hand_B")
+        print(f"     Available columns with 'hand': {[c for c in df.columns if 'hand' in c.lower()]}")
+        return df
+    
+    if not glicko_cols:
+        print("\n  ⚠️ Missing Glicko vs lefty columns!")
+        print("     These should be created in PP02")
+        print(f"     Available Glicko columns: {[c for c in df.columns if 'glicko' in c.lower() or 'g2_' in c.lower()]}")
+        return df
+    
+    # Unpack colonnes
+    g2_L_A, g2_R_A, g2_U_A, g2_L_B, g2_R_B, g2_U_B = glicko_cols
+    
+    # Trouver global rating pour fallback
+    global_A = None
+    global_B = None
+    for c in global_rating_candidates:
+        if c in df.columns:
+            if c.endswith("_A"):
+                global_A = c
+            elif c.endswith("_B"):
+                global_B = c
+    
+    print(f"  Global rating fallback: A={global_A}, B={global_B}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 2. CRÉER FEATURES
+    # ═══════════════════════════════════════════════════════════════
+    
+    # Rating de A contre la main de B
+    # Si B est gaucher → utiliser g2_vs_lefty_L de A
+    # Si B est droitier → utiliser g2_vs_lefty_R de A
+    
+    fallback_A = pl.col(global_A) if global_A else pl.lit(1500.0)
+    fallback_B = pl.col(global_B) if global_B else pl.lit(1500.0)
+    
+    df = df.with_columns([
+        # Rating de A contre la main de B
+        pl.when(pl.col("hand_B") == "L")
+          .then(pl.col(g2_L_A))
+          .when(pl.col("hand_B") == "R")
+          .then(pl.col(g2_R_A))
+          .when(pl.col("hand_B") == "U")
+          .then(pl.col(g2_U_A))
+          .otherwise(fallback_A)
+          .cast(pl.Float32)
+          .alias("glicko_A_vs_B_hand"),
+        
+        # Rating de B contre la main de A
+        pl.when(pl.col("hand_A") == "L")
+          .then(pl.col(g2_L_B))
+          .when(pl.col("hand_A") == "R")
+          .then(pl.col(g2_R_B))
+          .when(pl.col("hand_A") == "U")
+          .then(pl.col(g2_U_B))
+          .otherwise(fallback_B)
+          .cast(pl.Float32)
+          .alias("glicko_B_vs_A_hand"),
+    ])
+    
+    # Différence: avantage de A dans ce matchup de mains
+    df = df.with_columns([
+        (pl.col("glicko_A_vs_B_hand") - pl.col("glicko_B_vs_A_hand"))
+          .cast(pl.Float32)
+          .alias("diff_glicko_vs_opponent_hand"),
+    ])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 3. STATS
+    # ═══════════════════════════════════════════════════════════════
+    
+    cov = df["diff_glicko_vs_opponent_hand"].is_not_null().mean()
+    
+    # Éviter les NaN dans mean
+    valid = df.filter(
+        pl.col("diff_glicko_vs_opponent_hand").is_not_null() & 
+        ~pl.col("diff_glicko_vs_opponent_hand").is_nan()
+    )
+    
+    if len(valid) > 0:
+        mean_val = valid["diff_glicko_vs_opponent_hand"].mean()
+        std_val = valid["diff_glicko_vs_opponent_hand"].std()
+        print(f"\n  📊 STATS:")
+        print(f"     diff_glicko_vs_opponent_hand:")
+        print(f"        Coverage: {100*cov:.1f}%")
+        print(f"        Mean: {mean_val:.1f}")
+        print(f"        Std: {std_val:.1f}")
+        
+        # Analyse par type de matchup
+        print(f"\n  📊 PAR TYPE DE MATCHUP:")
+        for hand_a in ["R", "L"]:
+            for hand_b in ["R", "L"]:
+                subset = df.filter(
+                    (pl.col("hand_A") == hand_a) & 
+                    (pl.col("hand_B") == hand_b) &
+                    pl.col("diff_glicko_vs_opponent_hand").is_not_null()
+                )
+                if len(subset) > 0:
+                    mean_subset = subset["diff_glicko_vs_opponent_hand"].mean()
+                    print(f"     {hand_a} vs {hand_b}: {len(subset):,} matchs, mean diff = {mean_subset:.1f}")
+    else:
+        print(f"\n  ⚠️ No valid values for diff_glicko_vs_opponent_hand")
+    
+    return df
+
+
+def main():
+    print("\n" + "=" * 70)
+    print("   PP03C - GLICKO VS OPPONENT HAND")
+    print("=" * 70)
+    
+    start = time.time()
+    
+    # Load
+    ml_ready_path = find_ml_ready()
+    if ml_ready_path is None:
+        print("  ❌ ML_READY not found!")
+        return
+    
+    print(f"\n[1] Loading: {ml_ready_path}")
+    df = pl.read_parquet(ml_ready_path)
+    print(f"    Shape: {df.shape}")
+    
+    original_cols = len(df.columns)
+    
+    # Add features
+    df = add_glicko_vs_opponent_hand(df)
+    
+    new_cols = len(df.columns) - original_cols
+    print(f"\n[2] Added {new_cols} new columns")
+    
+    # Save
+    # Déterminer version
+    current_name = ml_ready_path.stem
+    if "v7" in current_name:
+        new_name = current_name.replace("v7", "v8")
+    elif "v6" in current_name:
+        new_name = current_name.replace("v6", "v7")
+    else:
+        new_name = current_name + "_with_glicko_hand"
+    
+    output_path = OUTPUT_DIR / f"{new_name}.parquet"
+    
+    print(f"\n[3] Saving to: {output_path}")
+    df.write_parquet(output_path)
+    
+    elapsed = time.time() - start
+    print(f"\n✅ Complete in {elapsed:.1f}s")
+    
+    # Liste des nouvelles features
+    new_features = ["glicko_A_vs_B_hand", "glicko_B_vs_A_hand", "diff_glicko_vs_opponent_hand"]
+    print(f"\n📋 NEW FEATURES:")
+    for f in new_features:
+        if f in df.columns:
+            cov = df[f].is_not_null().mean()
+            print(f"   ✅ {f}: {100*cov:.1f}% coverage")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2284 @@
+#!/usr/bin/env python3
+# ===============================================
+# PREPROCESS 9 - NASA GOD MODE SOTA 2026
+# Version corrigée anti-leakage structurel
+# ===============================================
+#
+# CORRECTIONS NASA:
+#   ✅ is_swapped au lieu de target_A_wins pour post-shuffle
+#   ✅ Rename winner_id/loser_id → player_A_id/player_B_id
+#   ✅ Drop toutes les colonnes winner_/loser_/w_/l_
+#   ✅ Garde Markov/SRGS (pas de leakage, viennent de rolling)
+#
+# Input: data_clean/ml_ready/matches_ml_ready_SOTA_v6.parquet (with opponent-adjusted)
+# Output: data_clean/ml_final/
+# ===============================================
+
+from pathlib import Path
+from datetime import datetime
+import time
+import json
+import gc
+import re
+import numpy as np
+import polars as pl
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+# Input - Use SOTA-enriched file if available
+SOTA_CANDIDATES = [
+    ("SOTA_v6", DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v6.parquet"),  # ← With opponent-adjusted
+    ("SOTA_v5", DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v5.parquet"),
+    ("SOTA_v4", DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v4.parquet"),
+    ("SOTA_v3", DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v3.parquet"),
+    ("SOTA_v2", DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v2.parquet"),
+    ("SOTA", DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA.parquet"),
+    ("BASE", DATA_CLEAN / "ml_ready" / "matches_ml_ready.parquet"),
+]
+
+ML_READY_FILE = None
+ML_READY_VERSION = None
+for version, path in SOTA_CANDIDATES:
+    if path.exists():
+        ML_READY_FILE = path
+        ML_READY_VERSION = version
+        break
+
+if ML_READY_FILE is None:
+    raise FileNotFoundError("No ML-ready file found! Run PP_01 to PP_08 first.")
+
+print(f"📁 Using: {ML_READY_VERSION} → {ML_READY_FILE.name}")
+
+# Players master file
+PLAYERS_MASTER_FILE = ROOT / "data_atp_detailed" / "atp_master_players.csv"
+PLAYERS_MASTER_PARQUET = ROOT / "data_atp_detailed" / "atp_master_players.parquet"
+
+# Output - defined dynamically below after EXCLUDE_ODDS config
+# OUTPUT_DIR = DATA_CLEAN / "ml_final"
+
+# Parameters
+GENDER = "atp"
+RANDOM_SEED = 42
+PI2 = 2 * np.pi
+
+# Split temporel
+TRAIN_END_YEAR = 2019
+VAL_END_YEAR = 2022
+
+# Feature selection
+MAX_FEATURES = 200
+MIN_VARIANCE_THRESHOLD = 0.001
+MAX_NULL_RATE = 0.95
+
+# ===============================================
+# COLONNES LEAKAGE - STRICTEMENT DÉFINIES
+# ===============================================
+
+# Mode de gestion des ranks
+# "strict"   = pas de ranks orientés, uniquement symétriques
+# "ultimate" = ranks neutres depuis table historisée (NASA ULTIME)
+RANK_MODE = "ultimate"  # ← RECOMMANDÉ
+
+# Option: Exclure les odds pour entraîner un modèle sans cotes
+# False = garder les odds (max performance)
+# True = exclure les odds (modèle utilisable sans cotes en production)
+EXCLUDE_ODDS = False  # ← Mettre True pour modèle sans cotes
+
+# ✅ OUTPUT_DIR dynamique selon EXCLUDE_ODDS
+OUTPUT_SUFFIX = "_no_odds" if EXCLUDE_ODDS else "_with_odds"
+OUTPUT_DIR = DATA_CLEAN / f"ml_final{OUTPUT_SUFFIX}"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Colonnes de leakage DIRECT (stats du match)
+LEAKAGE_COLS = [
+    "score_ta", "duration_minutes_ta",
+    "w_ace", "w_df", "w_svpt", "w_1stIn", "w_1stWon", "w_2ndWon",
+    "l_ace", "l_df", "l_svpt", "l_1stIn", "l_1stWon", "l_2ndWon",
+    "w_bpSaved", "w_bpFaced", "l_bpSaved", "l_bpFaced",
+    "winner_name", "loser_name",
+]
+
+# Colonnes rank orientées (issues de winner/loser) - à dropper en mode ULTIME
+RANK_ORIENTED_COLS = [
+    "rank_diff_A_minus_B",
+    "rank_ratio_A_over_B",
+]
+
+# ✅ Option: Drop absolute ranks pour éviter un "rank predictor"
+# Si True, on garde seulement les features relatives (diff_log_rank, rank_gap, etc.)
+DROP_ABSOLUTE_RANKS = True  # Recommandé pour NASA propre
+ABSOLUTE_RANK_COLS = ["rank_best", "rank_worst"]  # Ces features seront droppées si DROP_ABSOLUTE_RANKS
+
+# Colonnes intermédiaires (optionnel à drop, redondantes)
+# NOTE: Markov/SRGS finaux NE SONT PAS du leakage (viennent de rolling pré-match)
+INTERMEDIATE_P_COLS = [
+    "p_srv_pt_A", "p_srv_pt_B",
+    # p_hold et p_break sont utilisés par SRGS, on les garde
+]
+
+# IDs à exclure des features (pour exclusion dans select_features)
+# Note: winner_id/loser_id sont renommés en player_A_id/player_B_id après shuffle
+# On garde les deux dans la liste pour exclusion robuste à toute étape
+ID_COLS = [
+    "custom_match_id", "match_id_ta_dedup", "match_id_ta_source",
+    "winner_id", "loser_id",              # Pré-shuffle (exclusion de sécurité)
+    "player_A_id", "player_B_id",         # Post-shuffle (noms finaux)
+    "tourney_name_ta", "tourney_slug_ta",
+]
+
+# IDs finaux dans les parquets exportés (après shuffle)
+EXPORT_ID_COLS = [
+    "custom_match_id", "match_id_ta_dedup", "match_id_ta_source",
+    "player_A_id", "player_B_id",
+    "tourney_name_ta", "tourney_slug_ta",
+]
+
+# SOTA features to ALWAYS include (protected from elimination)
+PROTECTED_SOTA_FEATURES = [
+    # Speed Index
+    "tourney_speed_index",
+    # SSI Preference
+    "pref_ssi_A", "pref_ssi_B", "diff_pref_ssi", "diff_ssi_mismatch",
+    # SRGS (PP08)
+    "srgs_A", "srgs_B", "srgs_diff",
+    # Markov (PP08) - ✅ FIX: Both A and B required!
+    "markov_p_match_A", "markov_p_match_B",
+    "markov_edge_A", "markov_edge_B", 
+    "markov_p_set_A", "markov_p_set_B",
+    # Rolling vs Top
+    "r20_win_rate_vs_top10_A", "r20_win_rate_vs_top10_B",
+    "r20_win_rate_vs_top50_A", "r20_win_rate_vs_top50_B",
+    "r20_upset_rate_A", "r20_upset_rate_B",
+    # Mental features
+    "r20_choke_rate_A", "r20_choke_rate_B",
+    "r20_comeback_rate_A", "r20_comeback_rate_B",
+    # Opponent-adjusted (PP08b/c) - ✅ NEW!
+    "win_rate_vs_top10_A", "win_rate_vs_top10_B",
+    "win_rate_vs_top50_A", "win_rate_vs_top50_B",
+    "adj_dominance_score_A", "adj_dominance_score_B",
+    "diff_adj_dominance_score",
+]
+
+# ✅ NASA FIX: has_odds is META ONLY (not a training feature)
+# It's correlated with time (odds available mostly in recent era)
+# Using it as feature creates temporal shortcut. Keep it only for PP10 blend.
+# has_odds will be in the exported parquet but NOT in feature_list.json
+
+
+# ===============================================
+# SECTION 1: LOAD & INITIAL CLEAN
+# ===============================================
+
+def load_dataset() -> pl.DataFrame:
+    """Charge le dataset ML ready."""
+    
+    global PROTECTED_SOTA_FEATURES  # Permet de modifier la liste
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 1: LOAD DATASET")
+    print("=" * 70)
+    
+    print(f"\n  Loading {ML_READY_FILE}...")
+    df = pl.read_parquet(ML_READY_FILE)
+    print(f"  Shape: {df.shape}")
+    
+    # Ensure year column exists
+    if "year" not in df.columns:
+        if "tourney_date_ta" in df.columns:
+            if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+                df = df.with_columns([
+                    (pl.col("tourney_date_ta") // 10000).cast(pl.Int32).alias("year")
+                ])
+            else:
+                df = df.with_columns([
+                    pl.col("tourney_date_ta").dt.year().cast(pl.Int32).alias("year")
+                ])
+    
+    # Filter valid surfaces
+    if "tourney_surface_ta" in df.columns:
+        n_before = len(df)
+        df = df.filter(pl.col("tourney_surface_ta").is_not_null())
+        print(f"  After surface filter: {len(df)} (removed {n_before - len(df)})")
+    
+    # ✅ Early drop of known leakage cols (avoid carrying them through pipeline)
+    early_drop = [c for c in LEAKAGE_COLS if c in df.columns]
+    if early_drop:
+        df = df.drop(early_drop)
+        print(f"  🧹 Early dropped {len(early_drop)} leakage cols")
+    
+    # ✅ FIX: Validate paired features (_A must have _B counterpart)
+    # Otherwise after shuffle, unpaired features leak winner/loser info
+    print("\n  🔍 Validating paired features...")
+    validated_protected = []
+    unpaired = []
+    
+    for feat in PROTECTED_SOTA_FEATURES:
+        if feat.endswith("_A"):
+            # Check if _B version exists
+            feat_b = feat[:-2] + "_B"
+            if feat in df.columns and feat_b in df.columns:
+                validated_protected.append(feat)
+                if feat_b not in PROTECTED_SOTA_FEATURES:
+                    validated_protected.append(feat_b)  # Auto-add _B
+            elif feat in df.columns:
+                unpaired.append(feat)
+        elif feat.endswith("_B"):
+            # Check if _A version exists (should be handled above)
+            feat_a = feat[:-2] + "_A"
+            if feat in df.columns and feat_a in df.columns:
+                if feat not in validated_protected:
+                    validated_protected.append(feat)
+            elif feat in df.columns:
+                unpaired.append(feat)
+        else:
+            # Non-paired feature (e.g., tourney_speed_index)
+            if feat in df.columns:
+                validated_protected.append(feat)
+    
+    if unpaired:
+        print(f"  ⚠️ Unpaired features EXCLUDED (leakage risk!):")
+        for f in unpaired:
+            print(f"     - {f}")
+    
+    # Update global list
+    PROTECTED_SOTA_FEATURES = list(dict.fromkeys(validated_protected))  # Dedupe
+    print(f"  ✅ Validated {len(PROTECTED_SOTA_FEATURES)} protected features")
+    
+    return df
+
+
+# ===============================================
+# SECTION 2A: CELLULE A - Form/Fatigue Features
+# ===============================================
+
+def add_cellule_a_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Cellule A: Rolling features de forme et fatigue.
+    """
+    
+    print("\n" + "=" * 70)
+    print("   CELLULE A: FORM/FATIGUE FEATURES")
+    print("=" * 70)
+    
+    n_before = len(df.columns)
+    
+    # --- is_vs_top10 / is_vs_top50 ---
+    print("\n[A.1] Adding is_vs_top10/50...")
+    
+    # ✅ FIX NASA ULTIME: Skip in ultimate mode (we create better features from neutral ranks)
+    # In ultimate mode, we use has_top10_player, rank_best, etc. from add_neutral_rank_features()
+    if RANK_MODE == "ultimate":
+        print("  ⏭️ Skipped in RANK_MODE=ultimate (using neutral rank features instead)")
+    else:
+        # Mode practical/strict: créer depuis winner/loser ranks
+        if "loser_rank_ta" in df.columns:
+            df = df.with_columns([
+                (pl.col("loser_rank_ta").fill_null(9999) <= 10).cast(pl.Int8).alias("opp_is_top10_A"),
+                (pl.col("loser_rank_ta").fill_null(9999) <= 50).cast(pl.Int8).alias("opp_is_top50_A"),
+            ])
+            print("  ✅ opp_is_top10_A, opp_is_top50_A (adversaire de A)")
+        
+        if "winner_rank_ta" in df.columns:
+            df = df.with_columns([
+                (pl.col("winner_rank_ta").fill_null(9999) <= 10).cast(pl.Int8).alias("opp_is_top10_B"),
+                (pl.col("winner_rank_ta").fill_null(9999) <= 50).cast(pl.Int8).alias("opp_is_top50_B"),
+            ])
+            print("  ✅ opp_is_top10_B, opp_is_top50_B (adversaire de B)")
+    
+    # --- rounds_played_tourney ---
+    print("\n[A.2] Adding rounds_played_tourney...")
+    
+    round_order = {
+        "Q": 0, "Q1": 0, "Q2": 1, "Q3": 2,
+        "RR": 16, "R128": 20, "R64": 30, "R56": 35, "R48": 37,
+        "R32": 40, "R28": 45, "R24": 47, "R16": 50, "QF": 60, "SF": 70, "F": 80,
+        "3RD": 76, "BRONZE": 75
+    }
+    
+    if "round_ta" in df.columns:
+        df = df.with_columns([
+            pl.col("round_ta").str.to_uppercase().replace_strict(round_order, default=0).cast(pl.Int16).alias("round_ord")
+        ])
+    
+    if "round_ord" in df.columns:
+        df = df.with_columns([
+            (pl.col("round_ord") / 10).cast(pl.Int8).alias("rounds_played_approx_A"),
+            (pl.col("round_ord") / 10).cast(pl.Int8).alias("rounds_played_approx_B"),
+        ])
+        print("  ✅ rounds_played_approx_A/B")
+    
+    # --- is_qualifier / is_wildcard / is_lucky_loser ---
+    print("\n[A.3] Adding entry type flags...")
+    
+    for suffix in ["_A", "_B"]:
+        for flag in ["is_qualifier", "is_wildcard", "is_lucky_loser"]:
+            col_name = f"{flag}{suffix}"
+            if col_name not in df.columns:
+                df = df.with_columns([pl.lit(0).cast(pl.Int8).alias(col_name)])
+    print("  ✅ is_qualifier/wildcard/lucky_loser")
+    
+    # --- fatigue_qualifs ---
+    print("\n[A.4] Adding fatigue_qualifs...")
+    
+    for suffix in ["_A", "_B"]:
+        q_minutes_col = f"p_q_minutes{suffix}"
+        if q_minutes_col in df.columns:
+            df = df.with_columns([
+                pl.col(q_minutes_col).fill_null(0).cast(pl.Float32).alias(f"fatigue_qualifs{suffix}")
+            ])
+        else:
+            df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias(f"fatigue_qualifs{suffix}")])
+    print("  ✅ fatigue_qualifs_A/B")
+    
+    # --- r20_win_rate_vs_top10 ---
+    print("\n[A.5] Checking r20_win_rate_vs_top10...")
+    
+    for suffix in ["_A", "_B"]:
+        col_name = f"r20_win_rate_vs_top10{suffix}"
+        
+        if col_name in df.columns:
+            coverage = df[col_name].is_not_null().mean()
+            print(f"  ✅ {col_name} exists (coverage: {coverage:.1%})")
+        else:
+            win_rate_col = None
+            for candidate in [f"win_rate_20{suffix}", f"win_rate_r20{suffix}", f"r20_win_rate{suffix}"]:
+                if candidate in df.columns:
+                    win_rate_col = candidate
+                    break
+            
+            if win_rate_col:
+                df = df.with_columns([
+                    pl.col(win_rate_col).fill_null(0.5).cast(pl.Float32).alias(col_name)
+                ])
+                print(f"  ⚠️ {col_name} (approximated)")
+            else:
+                df = df.with_columns([pl.lit(None).cast(pl.Float32).alias(col_name)])
+                print(f"  ⚠️ {col_name} (will be imputed)")
+    
+    n_after = len(df.columns)
+    print(f"\n  Cellule A: {n_after - n_before} features added")
+    
+    return df
+
+
+# ===============================================
+# SECTION 2B: CELLULE B - Cyclic & Fatigue Index
+# ===============================================
+
+def add_cellule_b_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Cellule B: Encodage cyclique temporel + Index de fatigue cumulée.
+    """
+    
+    print("\n" + "=" * 70)
+    print("   CELLULE B: CYCLIC ENCODING & FATIGUE INDEX")
+    print("=" * 70)
+    
+    n_before = len(df.columns)
+    
+    # --- Cyclic temporal encoding ---
+    print("\n[B.1] Adding cyclic temporal features...")
+    
+    if "tourney_date_ta" in df.columns:
+        if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+            df = df.with_columns([
+                pl.col("tourney_date_ta").cast(pl.Utf8).str.to_datetime("%Y%m%d").alias("_dt_temp")
+            ])
+        else:
+            df = df.with_columns([pl.col("tourney_date_ta").alias("_dt_temp")])
+        
+        df = df.with_columns([
+            pl.col("_dt_temp").dt.month().alias("_month"),
+            pl.col("_dt_temp").dt.week().alias("_week"),
+            pl.col("_dt_temp").dt.weekday().alias("_dow"),
+        ])
+        
+        df = df.with_columns([
+            (PI2 * pl.col("_month") / 12).sin().cast(pl.Float32).alias("month_sin"),
+            (PI2 * pl.col("_month") / 12).cos().cast(pl.Float32).alias("month_cos"),
+            (PI2 * pl.col("_week") / 52).sin().cast(pl.Float32).alias("week_sin"),
+            (PI2 * pl.col("_week") / 52).cos().cast(pl.Float32).alias("week_cos"),
+            (PI2 * pl.col("_dow") / 7).sin().cast(pl.Float32).alias("dow_sin"),
+            (PI2 * pl.col("_dow") / 7).cos().cast(pl.Float32).alias("dow_cos"),
+            ((pl.col("_week").clip(1, 48) - 1) / 47).cast(pl.Float32).alias("season_progress"),
+        ])
+        
+        df = df.drop(["_dt_temp", "_month", "_week", "_dow"])
+        print("  ✅ month_sin/cos, week_sin/cos, dow_sin/cos, season_progress")
+    else:
+        print("  ⚠️ tourney_date_ta not found")
+    
+    # --- Cumulative fatigue index ---
+    print("\n[B.2] Adding cumulative fatigue index...")
+    
+    for suffix in ["_A", "_B"]:
+        fatigue_components = []
+        component_names = []
+        
+        matches_7d_candidates = [f"matches_last_7d{suffix}", f"matches_7d{suffix}"]
+        matches_7d_col = next((c for c in matches_7d_candidates if c in df.columns), None)
+        if matches_7d_col:
+            fatigue_components.append((pl.col(matches_7d_col).fill_null(0) / 5).clip(0, 1) * 0.30)
+            component_names.append("matches_7d")
+        
+        minutes_7d_candidates = [f"minutes_last_7d{suffix}", f"minutes_7d{suffix}"]
+        minutes_7d_col = next((c for c in minutes_7d_candidates if c in df.columns), None)
+        if minutes_7d_col:
+            fatigue_components.append((pl.col(minutes_7d_col).fill_null(0) / 600).clip(0, 1) * 0.30)
+            component_names.append("minutes_7d")
+        
+        minutes_30d_candidates = [f"minutes_last_30d{suffix}", f"minutes_30d{suffix}"]
+        minutes_30d_col = next((c for c in minutes_30d_candidates if c in df.columns), None)
+        if minutes_30d_col:
+            fatigue_components.append((pl.col(minutes_30d_col).fill_null(0) / 2000).clip(0, 1) * 0.20)
+            component_names.append("minutes_30d")
+        
+        days_candidates = [f"days_since_last{suffix}", f"days_since_last_ff{suffix}", f"days_rest{suffix}"]
+        days_col = next((c for c in days_candidates if c in df.columns), None)
+        if days_col:
+            fatigue_components.append((1 - (pl.col(days_col).fill_null(7) / 14).clip(0, 1)) * 0.20)
+            component_names.append("days_rest_inv")
+        
+        fatigue_qualifs_col = f"fatigue_qualifs{suffix}"
+        if fatigue_qualifs_col in df.columns:
+            fatigue_components.append((pl.col(fatigue_qualifs_col).fill_null(0) / 300).clip(0, 1) * 0.10)
+            component_names.append("qualifs")
+        
+        if fatigue_components:
+            fatigue_sum = fatigue_components[0]
+            for expr in fatigue_components[1:]:
+                fatigue_sum = fatigue_sum + expr
+            
+            df = df.with_columns([
+                fatigue_sum.clip(0, 1).cast(pl.Float32).alias(f"cumulative_fatigue_index{suffix}"),
+                (fatigue_sum > 0.6).cast(pl.Int8).alias(f"is_high_fatigue{suffix}"),
+                (fatigue_sum < 0.2).cast(pl.Int8).alias(f"is_fresh{suffix}"),
+            ])
+            print(f"  ✅ cumulative_fatigue_index{suffix} ({', '.join(component_names)})")
+        else:
+            df = df.with_columns([
+                pl.lit(0.3).cast(pl.Float32).alias(f"cumulative_fatigue_index{suffix}"),
+                pl.lit(0).cast(pl.Int8).alias(f"is_high_fatigue{suffix}"),
+                pl.lit(0).cast(pl.Int8).alias(f"is_fresh{suffix}"),
+            ])
+            print(f"  ⚠️ cumulative_fatigue_index{suffix} (defaulted)")
+    
+    # ✅ FIX: A-B pour cohérence (positif = avantage A = A moins fatigué)
+    df = df.with_columns([
+        (pl.col("cumulative_fatigue_index_A") - pl.col("cumulative_fatigue_index_B"))
+        .cast(pl.Float32).alias("fatigue_advantage_A")
+    ])
+    print("  ✅ fatigue_advantage_A (A-B: positif = A moins fatigué)")
+    
+    n_after = len(df.columns)
+    print(f"\n  Cellule B: {n_after - n_before} features added")
+    
+    return df
+
+
+# ===============================================
+# SECTION 2C: CELLULE C - Players Enrichment
+# ===============================================
+
+def add_cellule_c_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Cellule C: Enrichissement avec données joueurs.
+    """
+    
+    print("\n" + "=" * 70)
+    print("   CELLULE C: PLAYERS ENRICHMENT")
+    print("=" * 70)
+    
+    n_before = len(df.columns)
+    
+    players = None
+    
+    if PLAYERS_MASTER_PARQUET.exists():
+        print(f"\n  Loading players from {PLAYERS_MASTER_PARQUET}...")
+        try:
+            players = pl.read_parquet(PLAYERS_MASTER_PARQUET)
+        except Exception as e:
+            print(f"  ⚠️ Error: {e}")
+    
+    if players is None and PLAYERS_MASTER_FILE.exists():
+        print(f"\n  Loading players from {PLAYERS_MASTER_FILE}...")
+        try:
+            players = pl.read_csv(PLAYERS_MASTER_FILE, infer_schema_length=10000)
+        except Exception as e:
+            print(f"  ⚠️ Error: {e}")
+    
+    if players is not None:
+        print(f"  Loaded {len(players)} players")
+        
+        id_col = None
+        for candidate in ["atp_id_ref", "generated_id", "player_id", "id"]:
+            if candidate in players.columns:
+                id_col = candidate
+                break
+        
+        if id_col:
+            print(f"  Using ID column: {id_col}")
+            
+            player_features = [id_col]
+            
+            if "birth_date" in players.columns:
+                players = players.with_columns([
+                    pl.col("birth_date").str.to_datetime("%Y-%m-%d", strict=False).alias("birth_date_dt")
+                ])
+                player_features.append("birth_date_dt")
+            
+            if "height_cm" in players.columns:
+                players = players.with_columns([pl.col("height_cm").cast(pl.Float32)])
+                player_features.append("height_cm")
+            
+            if "weight_kg" in players.columns:
+                players = players.with_columns([pl.col("weight_kg").cast(pl.Float32)])
+                player_features.append("weight_kg")
+            
+            if "plays_hand" in players.columns:
+                players = players.with_columns([
+                    pl.when(pl.col("plays_hand").str.to_lowercase().str.contains("left"))
+                    .then(pl.lit("L"))
+                    .when(pl.col("plays_hand").str.to_lowercase().str.contains("right"))
+                    .then(pl.lit("R"))
+                    .otherwise(pl.lit(None))
+                    .alias("handed")
+                ])
+                player_features.append("handed")
+            
+            if "plays_backhand" in players.columns:
+                players = players.with_columns([
+                    pl.when(pl.col("plays_backhand").str.to_lowercase().str.contains("two|2"))
+                    .then(pl.lit("2H"))
+                    .when(pl.col("plays_backhand").str.to_lowercase().str.contains("one|1"))
+                    .then(pl.lit("1H"))
+                    .otherwise(pl.lit(None))
+                    .alias("backhand")
+                ])
+                player_features.append("backhand")
+            
+            if "pro_year" in players.columns:
+                players = players.with_columns([pl.col("pro_year").cast(pl.Float32)])
+                player_features.append("pro_year")
+            
+            players_subset = players.select([c for c in player_features if c in players.columns]).unique(id_col)
+            players_subset = players_subset.rename({id_col: "player_id_join"})
+            
+            # ✅ FIX: Support both winner_id/loser_id and player_A_id/player_B_id
+            id_mappings = [("_A", "winner_id", "player_A_id"), ("_B", "loser_id", "player_B_id")]
+            for suffix, id_primary, id_fallback in id_mappings:
+                id_source = id_primary if id_primary in df.columns else id_fallback
+                if id_source in df.columns:
+                    players_for_join = players_subset.clone()
+                    
+                    for col in players_for_join.columns:
+                        if col != "player_id_join":
+                            players_for_join = players_for_join.rename({col: f"{col}{suffix}"})
+                    
+                    df = df.join(
+                        players_for_join,
+                        left_on=id_source,
+                        right_on="player_id_join",
+                        how="left"
+                    )
+            
+            print("  ✅ Player features joined")
+            
+            if "tourney_date_ta" in df.columns:
+                if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+                    date_expr = pl.col("tourney_date_ta").cast(pl.Utf8).str.to_datetime("%Y%m%d")
+                    year_expr = (pl.col("tourney_date_ta") // 10000).cast(pl.Float32)
+                else:
+                    date_expr = pl.col("tourney_date_ta")
+                    year_expr = pl.col("tourney_date_ta").dt.year().cast(pl.Float32)
+                
+                for suffix in ["_A", "_B"]:
+                    birth_col = f"birth_date_dt{suffix}"
+                    if birth_col in df.columns:
+                        df = df.with_columns([
+                            ((date_expr - pl.col(birth_col)).dt.total_days() / 365.25)
+                            .clip(13, 55)
+                            .cast(pl.Float32)
+                            .alias(f"age_at_match{suffix}")
+                        ])
+                        print(f"  ✅ age_at_match{suffix}")
+                    
+                    pro_year_col = f"pro_year{suffix}"
+                    if pro_year_col in df.columns:
+                        df = df.with_columns([
+                            (year_expr - pl.col(pro_year_col))
+                            .clip(0, 40)
+                            .cast(pl.Float32)
+                            .alias(f"pro_career_len{suffix}")
+                        ])
+                        print(f"  ✅ pro_career_len{suffix}")
+    else:
+        print("  ⚠️ No players file found, creating defaults")
+        
+        for suffix in ["_A", "_B"]:
+            df = df.with_columns([
+                pl.lit(None).cast(pl.Float32).alias(f"age_at_match{suffix}"),
+                pl.lit(None).cast(pl.Float32).alias(f"pro_career_len{suffix}"),
+                pl.lit(None).cast(pl.Float32).alias(f"height_cm{suffix}"),
+                pl.lit(None).cast(pl.Float32).alias(f"weight_kg{suffix}"),
+                pl.lit(None).cast(pl.Utf8).alias(f"handed{suffix}"),
+                pl.lit(None).cast(pl.Utf8).alias(f"backhand{suffix}"),
+            ])
+    
+    n_after = len(df.columns)
+    print(f"\n  Cellule C: {n_after - n_before} features added")
+    
+    return df
+
+
+# ===============================================
+# SECTION 2D: CELLULE D - Tourney Speed Index
+# ===============================================
+
+def add_cellule_d_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Cellule D: Index de vitesse du tournoi.
+    """
+    
+    print("\n" + "=" * 70)
+    print("   CELLULE D: TOURNEY SPEED INDEX")
+    print("=" * 70)
+    
+    n_before = len(df.columns)
+    
+    if "tourney_speed_index" in df.columns:
+        coverage = df["tourney_speed_index"].is_not_null().mean()
+        print(f"\n  ✅ tourney_speed_index exists (coverage: {coverage:.1%})")
+    else:
+        speed_index_dir = DATA_CLEAN / "features" / "tourney_speed_index"
+        
+        if speed_index_dir.exists():
+            print(f"\n  Loading from {speed_index_dir}...")
+            try:
+                speed_df = pl.read_parquet(speed_index_dir)
+                speed_col = "tourney_speed_index" if "tourney_speed_index" in speed_df.columns else "speed_prior3y"
+                
+                if "tourney_slug_ta" in speed_df.columns and "year" in speed_df.columns:
+                    speed_df = speed_df.select([
+                        "tourney_slug_ta", "year",
+                        pl.col(speed_col).alias("tourney_speed_index")
+                    ]).unique(["tourney_slug_ta", "year"])
+                    
+                    df = df.join(speed_df, on=["tourney_slug_ta", "year"], how="left")
+                    print(f"  ✅ tourney_speed_index loaded")
+            except Exception as e:
+                print(f"  ⚠️ Error: {e}")
+        
+        if "tourney_speed_index" not in df.columns:
+            print("\n  Approximating from surface...")
+            
+            if "tourney_surface_ta" in df.columns:
+                df = df.with_columns([
+                    pl.when(pl.col("tourney_surface_ta") == "Grass").then(pl.lit(0.70))
+                    .when(pl.col("tourney_surface_ta") == "Carpet").then(pl.lit(0.65))
+                    .when(pl.col("tourney_surface_ta") == "Hard").then(pl.lit(0.50))
+                    .when(pl.col("tourney_surface_ta") == "Clay").then(pl.lit(0.30))
+                    .otherwise(pl.lit(0.50))
+                    .cast(pl.Float32).alias("tourney_speed_index")
+                ])
+                print("  ⚠️ tourney_speed_index (from surface)")
+    
+    if "pref_ssi_A" in df.columns and "pref_ssi_B" in df.columns:
+        print(f"\n  ✅ pref_ssi_A/B exist (from PP05)")
+    
+    print("\n  Adding speed sensitivity...")
+    
+    for suffix in ["_A", "_B"]:
+        if f"speed_sensitivity{suffix}" in df.columns:
+            print(f"  ✅ speed_sensitivity{suffix} exists")
+            continue
+            
+        ace_candidates = [f"r10_p_s_ace_p{suffix}", f"ace_rate_r10{suffix}", f"r10_ace_rate{suffix}"]
+        ace_col = next((c for c in ace_candidates if c in df.columns), None)
+        
+        if ace_col:
+            mean_ace = df.select(pl.col(ace_col).mean()).item()
+            df = df.with_columns([
+                (pl.col(ace_col).fill_null(mean_ace) - mean_ace)
+                .cast(pl.Float32).alias(f"speed_sensitivity{suffix}")
+            ])
+            print(f"  ✅ speed_sensitivity{suffix}")
+        else:
+            df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias(f"speed_sensitivity{suffix}")])
+            print(f"  ⚠️ speed_sensitivity{suffix} (defaulted)")
+    
+    if "inter__speed_matchup" not in df.columns:
+        df = df.with_columns([
+            (pl.col("tourney_speed_index") * 
+             (pl.col("speed_sensitivity_A") - pl.col("speed_sensitivity_B")))
+            .cast(pl.Float32).alias("inter__speed_matchup")
+        ])
+        print("  ✅ inter__speed_matchup")
+    
+    n_after = len(df.columns)
+    print(f"\n  Cellule D: {n_after - n_before} features added")
+    
+    return df
+
+
+# ===============================================
+# SECTION 2E: CELLULE E - Meta-features
+# ===============================================
+
+def add_cellule_e_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Cellule E: Meta-features (logit transforms, SSI mismatch, gaps).
+    """
+    
+    print("\n" + "=" * 70)
+    print("   CELLULE E: META-FEATURES")
+    print("=" * 70)
+    
+    n_before = len(df.columns)
+    
+    def safe_logit(col_expr):
+        clipped = col_expr.clip(0.001, 0.999)
+        return (clipped / (1 - clipped)).log()
+    
+    # --- BP conversion logit ---
+    print("\n[E.1] Adding logit transforms...")
+    
+    bp_candidates = [
+        ("r10_p_bp_conv_p_A", "r10_p_bp_conv_p_B"),
+        ("A_r10_p_bp_conv_p", "B_r10_p_bp_conv_p"),
+        ("bp_conv_pct_A", "bp_conv_pct_B"),
+    ]
+    for col_a, col_b in bp_candidates:
+        if col_a in df.columns and col_b in df.columns:
+            df = df.with_columns([
+                (safe_logit(pl.col(col_a)) - safe_logit(pl.col(col_b)))
+                .cast(pl.Float32).alias("diff__clutch_bpconv_logit")
+            ])
+            print("  ✅ diff__clutch_bpconv_logit")
+            break
+    else:
+        df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias("diff__clutch_bpconv_logit")])
+    
+    # --- First serve in logit ---
+    fs_candidates = [
+        ("r10_p_s_1stIn_p_A", "r10_p_s_1stIn_p_B"),
+        ("A_r10_p_s_1stIn_p", "B_r10_p_s_1stIn_p"),
+    ]
+    for col_a, col_b in fs_candidates:
+        if col_a in df.columns and col_b in df.columns:
+            df = df.with_columns([
+                (safe_logit(pl.col(col_a)) - safe_logit(pl.col(col_b)))
+                .cast(pl.Float32).alias("diff__first_in_consistency")
+            ])
+            print("  ✅ diff__first_in_consistency")
+            break
+    else:
+        df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias("diff__first_in_consistency")])
+    
+    # --- DF pressure ---
+    df_candidates = [
+        ("r10_p_s_df_p_A", "r10_p_s_df_p_B"),
+        ("A_r10_p_s_df_p", "B_r10_p_s_df_p"),
+    ]
+    for col_a, col_b in df_candidates:
+        if col_a in df.columns and col_b in df.columns:
+            # ✅ FIX: A-B (pas B-A) pour cohérence avec autres diffs
+            df = df.with_columns([
+                (pl.col(col_a) - pl.col(col_b)).cast(pl.Float32).alias("diff__df_pressure")
+            ])
+            print("  ✅ diff__df_pressure (A-B)")
+            break
+    else:
+        df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias("diff__df_pressure")])
+    
+    # --- Rally features ---
+    print("\n[E.2] Adding charting meta-features...")
+    
+    rally_candidates = [
+        ("r10_chart_avg_rally_A", "r10_chart_avg_rally_B"),
+        ("r10_ch_avg_rally_len_A", "r10_ch_avg_rally_len_B"),
+    ]
+    for col_a, col_b in rally_candidates:
+        if col_a in df.columns and col_b in df.columns:
+            df = df.with_columns([
+                (pl.col(col_a) - pl.col(col_b)).cast(pl.Float32).alias("diff__rally_mean"),
+                ((pl.col(col_a) + pl.col(col_b)) / 2).cast(pl.Float32).alias("style__rally_match"),
+            ])
+            print("  ✅ diff__rally_mean, style__rally_match")
+            break
+    else:
+        df = df.with_columns([
+            pl.lit(0.0).cast(pl.Float32).alias("diff__rally_mean"),
+            pl.lit(6.0).cast(pl.Float32).alias("style__rally_match"),
+        ])
+    
+    # --- Net aggression ---
+    net_candidates = [
+        ("r10_ch_net_won_pct_A", "r10_ch_net_won_pct_B"),
+    ]
+    for col_a, col_b in net_candidates:
+        if col_a in df.columns and col_b in df.columns:
+            df = df.with_columns([
+                (pl.col(col_a) - pl.col(col_b)).cast(pl.Float32).alias("diff__net_aggression")
+            ])
+            print("  ✅ diff__net_aggression")
+            break
+    else:
+        df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias("diff__net_aggression")])
+    
+    # --- SSI Mismatch ---
+    print("\n[E.3] Adding SSI mismatch...")
+    
+    if "pref_ssi_A" in df.columns and "pref_ssi_B" in df.columns:
+        print("  ✅ pref_ssi_A/B exist (from PP05)")
+        
+        if "diff_ssi_mismatch" not in df.columns:
+            if "tourney_speed_index" in df.columns:
+                df = df.with_columns([
+                    (
+                        (pl.col("tourney_speed_index").fill_null(0) - pl.col("pref_ssi_A").fill_null(0)).abs() -
+                        (pl.col("tourney_speed_index").fill_null(0) - pl.col("pref_ssi_B").fill_null(0)).abs()
+                    )
+                    .cast(pl.Float32).alias("diff_ssi_mismatch")
+                ])
+                print("  ✅ diff_ssi_mismatch")
+    else:
+        for suffix in ["_A", "_B"]:
+            hard_col = f"g2_hard_rating{suffix}"
+            clay_col = f"g2_clay_rating{suffix}"
+            
+            if hard_col in df.columns and clay_col in df.columns:
+                mean_rating = (pl.col(hard_col) + pl.col(clay_col)) / 2
+                df = df.with_columns([
+                    ((pl.col(hard_col) - pl.col(clay_col)) / mean_rating.clip(1, None))
+                    .cast(pl.Float32).alias(f"ssi_hard_vs_clay{suffix}")
+                ])
+                
+                if f"pref_ssi{suffix}" not in df.columns:
+                    df = df.with_columns([
+                        pl.col(f"ssi_hard_vs_clay{suffix}").fill_null(0).cast(pl.Float32).alias(f"pref_ssi{suffix}")
+                    ])
+                print(f"  ✅ ssi_hard_vs_clay{suffix}, pref_ssi{suffix}")
+            else:
+                if f"pref_ssi{suffix}" not in df.columns:
+                    df = df.with_columns([
+                        pl.lit(0.0).cast(pl.Float32).alias(f"ssi_hard_vs_clay{suffix}"),
+                        pl.lit(0.0).cast(pl.Float32).alias(f"pref_ssi{suffix}"),
+                    ])
+        
+        if "diff_ssi_mismatch" not in df.columns:
+            df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias("diff_ssi_mismatch")])
+        print("  ✅ diff_ssi_mismatch")
+    
+    # --- Rank interactions (SYMMETRIC ONLY - no leakage) ---
+    print("\n[E.4] Adding rank interactions (symmetric only)...")
+    
+    # ✅ FIX NASA ULTIME: Skip in ultimate mode (we create better features from neutral ranks)
+    if RANK_MODE == "ultimate":
+        print("  ⏭️ Skipped in ultimate mode (using neutral rank features later)")
+    elif "winner_rank_ta" in df.columns and "loser_rank_ta" in df.columns:
+        df = df.with_columns([
+            ((pl.col("winner_rank_ta").fill_null(9999) <= 10) &
+             (pl.col("loser_rank_ta").fill_null(9999) <= 10))
+            .cast(pl.Int8).alias("both_top10"),
+
+            ((pl.col("winner_rank_ta").fill_null(9999) <= 50) &
+             (pl.col("loser_rank_ta").fill_null(9999) <= 50))
+            .cast(pl.Int8).alias("both_top50"),
+
+            (pl.col("winner_rank_ta").fill_null(100) - 
+             pl.col("loser_rank_ta").fill_null(100)).abs()
+            .cast(pl.Float32).alias("rank_diff_abs"),
+        ])
+        print("  ✅ both_top10, both_top50, rank_diff_abs (symmetric)")
+        print("  ⏳ diff_log_rank, is_underdog_A → post-shuffle")
+    
+    # --- Rest advantage ---
+    print("\n[E.5] Adding rest advantage...")
+    
+    rest_candidates = [
+        ("days_since_last_A", "days_since_last_B"),
+        ("days_since_last_ff_A", "days_since_last_ff_B"),
+    ]
+    for col_a, col_b in rest_candidates:
+        if col_a in df.columns and col_b in df.columns:
+            df = df.with_columns([
+                (pl.col(col_a) - pl.col(col_b)).cast(pl.Float32).alias("rest_advantage_A")
+            ])
+            print("  ✅ rest_advantage_A")
+            break
+    else:
+        df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias("rest_advantage_A")])
+    
+    # --- Surface Glicko gaps ---
+    print("\n[E.6] Adding Glicko surface gaps...")
+    
+    for surface in ["hard", "clay", "grass"]:
+        col_a = f"g2_{surface}_rating_A"
+        col_b = f"g2_{surface}_rating_B"
+        
+        if col_a in df.columns and col_b in df.columns:
+            df = df.with_columns([
+                (pl.col(col_a) - pl.col(col_b)).cast(pl.Float32).alias(f"g2_{surface}_gap")
+            ])
+            print(f"  ✅ g2_{surface}_gap")
+    
+    if "tourney_surface_ta" in df.columns:
+        gap_mapping = []
+        for surf, gap_col in [("Hard", "g2_hard_gap"), ("Clay", "g2_clay_gap"), ("Grass", "g2_grass_gap")]:
+            if gap_col in df.columns:
+                gap_mapping.append((surf, gap_col))
+        
+        if gap_mapping:
+            expr = pl.lit(0.0)
+            for surf, gap_col in gap_mapping:
+                expr = pl.when(pl.col("tourney_surface_ta") == surf).then(pl.col(gap_col)).otherwise(expr)
+            df = df.with_columns([expr.cast(pl.Float32).alias("current_surface_advantage")])
+            print("  ✅ current_surface_advantage")
+    
+    # --- Mental/Clutch gaps ---
+    print("\n[E.7] Adding mental/clutch gaps...")
+    
+    gap_pairs = [
+        ("mental_toughness_score_A", "mental_toughness_score_B", "mental_gap"),
+        ("clutch_score_A", "clutch_score_B", "clutch_gap"),
+        ("upset_rate_r20_A", "upset_rate_r20_B", "upset_rate_gap"),
+        ("comeback_rate_r20_A", "comeback_rate_r20_B", "comeback_rate_gap"),
+        ("win_streak_current_A", "win_streak_current_B", "win_streak_gap"),
+    ]
+    for col_a, col_b, new_col in gap_pairs:
+        if col_a in df.columns and col_b in df.columns:
+            df = df.with_columns([
+                (pl.col(col_a) - pl.col(col_b)).cast(pl.Float32).alias(new_col)
+            ])
+            print(f"  ✅ {new_col}")
+    
+    n_after = len(df.columns)
+    print(f"\n  Cellule E: {n_after - n_before} features added")
+    
+    return df
+
+
+# ===============================================
+# CELLULE F: AGE-PEAK FEATURES (après Cellule C qui crée age_at_match)
+# ===============================================
+
+def add_age_peak_features_pp09(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Age-peak distance features - VERSION PP09.
+    
+    ✅ Appelé APRÈS Cellule C (qui crée age_at_match_A/B)
+    ✅ PEAK_AGE = 27.0 est une constante (pas de leakage temporel)
+    ✅ Pas de fill_null(27) qui "récompenserait" le missing
+    """
+    
+    print("\n" + "=" * 70)
+    print("   CELLULE F: AGE-PEAK FEATURES")
+    print("=" * 70)
+    
+    PEAK_AGE = 27.0
+    n_before = len(df.columns)
+    
+    # ✅ Drop any incorrect age features from PP08 (if they exist)
+    pp08_age_cols = ["age_from_peak_A", "age_from_peak_B", "age_peak_advantage_A", 
+                     "career_trajectory_advantage_A", "career_phase_A", "career_phase_B",
+                     "age_missing_A", "age_missing_B"]
+    existing_pp08_cols = [c for c in pp08_age_cols if c in df.columns]
+    if existing_pp08_cols:
+        df = df.drop(existing_pp08_cols)
+        print(f"  🧹 Dropped {len(existing_pp08_cols)} incorrect PP08 age features")
+    
+    # Whitelist stricte
+    age_A = "age_at_match_A" if "age_at_match_A" in df.columns else None
+    age_B = "age_at_match_B" if "age_at_match_B" in df.columns else None
+    
+    print(f"  🔍 age_A column: {age_A}")
+    print(f"  🔍 age_B column: {age_B}")
+    
+    if age_A and age_B:
+        # Stats pour diagnostic
+        null_rate_A = df[age_A].is_null().mean()
+        nan_rate_A = df[age_A].is_nan().mean() if df[age_A].dtype in [pl.Float32, pl.Float64] else 0
+        print(f"  📊 {age_A}: null={null_rate_A:.1%}, nan={nan_rate_A:.1%}")
+        
+        # ✅ FIX: Handle both null AND NaN
+        is_missing_A = (pl.col(age_A).is_null() | pl.col(age_A).is_nan())
+        is_missing_B = (pl.col(age_B).is_null() | pl.col(age_B).is_nan())
+        
+        # Flags missingness + age_from_peak (null si âge manquant)
+        df = df.with_columns([
+            is_missing_A.cast(pl.Int8).alias("age_missing_A"),
+            is_missing_B.cast(pl.Int8).alias("age_missing_B"),
+            
+            pl.when(is_missing_A).then(pl.lit(None))
+              .otherwise((pl.col(age_A) - PEAK_AGE).abs())
+              .clip(0, 50)
+              .cast(pl.Float32)
+              .alias("age_from_peak_A"),
+            
+            pl.when(is_missing_B).then(pl.lit(None))
+              .otherwise((pl.col(age_B) - PEAK_AGE).abs())
+              .clip(0, 50)
+              .cast(pl.Float32)
+              .alias("age_from_peak_B"),
+            
+            # Career phase
+            pl.when(is_missing_A).then(pl.lit("unknown"))
+              .when(pl.col(age_A) < 25).then(pl.lit("rising"))
+              .when(pl.col(age_A) > 30).then(pl.lit("declining"))
+              .otherwise(pl.lit("peak"))
+              .alias("career_phase_A"),
+            
+            pl.when(is_missing_B).then(pl.lit("unknown"))
+              .when(pl.col(age_B) < 25).then(pl.lit("rising"))
+              .when(pl.col(age_B) > 30).then(pl.lit("declining"))
+              .otherwise(pl.lit("peak"))
+              .alias("career_phase_B"),
+        ])
+        
+        # age_peak_advantage (sera null si l'un des deux est null)
+        df = df.with_columns([
+            (pl.col("age_from_peak_B") - pl.col("age_from_peak_A"))
+            .cast(pl.Float32)
+            .alias("age_peak_advantage_A"),
+            
+            pl.when((pl.col("career_phase_A") == "rising") & (pl.col("career_phase_B") == "declining"))
+              .then(pl.lit(0.05))
+              .when((pl.col("career_phase_A") == "declining") & (pl.col("career_phase_B") == "rising"))
+              .then(pl.lit(-0.05))
+              .otherwise(pl.lit(0.0))
+              .cast(pl.Float32)
+              .alias("career_trajectory_advantage_A"),
+        ])
+        
+        # Stats
+        peak_coverage = df["age_from_peak_A"].is_not_null().mean()
+        print(f"  ✅ Age-Peak features added")
+        print(f"     age_from_peak coverage: {peak_coverage:.1%}")
+        
+    else:
+        print("  ⚠️ age_at_match_A/B not found - skipping age-peak features")
+    
+    n_after = len(df.columns)
+    print(f"\n  Cellule F: {n_after - n_before} features added")
+    
+    return df
+
+
+# ===============================================
+# SECTION 3: SHUFFLE A/B (avec is_swapped)
+# ===============================================
+
+def shuffle_ab(df: pl.DataFrame, seed: int = 42) -> pl.DataFrame:
+    """
+    Shuffle A/B pour avoir target 50/50.
+    
+    ✅ NASA FIX: Garde is_swapped pour post-shuffle features.
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 3: SHUFFLE A/B")
+    print("=" * 70)
+    
+    n_rows = len(df)
+    
+    np.random.seed(seed)
+    swap_array = np.random.rand(n_rows) < 0.5
+    n_swapped = swap_array.sum()
+    
+    print(f"  Swapping {n_swapped:,} rows ({100*n_swapped/n_rows:.1f}%)")
+    
+    # ✅ Garder is_swapped pour post-shuffle features
+    df = df.with_columns([
+        pl.Series("is_swapped", swap_array).cast(pl.Int8)
+    ])
+    
+    # Identify paired columns
+    cols_A = [c for c in df.columns if c.endswith("_A")]
+    cols_B = [c for c in df.columns if c.endswith("_B")]
+    
+    bases_A = {c[:-2] for c in cols_A}
+    bases_B = {c[:-2] for c in cols_B}
+    paired_bases = bases_A & bases_B
+    
+    print(f"  Paired features to swap: {len(paired_bases)}")
+    
+    # Build swap expressions
+    swap_exprs = []
+    
+    for base in paired_bases:
+        col_a = f"{base}_A"
+        col_b = f"{base}_B"
+        
+        if col_a in df.columns and col_b in df.columns:
+            swap_exprs.extend([
+                pl.when(pl.col("is_swapped") == 1).then(pl.col(col_b)).otherwise(pl.col(col_a)).alias(f"_new_{col_a}"),
+                pl.when(pl.col("is_swapped") == 1).then(pl.col(col_a)).otherwise(pl.col(col_b)).alias(f"_new_{col_b}"),
+            ])
+    
+    # Swap winner_id <-> loser_id
+    if "winner_id" in df.columns and "loser_id" in df.columns:
+        swap_exprs.extend([
+            pl.when(pl.col("is_swapped") == 1).then(pl.col("loser_id")).otherwise(pl.col("winner_id")).alias("_new_winner_id"),
+            pl.when(pl.col("is_swapped") == 1).then(pl.col("winner_id")).otherwise(pl.col("loser_id")).alias("_new_loser_id"),
+        ])
+    
+    if swap_exprs:
+        df = df.with_columns(swap_exprs)
+    
+    # Replace columns
+    rename_map = {}
+    drop_cols = []
+    
+    for base in paired_bases:
+        col_a = f"{base}_A"
+        col_b = f"{base}_B"
+        new_a = f"_new_{col_a}"
+        new_b = f"_new_{col_b}"
+        
+        if new_a in df.columns:
+            drop_cols.extend([col_a, col_b])
+            rename_map[new_a] = col_a
+            rename_map[new_b] = col_b
+    
+    if "_new_winner_id" in df.columns:
+        drop_cols.extend(["winner_id", "loser_id"])
+        rename_map["_new_winner_id"] = "winner_id"
+        rename_map["_new_loser_id"] = "loser_id"
+    
+    df = df.drop([c for c in drop_cols if c in df.columns])
+    df = df.rename(rename_map)
+    
+    # Invert diff columns (all diffs are A-B, need to be inverted on swap)
+    # ✅ All diff features now follow A-B convention
+    diff_cols = [c for c in df.columns if c.startswith("diff")]
+    if diff_cols:
+        invert_exprs = [
+            pl.when(pl.col("is_swapped") == 1).then(-pl.col(c)).otherwise(pl.col(c)).alias(c)
+            for c in diff_cols
+        ]
+        df = df.with_columns(invert_exprs)
+        print(f"  ✅ Inverted {len(diff_cols)} diff* cols on swap")
+    
+    # ✅ FIX: Auto-detect ALL signed columns that need inversion
+    # Extended pattern to catch more signed column naming conventions
+    pattern = re.compile(r"(_diff$)|(_gap$)|(_advantage(_A)?$)|(^inter__)|(_delta$)|(_spread$)|(_edge$)|(^net_)")
+    
+    # Explicit whitelist of signed columns (more robust than pattern alone)
+    explicit_signed = {
+        "srgs_diff",  # SRGS difference
+        # Add any other known signed columns here
+    }
+    
+    # Exclude post-shuffle features (already correct orientation)
+    post_shuffle_cols = {"diff_log_rank", "diff_rank_normalized", "is_underdog_A"}
+    
+    # ✅ FIX: Symmetric exceptions - these are NOT A/B dependent, must NOT invert
+    # rank_gap = rank_worst - rank_best → always positive, independent of who is A/B
+    symmetric_exceptions = {"rank_gap"}
+    
+    # Find all matching columns (pattern OR explicit whitelist)
+    numeric_types = {pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64}
+    auto_signed = [
+        c for c in df.columns
+        if (pattern.search(c) or c in explicit_signed)
+        and c not in post_shuffle_cols
+        and c not in symmetric_exceptions  # ✅ Don't invert symmetric features
+        and c not in diff_cols  # Already handled above
+        and df[c].dtype in numeric_types
+    ]
+    
+    if auto_signed:
+        df = df.with_columns([
+            pl.when(pl.col("is_swapped") == 1).then(-pl.col(c)).otherwise(pl.col(c)).alias(c)
+            for c in auto_signed
+        ])
+        print(f"  ✅ Auto-inverted {len(auto_signed)} signed cols on swap:")
+        for c in sorted(auto_signed)[:10]:
+            print(f"      - {c}")
+        if len(auto_signed) > 10:
+            print(f"      ... and {len(auto_signed) - 10} more")
+    
+    # Create target based on is_swapped
+    df = df.with_columns([
+        pl.when(pl.col("is_swapped") == 1).then(pl.lit(0)).otherwise(pl.lit(1))
+        .cast(pl.Int8).alias("target_A_wins")
+    ])
+    
+    # Verify balance
+    target_dist = df.group_by("target_A_wins").len().sort("target_A_wins")
+    print(f"\n  Target distribution:")
+    for row in target_dist.iter_rows():
+        pct = 100 * row[1] / n_rows
+        print(f"    {row[0]}: {row[1]:,} ({pct:.1f}%)")
+    
+    # ✅ NE PAS drop is_swapped ici - on en a besoin pour post-shuffle features
+    
+    return df
+
+
+# ==============================================================================
+# HELPER: Date expression
+# ==============================================================================
+
+def _date_expr(df: pl.DataFrame, col: str = "tourney_date_ta") -> pl.Expr:
+    """Convert tourney_date_ta to Date type."""
+    if df[col].dtype in [pl.Int64, pl.Int32]:
+        return pl.col(col).cast(pl.Utf8).str.to_datetime("%Y%m%d").cast(pl.Date)
+    return pl.col(col).cast(pl.Date)
+
+  # ==============================================================================
+  # POST-SHUFFLE: GLICKO & MARKOV (NASA GOD SOTA ANTI-LEAK)
+  # ==============================================================================
+
+def add_post_shuffle_proba(df: pl.DataFrame) -> pl.DataFrame:
+  """
+  Calcule glicko_prob et markov features APRES shuffle.
+  ✅ NASA ANTI-LEAK: Utilise les ratings A/B déjà swappés.
+  """
+
+  # --- GLICKO PROBABILITY POST-SHUFFLE ---
+  print("\n" + "=" * 70)
+  print("   POST-SHUFFLE GLICKO PROBABILITY (NASA ANTI-LEAK)")
+  print("=" * 70)
+
+  glicko_rating_A = None
+  for col_base in ["g2_global_rating", "g2_surface_H_rating", "g2_surface_C_rating"]:
+      col_A = f"{col_base}_A"
+      col_B = f"{col_base}_B"
+      if col_A in df.columns and col_B in df.columns:
+          glicko_rating_A = col_A
+          glicko_rating_B = col_B
+          print(f"  Using: {col_A}, {col_B}")
+          break
+
+  if glicko_rating_A:
+      df = df.with_columns([
+          (1 / (1 + (10 ** ((pl.col(glicko_rating_B) - pl.col(glicko_rating_A)) / 400))))
+          .fill_null(0.5)
+          .clip(0.05, 0.95)
+          .cast(pl.Float32)
+          .alias("glicko_prob_A"),
+      ])
+
+      # Surface-specific
+      surface_rating_A = None
+      for surface in ["H", "C", "G", "P"]:
+          col_A = f"g2_surface_{surface}_rating_A"
+          col_B = f"g2_surface_{surface}_rating_B"
+          if col_A in df.columns and col_B in df.columns:
+              surface_rating_A = col_A
+              surface_rating_B = col_B
+              break
+
+      if surface_rating_A:
+          df = df.with_columns([
+              (1 / (1 + (10 ** ((pl.col(surface_rating_B) - pl.col(surface_rating_A)) / 400))))
+              .fill_null(0.5)
+              .clip(0.05, 0.95)
+              .cast(pl.Float32)
+              .alias("glicko_prob_surface_A"),
+          ])
+          df = df.with_columns([
+              (0.7 * pl.col("glicko_prob_A") + 0.3 * pl.col("glicko_prob_surface_A"))
+              .cast(pl.Float32)
+              .alias("glicko_prob_blend_A"),
+          ])
+          print("  ✅ glicko_prob_A, glicko_prob_surface_A, glicko_prob_blend_A (POST-SHUFFLE)")
+      else:
+          df = df.with_columns([pl.col("glicko_prob_A").alias("glicko_prob_blend_A")])
+          print("  ✅ glicko_prob_A, glicko_prob_blend_A (POST-SHUFFLE)")
+  else:
+      print("  ⚠️ No Glicko ratings found, skipping")
+
+  # --- MARKOV CHAIN POST-SHUFFLE ---
+  print("\n" + "=" * 70)
+  print("   POST-SHUFFLE MARKOV CHAIN (NASA ANTI-LEAK)")
+  print("=" * 70)
+
+  DEFAULT_P_SRV = 0.63
+
+  def p_game_numpy(p: np.ndarray) -> np.ndarray:
+      q = 1 - p
+      p_deuce = 20 * (p ** 3) * (q ** 3)
+      denom = p ** 2 + q ** 2
+      p_win_deuce = np.where(denom < 1e-10, 0.5, (p ** 2) / denom)
+      p_win_before = p**4 + 4 * p**4 * q + 10 * p**4 * q**2
+      return np.clip(p_win_before + p_deuce * p_win_deuce, 0.01, 0.99)
+
+  if "p_srv_pt_prior_A" in df.columns and "p_srv_pt_prior_B" in df.columns:
+      p_A = df["p_srv_pt_prior_A"].fill_nan(DEFAULT_P_SRV).fill_null(DEFAULT_P_SRV).to_numpy()
+      p_B = df["p_srv_pt_prior_B"].fill_nan(DEFAULT_P_SRV).fill_null(DEFAULT_P_SRV).to_numpy()
+
+      print(f"  p_srv_pt_prior_A: mean={np.mean(p_A):.4f}")
+      print(f"  p_srv_pt_prior_B: mean={np.mean(p_B):.4f}")
+
+      p_hold_A = p_game_numpy(p_A)
+      p_hold_B = p_game_numpy(p_B)
+      p_break_A = 1 - p_hold_B
+      p_break_B = 1 - p_hold_A
+
+      num = p_hold_A * p_break_A
+      den = p_hold_B * p_break_B + 1e-10
+      r = num / den
+      p_set_A = np.clip(r / (1 + r), 0.05, 0.95)
+
+      if "best_of_ta" in df.columns:
+          best_of = df["best_of_ta"].fill_null(3).to_numpy().astype(int)
+      else:
+          best_of = np.full(len(df), 3)
+
+      q_set_A = 1 - p_set_A
+      p_match_A = np.where(
+          best_of == 5,
+          p_set_A**3 + 3 * p_set_A**3 * q_set_A + 6 * p_set_A**3 * q_set_A**2,
+          p_set_A**2 + 2 * p_set_A**2 * q_set_A
+      )
+      p_match_A = np.clip(p_match_A, 0.01, 0.99)
+      p_match_B = 1 - p_match_A
+
+      df = df.with_columns([
+          pl.Series("markov_p_hold_A", p_hold_A).cast(pl.Float32),
+          pl.Series("markov_p_hold_B", p_hold_B).cast(pl.Float32),
+          pl.Series("markov_p_break_A", p_break_A).cast(pl.Float32),
+          pl.Series("markov_p_break_B", p_break_B).cast(pl.Float32),
+          pl.Series("markov_p_set_A", p_set_A).cast(pl.Float32),
+          pl.Series("markov_p_set_B", 1 - p_set_A).cast(pl.Float32),
+          pl.Series("markov_p_match_A", p_match_A).cast(pl.Float32),
+          pl.Series("markov_p_match_B", p_match_B).cast(pl.Float32),
+          pl.Series("markov_edge_A", p_match_A - 0.5).cast(pl.Float32),
+          pl.Series("markov_edge_B", p_match_B - 0.5).cast(pl.Float32),
+          pl.Series("markov_fair_odds_A", 1.0 / (p_match_A + 0.001)).cast(pl.Float32),
+          pl.Series("markov_fair_odds_B", 1.0 / (p_match_B + 0.001)).cast(pl.Float32),
+      ])
+      print(f"  ✅ Markov POST-SHUFFLE: p_match_A mean={np.mean(p_match_A):.4f}")
+  else:
+      print("  ⚠️ p_srv_pt_prior_A/B not found, skipping Markov")
+
+  return df
+# ==============================================================================
+# NASA ULTIME: NEUTRAL RANK FEATURES (depuis table historisée)
+# ==============================================================================
+
+def add_neutral_rank_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Ajoute rank_pre_A/rank_pre_B depuis la table historisée (NASA ULTIME).
+    """
+    
+    print("\n" + "=" * 70)
+    print("   NEUTRAL RANK FEATURES (NASA ULTIME)")
+    print("=" * 70)
+    
+    rankings_path = DATA_CLEAN / "features" / "atp_rankings_history.parquet"
+    
+    if not rankings_path.exists():
+        print(f"  ⚠️ Rankings history not found: {rankings_path}")
+        print("  → Run create_rankings_history.py first!")
+        return df
+    
+    # ✅ FIX: Load ONCE with correct variable name
+    rankings = pl.read_parquet(rankings_path)
+    print(f"  📁 Loaded {len(rankings):,} ranking entries")
+    
+    # ✅ FIX: Sort rankings (use same variable!)
+    rankings = rankings.with_columns([
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("rank_date").cast(pl.Date)
+    ]).sort(["player_id", "rank_date"])
+    
+    # Préparer la date du match
+    df = df.with_columns([
+        _date_expr(df, "tourney_date_ta").alias("match_date")
+    ])
+    
+    # Ajouter row_id pour le join
+    df = df.with_row_index("_row_id")
+    
+    # ===== JOIN POUR PLAYER A =====
+    # ✅ FIX: Include _row_id in selection!
+    left_A = df.select([
+        pl.col("_row_id"),  # ← AJOUTÉ !
+        pl.col("player_A_id").cast(pl.Utf8).alias("player_id"),
+        pl.col("match_date"),
+    ]).sort(["player_id", "match_date"])
+    
+    right_A = rankings.rename({"rank_date": "ref_date", "rank": "rank_pre_A"})
+    
+    joined_A = left_A.join_asof(
+        right_A,
+        left_on="match_date",
+        right_on="ref_date",
+        by="player_id",
+        strategy="backward"
+    ).select(["_row_id", "rank_pre_A"])
+    
+    # ===== JOIN POUR PLAYER B =====
+    # ✅ FIX: Include _row_id in selection!
+    left_B = df.select([
+        pl.col("_row_id"),  # ← AJOUTÉ !
+        pl.col("player_B_id").cast(pl.Utf8).alias("player_id"),
+        pl.col("match_date"),
+    ]).sort(["player_id", "match_date"])
+    
+    right_B = rankings.rename({"rank_date": "ref_date", "rank": "rank_pre_B"})
+    
+    joined_B = left_B.join_asof(
+        right_B,
+        left_on="match_date",
+        right_on="ref_date",
+        by="player_id",
+        strategy="backward"
+    ).select(["_row_id", "rank_pre_B"])
+    
+    # ===== MERGE BACK =====
+    df = (
+        df
+        .join(joined_A, on="_row_id", how="left")
+        .join(joined_B, on="_row_id", how="left")
+        .drop(["_row_id"])
+    )
+    
+    # Stats
+    coverage_A = df["rank_pre_A"].is_not_null().mean()
+    coverage_B = df["rank_pre_B"].is_not_null().mean()
+    print(f"  ✅ Neutral ranks joined")
+    print(f"     Coverage: A={coverage_A:.1%}, B={coverage_B:.1%}")
+    
+    # ===== CRÉER LES FEATURES DÉRIVÉES =====
+    df = df.with_columns([
+        # diff_log_rank
+        (pl.col("rank_pre_B").fill_null(500).clip(1, 2000).log() - 
+         pl.col("rank_pre_A").fill_null(500).clip(1, 2000).log())
+        .fill_nan(0.0)
+        .cast(pl.Float32)
+        .alias("diff_log_rank"),
+        
+        # is_underdog_A
+        (pl.col("rank_pre_A").fill_null(9999) > 
+         pl.col("rank_pre_B").fill_null(1) * 2)
+        .cast(pl.Int8)
+        .alias("is_underdog_A"),
+        
+        # diff_rank_normalized
+        ((pl.col("rank_pre_B").fill_null(100) - 
+          pl.col("rank_pre_A").fill_null(100)) / 100)
+        .clip(-5, 5)
+        .cast(pl.Float32)
+        .alias("diff_rank_normalized"),
+        
+        # rank_best / rank_worst
+        pl.min_horizontal(
+            pl.col("rank_pre_A").fill_null(9999),
+            pl.col("rank_pre_B").fill_null(9999)
+        ).alias("rank_best"),
+        
+        pl.max_horizontal(
+            pl.col("rank_pre_A").fill_null(9999),
+            pl.col("rank_pre_B").fill_null(9999)
+        ).alias("rank_worst"),
+    ])
+    
+    # Features symétriques dérivées
+    df = df.with_columns([
+        (pl.col("rank_best") <= 10).cast(pl.Int8).alias("has_top10_player"),
+        (pl.col("rank_best") <= 50).cast(pl.Int8).alias("has_top50_player"),
+        (pl.col("rank_worst") - pl.col("rank_best")).cast(pl.Float32).alias("rank_gap"),
+    ])
+    
+    print(f"  ✅ diff_log_rank, is_underdog_A, diff_rank_normalized")
+    print(f"  ✅ rank_best, rank_worst, has_top10_player, has_top50_player, rank_gap")
+    
+    # Correlation check
+    corr_df = df.filter(pl.col("diff_log_rank").is_finite())
+    if len(corr_df) > 100:
+        corr = corr_df.select(pl.corr("target_A_wins", "diff_log_rank")).item()
+        print(f"\n  🔍 Info: corr(target, diff_log_rank) = {corr:.4f}")
+    
+    return df
+
+
+# ==============================================================================
+# LEGACY: POST-SHUFFLE RANK FEATURES (pour mode "practical")
+# ==============================================================================
+
+def add_post_shuffle_rank_features_legacy(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    [LEGACY] Calcule les features de rang depuis winner/loser.
+    Utilisé seulement si RANK_MODE != "ultimate".
+    """
+    
+    print("\n" + "=" * 70)
+    print("   POST-SHUFFLE RANK FEATURES (LEGACY)")
+    print("=" * 70)
+    
+    if "winner_rank_ta" not in df.columns or "loser_rank_ta" not in df.columns:
+        print("  ⚠️ winner_rank_ta/loser_rank_ta not found, skipping")
+        return df
+    
+    if "is_swapped" not in df.columns:
+        print("  ⚠️ is_swapped not found (shuffle not done?), skipping")
+        return df
+    
+    df = df.with_columns([
+        pl.when(pl.col("is_swapped") == 0)
+          .then(pl.col("winner_rank_ta"))
+          .otherwise(pl.col("loser_rank_ta"))
+          .alias("rank_A"),
+        
+        pl.when(pl.col("is_swapped") == 0)
+          .then(pl.col("loser_rank_ta"))
+          .otherwise(pl.col("winner_rank_ta"))
+          .alias("rank_B"),
+    ])
+    
+    df = df.with_columns([
+        (pl.col("rank_B").fill_null(500).clip(1, 2000).log() - 
+         pl.col("rank_A").fill_null(500).clip(1, 2000).log())
+        .fill_nan(0.0)
+        .cast(pl.Float32)
+        .alias("diff_log_rank"),
+        
+        (pl.col("rank_A").fill_null(9999) > 
+         pl.col("rank_B").fill_null(1) * 2)
+        .cast(pl.Int8)
+        .alias("is_underdog_A"),
+        
+        # ✅ FIX: (B - A) for consistent "positive = advantage A" convention
+        ((pl.col("rank_B").fill_null(100) - 
+          pl.col("rank_A").fill_null(100)) / 100)
+        .clip(-5, 5)
+        .cast(pl.Float32)
+        .alias("diff_rank_normalized"),
+    ])
+    
+    print(f"  ✅ rank_A, rank_B, diff_log_rank, is_underdog_A, diff_rank_normalized")
+    print(f"  ⚠️ WARNING: Using legacy winner/loser ranks")
+    
+    return df
+
+
+# ==============================================================================
+# POST-SHUFFLE ODDS CONVERSION (utilise is_swapped, PAS target_A_wins)
+# ==============================================================================
+
+def convert_odds_to_AB(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Convertit les odds winner/loser → A/B après le shuffle.
+    
+    ✅ NASA FIX: Utilise is_swapped (pas target_A_wins).
+    ✅ PATCH: Ajoute has_odds flag AVANT imputation pour distinguer odds réelles vs imputées
+    """
+    
+    print("\n" + "=" * 70)
+    print("   POST-SHUFFLE ODDS CONVERSION")
+    print("=" * 70)
+    
+    # ✅ FIX: Vérifier que les DEUX colonnes existent
+    if ("odds_implied_prob_winner" not in df.columns) or ("odds_implied_prob_loser" not in df.columns):
+        print("  ⚠️ Odds implied prob winner/loser not both found, skipping")
+        df = df.with_columns([pl.lit(0).cast(pl.Int8).alias("has_odds")])
+        return df
+    
+    if "is_swapped" not in df.columns:
+        print("  ⚠️ is_swapped not found, skipping")
+        df = df.with_columns([pl.lit(0).cast(pl.Int8).alias("has_odds")])
+        return df
+    
+    # ✅ PATCH: Créer has_odds AVANT toute conversion/imputation
+    # Ce flag permet au modèle de savoir quand les odds sont réelles vs imputées
+    # Check both winner AND loser for robustness
+    df = df.with_columns([
+        (
+            (pl.col("odds_implied_prob_winner").is_not_null() & pl.col("odds_implied_prob_winner").is_not_nan()) |
+            (pl.col("odds_implied_prob_loser").is_not_null() & pl.col("odds_implied_prob_loser").is_not_nan())
+        )
+        .cast(pl.Int8)
+        .alias("has_odds")
+    ])
+    
+    # ✅ FIX: Utilise is_swapped, PAS target_A_wins
+    df = df.with_columns([
+        pl.when(pl.col("is_swapped") == 0)
+          .then(pl.col("odds_implied_prob_winner"))
+          .otherwise(pl.col("odds_implied_prob_loser"))
+          .cast(pl.Float32)
+          .alias("odds_implied_prob_A"),
+        
+        pl.when(pl.col("is_swapped") == 0)
+          .then(pl.col("odds_implied_prob_loser"))
+          .otherwise(pl.col("odds_implied_prob_winner"))
+          .cast(pl.Float32)
+          .alias("odds_implied_prob_B"),
+    ])
+    
+    if "odds_winner" in df.columns and "odds_loser" in df.columns:
+        df = df.with_columns([
+            pl.when(pl.col("is_swapped") == 0)
+              .then(pl.col("odds_winner"))
+              .otherwise(pl.col("odds_loser"))
+              .cast(pl.Float32)
+              .alias("odds_A"),
+            
+            pl.when(pl.col("is_swapped") == 0)
+              .then(pl.col("odds_loser"))
+              .otherwise(pl.col("odds_winner"))
+              .cast(pl.Float32)
+              .alias("odds_B"),
+        ])
+        
+        # ✅ FIX NASA: Clip odds before log to avoid inf/nan
+        # odds <= 0 → -inf, odds = 0 → nan
+        df = df.with_columns([
+            (pl.col("odds_B").clip(1.01, 1000).log() - 
+             pl.col("odds_A").clip(1.01, 1000).log())
+            .fill_nan(0.0)  # Safety: impute any remaining nan
+            .cast(pl.Float32)
+            .alias("log_odds_ratio_AB"),
+        ])
+    
+    cols_to_drop = ["odds_winner", "odds_loser", 
+                    "odds_implied_prob_winner", "odds_implied_prob_loser"]
+    df = df.drop([c for c in cols_to_drop if c in df.columns])
+    
+    # Stats using has_odds flag
+    n_with_odds = df["has_odds"].sum()
+    print(f"  ✅ Odds converted to A/B format")
+    print(f"  ✅ has_odds flag created (for blend strategy)")
+    print(f"  📊 Matchs with real odds: {n_with_odds:,}/{len(df):,} ({100*n_with_odds/len(df):.1f}%)")
+    
+    return df
+
+
+# ==============================================================================
+# DROP OUTCOME-CONDITIONED COLS (CRITICAL ANTI-LEAKAGE)
+# ==============================================================================
+
+def drop_outcome_conditioned_cols(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Drop les colonnes qui encodent le résultat via la structure winner/loser.
+    
+    ✅ CRITICAL: Ces colonnes révèlent qui a gagné par leur nom!
+    """
+    
+    print("\n" + "=" * 70)
+    print("   DROP OUTCOME-CONDITIONED COLS (LEAKAGE STRUCTUREL)")
+    print("=" * 70)
+    
+    # 1. Known leakage cols
+    leak = [c for c in LEAKAGE_COLS if c in df.columns]
+    
+    # 2. Any w_/l_ match stats (direct outcome)
+    wl = [c for c in df.columns if c.startswith(("w_", "l_"))]
+    
+    # 3. winner_/loser_ columns (SAUF IDs)
+    # ✅ FIX: Inclure winner_id/loser_id au cas où rename n'a pas eu lieu
+    keep_ids = {"player_A_id", "player_B_id", "winner_id", "loser_id"}
+    winlose = [
+        c for c in df.columns
+        if (c.startswith("winner_") or c.startswith("loser_")) 
+        and c not in keep_ids
+    ]
+    
+    # 4. Intermediate p_* columns (optional, for cleanup)
+    intermediate = [c for c in INTERMEDIATE_P_COLS if c in df.columns]
+    
+    # 5. ✅ FIX: Drop rank_A/rank_B (redondant avec diff_log_rank, diff_rank_normalized)
+    redundant_ranks = [c for c in ["rank_A", "rank_B"] if c in df.columns]
+    
+    # 6. ✅ NASA ULTIME: Drop rank orientées issues de winner/loser
+    rank_oriented = [c for c in RANK_ORIENTED_COLS if c in df.columns]
+    
+    # 7. ✅ Option: Drop absolute ranks pour éviter un "rank predictor"
+    absolute_ranks = []
+    if DROP_ABSOLUTE_RANKS:
+        absolute_ranks = [c for c in ABSOLUTE_RANK_COLS if c in df.columns]
+    
+    to_drop = list(dict.fromkeys(leak + wl + winlose + intermediate + redundant_ranks + rank_oriented + absolute_ranks))
+    
+    if to_drop:
+        print(f"  🧹 Dropping {len(to_drop)} outcome-conditioned columns:")
+        print(f"      Known leakage: {len(leak)}")
+        print(f"      w_/l_ stats: {len(wl)}")
+        print(f"      winner_/loser_: {len(winlose)}")
+        print(f"      Intermediate p_*: {len(intermediate)}")
+        print(f"      Redundant ranks: {len(redundant_ranks)}")
+        print(f"      Rank oriented (NASA): {len(rank_oriented)}")
+        if DROP_ABSOLUTE_RANKS:
+            print(f"      Absolute ranks (NASA): {len(absolute_ranks)}")
+        
+        if len(to_drop) <= 30:
+            for c in to_drop:
+                print(f"        - {c}")
+        else:
+            for c in to_drop[:15]:
+                print(f"        - {c}")
+            print(f"        ... and {len(to_drop) - 15} more")
+        
+        df = df.drop(to_drop)
+    else:
+        print("  ✅ No outcome-conditioned columns found")
+    
+    # ✅ NASA CHECK: Verify no winner_/loser_ remain
+    bad = [c for c in df.columns if c.startswith(("winner_", "loser_", "w_", "l_"))]
+    print(f"\n  🧪 NASA CHECK - Remaining winner/loser structural cols: {len(bad)}")
+    if bad:
+        print(f"     ⚠️ WARNING: {bad[:30]}")
+    else:
+        print(f"     ✅ CLEAN - No structural leakage!")
+    
+    return df
+
+
+# ===============================================
+# SECTION 4: TEMPORAL SPLIT
+# ===============================================
+
+def temporal_split(df: pl.DataFrame) -> tuple:
+    """Split temporel strict."""
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 4: TEMPORAL SPLIT")
+    print("=" * 70)
+    
+    train = df.filter(pl.col("year") <= TRAIN_END_YEAR)
+    val = df.filter((pl.col("year") > TRAIN_END_YEAR) & (pl.col("year") <= VAL_END_YEAR))
+    test = df.filter(pl.col("year") > VAL_END_YEAR)
+    
+    print(f"\n  Train: {len(train):,} rows (≤{TRAIN_END_YEAR})")
+    print(f"  Val:   {len(val):,} rows ({TRAIN_END_YEAR+1}-{VAL_END_YEAR})")
+    print(f"  Test:  {len(test):,} rows (>{VAL_END_YEAR})")
+    
+    return train, val, test
+
+
+# ===============================================
+# SECTION 5: FEATURE SELECTION
+# ===============================================
+
+def select_features(train: pl.DataFrame, val: pl.DataFrame, test: pl.DataFrame) -> tuple:
+    """Feature selection with SOTA features protection."""
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 5: FEATURE SELECTION")
+    print("=" * 70)
+    
+    # =========================================================================
+    # ✅ FIX NASA: Audit global unpaired _A/_B features (LEAKAGE RISK!)
+    # Any NUMERIC feature ending in _A without _B counterpart (or vice versa) 
+    # can leak winner/loser info after shuffle - EXCEPT legitimate post-shuffle
+    # features that don't need a _B counterpart by design.
+    # =========================================================================
+    print("\n[5.0] 🔍 NASA AUDIT: Detecting unpaired _A/_B features...")
+    
+    # ✅ ALLOWLIST: Features that are OK to be unpaired (post-shuffle, don't need _B)
+    # These are calculated AFTER shuffle and represent A-specific or A-B differences
+    UNPAIRED_OK = {
+        # Underdog flag (binary: is A the underdog?)
+        "is_underdog_A",
+        # Advantage features (A-B differences, no need for _B)
+        "rest_advantage_A",
+        "fatigue_advantage_A", 
+        "age_peak_advantage_A",
+        "career_trajectory_advantage_A",
+        "clutch_advantage_A",
+        "handedness_advantage_A",
+        "style_matchup_advantage_A",
+        "h2h_advantage_A",
+        # Probability features (prob that A wins, no need for _B)
+        #"glicko_prob_A",
+        #"glicko_prob_blend_A",
+        # Momentum/confidence (A-specific post-shuffle)
+        "deep_run_confidence_A",
+        "fatigue_momentum_A",
+    }
+    
+    # ✅ FIX: Use UNION of all splits (not just train) to catch schema drift
+    all_cols = set(train.columns) | set(val.columns) | set(test.columns)
+    
+    # ✅ FIX PARANO: Union of numeric columns from ALL splits (drift-proof)
+    numeric_types = {pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64}
+    
+    def numeric_set(df: pl.DataFrame) -> set:
+        return {c for c in df.columns if df[c].dtype in numeric_types}
+    
+    numeric_cols = numeric_set(train) | numeric_set(val) | numeric_set(test)
+    
+    cols_A = {c for c in all_cols if c.endswith("_A") and c in numeric_cols}
+    cols_B = {c for c in all_cols if c.endswith("_B") and c in numeric_cols}
+    
+    # Find unpaired NUMERIC features (excluding allowlist)
+    unpaired_A = []  # _A without _B
+    unpaired_B = []  # _B without _A
+    allowed_kept = []  # For logging
+    
+    for col_a in cols_A:
+        if col_a in UNPAIRED_OK:
+            allowed_kept.append(col_a)
+            continue  # ✅ Skip allowlisted features
+        col_b = col_a[:-2] + "_B"
+        if col_b not in cols_B:
+            unpaired_A.append(col_a)
+    
+    for col_b in cols_B:
+        col_a = col_b[:-2] + "_A"
+        if col_a not in cols_A:
+            unpaired_B.append(col_b)
+    
+    unpaired_all = unpaired_A + unpaired_B
+    
+    # Log allowlisted features that were kept
+    if allowed_kept:
+        print(f"  ✅ Kept {len(allowed_kept)} allowlisted unpaired features (post-shuffle, safe):")
+        for c in sorted(allowed_kept)[:10]:
+            print(f"      + {c}")
+        if len(allowed_kept) > 10:
+            print(f"      ... and {len(allowed_kept) - 10} more")
+    
+    if unpaired_all:
+        print(f"  🔴 Found {len(unpaired_all)} SUSPICIOUS unpaired features (LEAKAGE RISK!):")
+        for c in unpaired_all[:15]:
+            print(f"      - {c}")
+        if len(unpaired_all) > 15:
+            print(f"      ... and {len(unpaired_all) - 15} more")
+        
+        # Drop from ALL splits (union-based audit)
+        train = train.drop([c for c in unpaired_all if c in train.columns])
+        val = val.drop([c for c in unpaired_all if c in val.columns])
+        test = test.drop([c for c in unpaired_all if c in test.columns])
+        print(f"  ✅ Dropped {len(unpaired_all)} suspicious unpaired features")
+    else:
+        print(f"  ✅ No suspicious unpaired features found")
+    
+    # =========================================================================
+    
+    exclude_cols = ["target_A_wins", "year", "tourney_date_ta", "gender", 
+                    "tourney_surface_ta", "tourney_level_ta", "round_ta",
+                    "best_of_ta", "is_indoor", "match_status"]
+    exclude_cols += ID_COLS
+    
+    # ✅ FIX NASA: has_odds = META ONLY (not a training feature)
+    # has_odds is correlated with time (odds available mostly in recent era)
+    # Using it as feature creates temporal shortcut. Keep it only for PP10 blend.
+    exclude_cols.append("has_odds")
+    print("\n  ℹ️ has_odds excluded from features (meta only for blend)")
+    
+    # ✅ Option: Exclure les odds pour modèle sans cotes
+    if EXCLUDE_ODDS:
+        odds_cols = ["odds_A", "odds_B", "odds_implied_prob_A", "odds_implied_prob_B", 
+                     "log_odds_ratio_AB"]  # has_odds already excluded above
+        exclude_cols += odds_cols
+        print(f"  ⚠️ EXCLUDE_ODDS=True: Excluding {len(odds_cols)} odds-related features")
+    
+    numeric_types = [pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64]
+    numeric_cols = [c for c in train.columns 
+                    if c not in exclude_cols
+                    and train[c].dtype in numeric_types]
+    
+    print(f"\n[5.1] Initial numeric features: {len(numeric_cols)}")
+    
+    # Protected SOTA features
+    protected_in_data = [c for c in PROTECTED_SOTA_FEATURES if c in train.columns]
+    print(f"[5.1b] Protected SOTA features: {len(protected_in_data)}")
+    for f in protected_in_data:
+        coverage = train[f].is_not_null().mean()
+        print(f"       {f}: {coverage:.1%}")
+    
+    regular_cols = [c for c in numeric_cols if c not in protected_in_data]
+    
+    # ✅ FIX: Remove high null rate (including NaN!)
+    null_exprs = [(pl.col(c).is_null() | pl.col(c).is_nan()).mean().alias(c) for c in regular_cols]
+    null_rates_df = train.select(null_exprs)
+    null_rates = {c: null_rates_df[c][0] for c in regular_cols}
+    
+    keep_cols = [c for c in regular_cols if (null_rates[c] or 0) <= MAX_NULL_RATE]
+    print(f"[5.2] After null filter: {len(keep_cols)}")
+    
+    # Remove near-constant
+    var_exprs = [pl.col(c).var().alias(c) for c in keep_cols]
+    var_df = train.select(var_exprs)
+    variances = {c: var_df[c][0] for c in keep_cols}
+    
+    keep_cols = [c for c in keep_cols if (variances[c] or 0) >= MIN_VARIANCE_THRESHOLD]
+    print(f"[5.3] After variance filter: {len(keep_cols)}")
+    
+    # Correlation-based importance
+    correlations = {}
+    batch_size = 50
+    for i in range(0, len(keep_cols), batch_size):
+        batch_cols = keep_cols[i:i+batch_size]
+        corr_exprs = [pl.corr("target_A_wins", c).alias(c) for c in batch_cols]
+        corr_df = train.select(corr_exprs)
+        for c in batch_cols:
+            corr_val = corr_df[c][0]
+            correlations[c] = abs(corr_val) if corr_val is not None and not np.isnan(corr_val) else 0.0
+    
+    for c in protected_in_data:
+        try:
+            corr_val = train.select(pl.corr("target_A_wins", c))[0, 0]
+            correlations[c] = abs(corr_val) if corr_val is not None and not np.isnan(corr_val) else 0.0
+        except:
+            correlations[c] = 0.0
+    
+    sorted_features = sorted(correlations.items(), key=lambda x: x[1], reverse=True)
+    
+    print(f"\n  Top 10 by correlation:")
+    for feat, corr in sorted_features[:10]:
+        protected_mark = " [SOTA]" if feat in protected_in_data else ""
+        print(f"    {feat}: {corr:.4f}{protected_mark}")
+    
+    n_regular = MAX_FEATURES - len(protected_in_data)
+    regular_selected = [f for f, _ in sorted_features if f not in protected_in_data][:n_regular]
+    
+    selected_features = protected_in_data + regular_selected
+    print(f"\n  Selected: {len(selected_features)} features")
+    print(f"    - Protected SOTA: {len(protected_in_data)}")
+    print(f"    - Regular: {len(regular_selected)}")
+    
+    # ✅ FIX: Include meta columns for PP10 (not training features!)
+    # - tourney_date_ta: temporal sorting
+    # - has_odds: blend strategy (which model to use)
+    meta_cols = ["target_A_wins", "year", "tourney_date_ta", "has_odds"]
+    keep_all = meta_cols + [c for c in EXPORT_ID_COLS if c in train.columns] + selected_features
+    keep_all = list(dict.fromkeys([c for c in keep_all if c in train.columns]))
+    
+    # ✅ FIX: Force same schema across all splits (train/val/test)
+    def ensure_cols(df: pl.DataFrame, cols: list, ref: pl.DataFrame) -> pl.DataFrame:
+        """Ensure df has exactly the same columns as ref, in same order."""
+        exprs = []
+        for c in cols:
+            if c not in df.columns:
+                # Use dtype from ref if available, else Float32
+                dtype = ref[c].dtype if c in ref.columns else pl.Float32
+                exprs.append(pl.lit(None).cast(dtype).alias(c))
+        if exprs:
+            df = df.with_columns(exprs)
+            print(f"    ⚠️ Added {len(exprs)} missing columns to match schema")
+        return df.select(cols)  # Same order, same schema
+    
+    train_sel = train.select(keep_all)
+    val_sel = ensure_cols(val, keep_all, train_sel)
+    test_sel = ensure_cols(test, keep_all, train_sel)
+    
+    # Verify same schema
+    assert list(train_sel.columns) == list(val_sel.columns) == list(test_sel.columns), \
+        "Schema mismatch between splits!"
+    print(f"  ✅ Schema identical across train/val/test ({len(keep_all)} cols)")
+    
+    return train_sel, val_sel, test_sel, selected_features
+
+
+# ===============================================
+# SECTION 6: SCALING
+# ===============================================
+
+def apply_scaling(train: pl.DataFrame, val: pl.DataFrame, test: pl.DataFrame, 
+                  feature_cols: list) -> tuple:
+    """Applique QuantileTransformer."""
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 6: QUANTILE SCALING")
+    print("=" * 70)
+    
+    from sklearn.preprocessing import QuantileTransformer
+    import joblib
+    
+    # ✅ FIX: has_odds doit rester 0/1 (pas scalé!)
+    DONT_SCALE = ["has_odds"]
+    
+    numeric_types = [pl.Float32, pl.Float64, pl.Int32, pl.Int64, pl.Int16, pl.Int8]
+    scale_cols = [c for c in feature_cols 
+                  if c not in ID_COLS + ["target_A_wins", "year"] + DONT_SCALE
+                  and c in train.columns
+                  and train[c].dtype in numeric_types]
+    
+    print(f"\n  Scaling {len(scale_cols)} features")
+    print(f"  (Excluded from scaling: {DONT_SCALE})")
+    
+    # Compute medians
+    median_exprs = [pl.col(c).median().alias(c) for c in scale_cols]
+    medians_df = train.select(median_exprs)
+    medians = {c: medians_df[c][0] for c in scale_cols}
+    
+    # SOTA defaults
+    sota_defaults = {
+        "r20_win_rate_vs_top10_A": 0.3,
+        "r20_win_rate_vs_top10_B": 0.3,
+        "r20_win_rate_vs_top50_A": 0.4,
+        "r20_win_rate_vs_top50_B": 0.4,
+        "r20_upset_rate_A": 0.3,
+        "r20_upset_rate_B": 0.3,
+        "pref_ssi_A": 0.0,
+        "pref_ssi_B": 0.0,
+        "diff_pref_ssi": 0.0,
+        "diff_ssi_mismatch": 0.0,
+        "tourney_speed_index": 0.0,
+    }
+    
+    for col, default in sota_defaults.items():
+        if col in medians:
+            if medians[col] is None or np.isnan(medians[col]):
+                medians[col] = default
+                print(f"  ⚠️ {col}: using default {default}")
+    
+    # ✅ FIX: Impute both null AND NaN
+    impute_exprs = [
+        pl.when(pl.col(c).is_null() | pl.col(c).is_nan())
+        .then(pl.lit(medians.get(c, 0.0)))
+        .otherwise(pl.col(c))
+        .alias(c) 
+        for c in scale_cols
+    ]
+    train = train.with_columns(impute_exprs)
+    val = val.with_columns(impute_exprs)  # ✅ Same schema guaranteed
+    test = test.with_columns(impute_exprs)  # ✅ Same schema guaranteed
+    
+    # Scale train
+    train_np = train.select(scale_cols).to_numpy()
+    
+    scaler = QuantileTransformer(
+        n_quantiles=min(1000, len(train)),
+        output_distribution='normal',
+        random_state=RANDOM_SEED
+    )
+    
+    train_scaled = scaler.fit_transform(train_np)
+    del train_np
+    
+    for i, col in enumerate(scale_cols):
+        train = train.with_columns([pl.Series(col, train_scaled[:, i].astype(np.float32))])
+    del train_scaled
+    
+    # ✅ FIX: Simplified scaling (same schema guaranteed by ensure_cols)
+    val_np = val.select(scale_cols).to_numpy()
+    val_scaled = scaler.transform(val_np)
+    del val_np
+    
+    for i, col in enumerate(scale_cols):
+        val = val.with_columns([pl.Series(col, val_scaled[:, i].astype(np.float32))])
+    del val_scaled
+    
+    test_np = test.select(scale_cols).to_numpy()
+    test_scaled = scaler.transform(test_np)
+    del test_np
+    
+    for i, col in enumerate(scale_cols):
+        test = test.with_columns([pl.Series(col, test_scaled[:, i].astype(np.float32))])
+    del test_scaled
+    
+    scaler_path = OUTPUT_DIR / "quantile_scaler.joblib"
+    joblib.dump(scaler, scaler_path)
+    print(f"  Scaler saved: {scaler_path}")
+    
+    medians_path = OUTPUT_DIR / "imputation_medians.json"
+    medians_serializable = {k: float(v) if v is not None else 0.0 for k, v in medians.items()}
+    medians_path.write_text(json.dumps(medians_serializable, indent=2))
+    
+    return train, val, test
+
+
+# ===============================================
+# SECTION 7: EXPORT
+# ===============================================
+
+def export_datasets(train: pl.DataFrame, val: pl.DataFrame, test: pl.DataFrame, feature_cols: list):
+    """Export final datasets."""
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 7: EXPORT")
+    print("=" * 70)
+    # ✅ FIX CRITICAL: Sort by date BEFORE export!
+    # TimeSeriesSplit in PP10 assumes data is sorted chronologically
+    print("\n  🕐 Sorting splits by date before export...")
+    train = train.sort(["tourney_date_ta", "custom_match_id"])
+    val   = val.sort(["tourney_date_ta", "custom_match_id"])
+    test  = test.sort(["tourney_date_ta", "custom_match_id"])
+    print("     ✅ Sorted by tourney_date_ta")
+    train.write_parquet(OUTPUT_DIR / "train.parquet")
+    val.write_parquet(OUTPUT_DIR / "val.parquet")
+    test.write_parquet(OUTPUT_DIR / "test.parquet")
+    
+    (OUTPUT_DIR / "feature_list.json").write_text(json.dumps(feature_cols, indent=2))
+    
+    metadata = {
+        "created": datetime.now().isoformat(),
+        "train_rows": len(train),
+        "val_rows": len(val),
+        "test_rows": len(test),
+        "n_features": len(feature_cols),
+        "train_end_year": TRAIN_END_YEAR,
+        "val_end_year": VAL_END_YEAR,
+        "pipeline": "PP_09_NASA_GOD_SOTA_2026",
+    }
+    (OUTPUT_DIR / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    
+    print(f"\n  ✅ Exported to {OUTPUT_DIR}")
+    print(f"     train.parquet: {len(train):,} rows")
+    print(f"     val.parquet: {len(val):,} rows")
+    print(f"     test.parquet: {len(test):,} rows")
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    """Pipeline complet NASA GOD MODE."""
+    
+    print("\n" + "=" * 70)
+    print("   PP_09 - NASA GOD MODE SOTA 2026")
+    print("   TennisTitan - Anti-Leakage FINAL")
+    print("=" * 70)
+    print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   RANK_MODE: {RANK_MODE}")
+    print(f"   EXCLUDE_ODDS: {EXCLUDE_ODDS}")
+    print(f"   OUTPUT_DIR: {OUTPUT_DIR}")
+    print("=" * 70)
+    
+    t0 = time.perf_counter()
+    
+    # 1. Load
+    df = load_dataset()
+    gc.collect()
+    
+    # 2. Add ALL missing features (Cellules A-E)
+    df = add_cellule_a_features(df)
+    gc.collect()
+    
+    df = add_cellule_b_features(df)
+    gc.collect()
+    
+    df = add_cellule_c_features(df)
+    gc.collect()
+    
+    # ✅ Cellule F: Age-Peak (APRÈS Cellule C qui crée age_at_match_A/B)
+    df = add_age_peak_features_pp09(df)
+    gc.collect()
+    
+    df = add_cellule_d_features(df)
+    gc.collect()
+    
+    df = add_cellule_e_features(df)
+    gc.collect()
+    
+    print("\n" + "=" * 70)
+    print("   FEATURE SUMMARY")
+    print("=" * 70)
+    print(f"  Total columns before shuffle: {len(df.columns)}")
+    
+    # 3. Shuffle (garde is_swapped)
+    df = shuffle_ab(df, seed=RANDOM_SEED)
+    gc.collect()
+    
+    # ✅ 3.1 Renommer IDs winner/loser → A/B
+    if "winner_id" in df.columns and "loser_id" in df.columns:
+        df = df.rename({"winner_id": "player_A_id", "loser_id": "player_B_id"})
+        print("\n  ✅ Renamed winner_id/loser_id → player_A_id/player_B_id")
+    
+    # ✅ HARDENING: Defensive drop of winner_id/loser_id (in case of accidental re-introduction)
+    residual_ids = [c for c in ["winner_id", "loser_id"] if c in df.columns]
+    if residual_ids:
+        df = df.drop(residual_ids)
+        print(f"  ⚠️ Defensively dropped residual IDs: {residual_ids}")
+
+    # ✅ 3.2 POST-SHUFFLE PROBABILITIES (NASA ANTI-LEAK)
+    df = add_post_shuffle_proba(df)
+    gc.collect()
+
+    # ✅ 3.2 Post-shuffle features - SELON RANK_MODE
+    if RANK_MODE == "ultimate":
+        # NASA ULTIME: Ranks neutres depuis table historisée
+        df = add_neutral_rank_features(df)
+        # ✅ FIX: Drop absolute ranks - force model to use derived features only
+        # Keeps: diff_log_rank, is_underdog_A, diff_rank_normalized, rank_gap, has_top10_player
+        # Prevents model from becoming a simple "rank predictor"
+        abs_rank_cols = [c for c in ["rank_pre_A", "rank_pre_B"] if c in df.columns]
+        if abs_rank_cols:
+            df = df.drop(abs_rank_cols)
+            print(f"  ✅ Dropped absolute ranks: {abs_rank_cols} (using derived features only)")
+    elif RANK_MODE == "practical":
+        # Mode pratique: Ranks depuis winner/loser (avec is_swapped)
+        df = add_post_shuffle_rank_features_legacy(df)
+    else:
+        # Mode strict: Pas de ranks orientés
+        print("\n  ⚠️ RANK_MODE=strict: No oriented rank features")
+    
+    # ✅ FIX: Conversion odds conditionnelle
+    if EXCLUDE_ODDS:
+        # Pas d'odds dans ce pipeline → has_odds constant = 0 (non protégé)
+        print("\n" + "=" * 70)
+        print("   SKIP ODDS CONVERSION (EXCLUDE_ODDS=True)")
+        print("=" * 70)
+        df = df.with_columns([pl.lit(0).cast(pl.Int8).alias("has_odds")])
+        print("  ⏭️ Odds conversion skipped")
+        print("  ✅ has_odds set to 0 for all rows (not protected)")
+    else:
+        df = convert_odds_to_AB(df)
+    gc.collect()
+    
+    # ✅ 3.3 DROP LEAKAGE STRUCTUREL (CRITICAL!)
+    df = drop_outcome_conditioned_cols(df)
+    gc.collect()
+    
+    # ✅ FINAL NASA CHECK: Verify no winner/loser cols remain (HARD ASSERT)
+    remaining_wl = [c for c in df.columns if c.startswith(("winner_", "loser_", "w_", "l_"))]
+    if remaining_wl:
+        print(f"\n  🔴 CRITICAL: Still have {len(remaining_wl)} winner/loser cols: {remaining_wl[:20]}")
+        # ✅ HARDENING: This is a hard failure - leakage cannot be tolerated
+        assert len(remaining_wl) == 0, f"LEAKAGE DETECTED! Outcome-conditioned cols remaining: {remaining_wl[:20]}"
+    else:
+        print("\n  ✅ FINAL NASA CHECK: 0 winner/loser columns remaining - CLEAN!")
+    
+    # ✅ 3.4 Drop is_swapped (ne jamais l'entraîner!)
+    if "is_swapped" in df.columns:
+        df = df.drop("is_swapped")
+        print("\n  ✅ Dropped is_swapped (not for training)")
+    
+    # 4. Split temporel
+    train, val, test = temporal_split(df)
+    del df
+    gc.collect()
+    
+    # 5. Select
+    train, val, test, feature_cols = select_features(train, val, test)
+    gc.collect()
+    
+    # 6. Scale
+    train, val, test = apply_scaling(train, val, test, feature_cols)
+    gc.collect()
+    
+    # 7. Export
+    export_datasets(train, val, test, feature_cols)
+    
+    elapsed = time.perf_counter() - t0
+    
+    print("\n" + "=" * 70)
+    print(f"   ✅ PP_09 NASA COMPLETE! Time: {elapsed:.1f}s")
+    print("=" * 70)
+    
+    print(f"""
+📊 FINAL SUMMARY:
+   Train: {len(train):,} rows
+   Val: {len(val):,} rows
+   Test: {len(test):,} rows
+   Features: {len(feature_cols)}
+   Rank Mode: {RANK_MODE}
+   Exclude Odds: {EXCLUDE_ODDS}
+   Output: {OUTPUT_DIR}
+
+✅ NASA ANTI-LEAKAGE CHECKS:
+   - is_swapped used for post-shuffle (not target_A_wins)
+   - IDs renamed to player_A_id/player_B_id
+   - All winner_/loser_/w_/l_ cols dropped
+   - SRGS features KEPT (paired _A/_B, no leakage)
+   - Markov features KEPT (properly paired _A/_B from PP08B v5)
+   - Post-shuffle advantage features KEPT (allowlisted)
+   - Ranks from historical table (NASA ULTIME) ✅
+""")
+
+
+if __name__ == "__main__":
+    main()

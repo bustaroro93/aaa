@@ -1,0 +1,70 @@
+======================================================================
+   PP05B - SSI MULTI-FACTEUR GOD SOTA 2026
+======================================================================
+   2026-01-08 18:30:26
+======================================================================
+
+[1] Loading matches_base...
+  Loaded: 544,245 matches
+
+============================================================
+SECTION 1: SSI PAR SURFACE
+============================================================
+  Player-match rows: 1,088,490
+  Processing Hard...
+  Processing Clay...
+  Processing Grass...
+  ssi_current_surface_A: 100.0% coverage
+  diff_ssi_current_surface: 100.0% coverage
+
+============================================================
+SECTION 2: SSI INDOOR VS OUTDOOR
+============================================================
+
+============================================================
+SECTION 3: SSI BY TOURNAMENT LEVEL
+============================================================
+
+======================================================================
+   SUMMARY
+======================================================================
+  New columns: 29
+
+  📊 NEW FEATURES (29):
+     big_event_preference_A: 100.0% coverage, mean=-0.039
+     big_event_preference_B: 100.0% coverage, mean=0.011
+     diff_big_event_preference: 100.0% coverage, mean=-0.050
+     diff_indoor_preference: 100.0% coverage, mean=-0.055
+     diff_ssi_clay: 100.0% coverage, mean=0.039
+     diff_ssi_context: 100.0% coverage, mean=0.055
+     diff_ssi_current_surface: 100.0% coverage, mean=0.050
+     diff_ssi_grass: 100.0% coverage, mean=0.005
+     diff_ssi_hard: 100.0% coverage, mean=0.036
+     diff_wr_event_context: 100.0% coverage, mean=0.056
+     indoor_preference_A: 100.0% coverage, mean=-0.036
+     indoor_preference_B: 100.0% coverage, mean=0.019
+     is_big_event: (non-numeric)
+     ssi_clay_A: 100.0% coverage, mean=0.519
+     ssi_clay_B: 100.0% coverage, mean=0.480
+     ssi_current_surface_A: 100.0% coverage, mean=0.537
+     ssi_current_surface_B: 100.0% coverage, mean=0.487
+     ssi_grass_A: 100.0% coverage, mean=0.511
+     ssi_grass_B: 100.0% coverage, mean=0.506
+     ssi_hard_A: 100.0% coverage, mean=0.518
+     ssi_hard_B: 100.0% coverage, mean=0.482
+     ssi_indoor_A: 100.0% coverage, mean=0.500
+     ssi_indoor_B: 100.0% coverage, mean=0.500
+     ssi_outdoor_A: 100.0% coverage, mean=0.536
+     ssi_outdoor_B: 100.0% coverage, mean=0.481
+     wr_big_events_A: 100.0% coverage, mean=0.503
+     wr_big_events_B: 100.0% coverage, mean=0.497
+     wr_small_events_A: 100.0% coverage, mean=0.542
+     wr_small_events_B: 100.0% coverage, mean=0.486
+
+  ✅ Saved to C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\ssi_multi\ssi_multi_match_level.parquet
+
+  ⏱️ Total time: 2.5s
+
+======================================================================
+   PP05B COMPLETE
+======================================================================

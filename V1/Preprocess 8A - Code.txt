@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+# ===============================================
+# PP_08A - Rank History2026 v5
+# CREATE ATP RANKINGS HISTORY
+# Extrait les rankings historisés depuis les matchs
+# ===============================================
+#
+# Input: matches_ml_ready.parquet (ou SOTA_v4)
+# Output: data_clean/features/atp_rankings_history.parquet
+#
+# Usage: python create_rankings_history.py
+# ===============================================
+
+import polars as pl
+from pathlib import Path
+from datetime import datetime
+
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+ML_READY_DIR = DATA_CLEAN / "ml_ready"
+OUTPUT_DIR = DATA_CLEAN / "features"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Chercher le meilleur fichier source
+CANDIDATES = [
+    ML_READY_DIR / "matches_ml_ready_SOTA_v4.parquet",
+    ML_READY_DIR / "matches_ml_ready_SOTA_v3.parquet",
+    ML_READY_DIR / "matches_ml_ready.parquet",
+]
+
+
+def main():
+    print("\n" + "=" * 70)
+    print("   CREATE ATP RANKINGS HISTORY")
+    print("=" * 70)
+    print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+    
+    # Trouver le fichier source
+    source_path = None
+    for path in CANDIDATES:
+        if path.exists():
+            source_path = path
+            break
+    
+    if source_path is None:
+        print("❌ No source file found!")
+        return
+    
+    print(f"\n📁 Loading: {source_path.name}")
+    df = pl.read_parquet(source_path)
+    print(f"   Shape: {df.shape}")
+    
+    # Vérifier les colonnes nécessaires
+    required = ["winner_id", "loser_id", "winner_rank_ta", "loser_rank_ta", "tourney_date_ta"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        print(f"❌ Missing columns: {missing}")
+        return
+    
+    # Préparer l'expression date
+    def date_expr(col_name: str) -> pl.Expr:
+        if df[col_name].dtype in [pl.Int64, pl.Int32]:
+            return pl.col(col_name).cast(pl.Utf8).str.to_datetime("%Y%m%d").cast(pl.Date)
+        return pl.col(col_name).cast(pl.Date)
+    
+    print("\n📊 Extracting rankings...")
+    
+    # Extraire rankings des winners
+    # ✅ FIX: Handle NaN before casting to Int32
+    winners = df.select([
+        pl.col("winner_id").cast(pl.Utf8).alias("player_id"),
+        date_expr("tourney_date_ta").alias("rank_date"),
+        pl.col("winner_rank_ta").fill_nan(None).cast(pl.Int32).alias("rank"),
+    ]).filter(
+        pl.col("player_id").is_not_null() &
+        pl.col("rank").is_not_null() &
+        (pl.col("rank") > 0)
+    )
+    
+    # Extraire rankings des losers
+    losers = df.select([
+        pl.col("loser_id").cast(pl.Utf8).alias("player_id"),
+        date_expr("tourney_date_ta").alias("rank_date"),
+        pl.col("loser_rank_ta").fill_nan(None).cast(pl.Int32).alias("rank"),
+    ]).filter(
+        pl.col("player_id").is_not_null() &
+        pl.col("rank").is_not_null() &
+        (pl.col("rank") > 0)
+    )
+    
+    print(f"   Winners entries: {len(winners):,}")
+    print(f"   Losers entries: {len(losers):,}")
+    
+    # Combiner
+    combined = pl.concat([winners, losers], how="vertical")
+    print(f"   Combined: {len(combined):,}")
+    
+    # Dédupliquer: si plusieurs ranks le même jour, garder le meilleur (min)
+    rankings = (
+        combined
+        .group_by(["player_id", "rank_date"])
+        .agg(pl.col("rank").min().alias("rank"))
+        .sort(["player_id", "rank_date"])
+    )
+    
+    print(f"\n✅ Final rankings table:")
+    print(f"   Entries: {len(rankings):,}")
+    print(f"   Unique players: {rankings['player_id'].n_unique():,}")
+    print(f"   Date range: {rankings['rank_date'].min()} → {rankings['rank_date'].max()}")
+    
+    # Stats
+    rank_stats = rankings.select([
+        pl.col("rank").mean().alias("mean"),
+        pl.col("rank").median().alias("median"),
+        pl.col("rank").min().alias("min"),
+        pl.col("rank").max().alias("max"),
+    ])
+    print(f"   Rank stats: mean={rank_stats['mean'][0]:.0f}, median={rank_stats['median'][0]:.0f}, "
+          f"min={rank_stats['min'][0]}, max={rank_stats['max'][0]}")
+    
+    # Sauvegarder
+    output_path = OUTPUT_DIR / "atp_rankings_history.parquet"
+    rankings.write_parquet(output_path, compression="zstd")
+    print(f"\n💾 Saved: {output_path}")
+    
+    # Vérification: distribution par année
+    print("\n📈 Entries per year:")
+    yearly = (
+        rankings
+        .with_columns([pl.col("rank_date").dt.year().alias("year")])
+        .group_by("year")
+        .len()
+        .sort("year")
+    )
+    for row in yearly.iter_rows():
+        print(f"   {row[0]}: {row[1]:,}")
+
+
+if __name__ == "__main__":
+    main()

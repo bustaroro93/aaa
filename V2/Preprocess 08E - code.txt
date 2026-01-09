@@ -1,0 +1,122 @@
+"""
+===============================================
+PP08E MERGE v2 - Pour PP03B_v2_no_conflicts
+===============================================
+"""
+
+import polars as pl
+from pathlib import Path
+import time
+
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+# Input
+ML_READY_CANDIDATES = [
+    DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v6.parquet",
+    DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v5.parquet",
+    DATA_CLEAN / "ml_ready" / "matches_ml_ready.parquet",
+]
+
+PP03B_PATH = DATA_CLEAN / "features" / "player_attributes" / "player_attributes_v2_match_level.parquet"
+
+OUTPUT_DIR = DATA_CLEAN / "ml_ready"
+
+
+def find_ml_ready():
+    for p in ML_READY_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def main():
+    print("\n" + "=" * 70)
+    print("   PP03B MERGE v2")
+    print("=" * 70)
+    
+    start = time.time()
+    
+    # Load ML_READY
+    ml_ready_path = find_ml_ready()
+    if ml_ready_path is None:
+        print("  ❌ ML_READY not found!")
+        return
+    
+    print(f"\n[1] Loading ML_READY: {ml_ready_path}")
+    df = pl.read_parquet(ml_ready_path)
+    print(f"    Shape: {df.shape}")
+    original_cols = len(df.columns)
+    
+    # Load PP03B
+    if not PP03B_PATH.exists():
+        print(f"\n  ❌ PP03B not found: {PP03B_PATH}")
+        print("     Run PP03B_v2_no_conflicts.py first!")
+        return
+    
+    print(f"\n[2] Loading PP03B: {PP03B_PATH}")
+    pp03b = pl.read_parquet(PP03B_PATH)
+    print(f"    Shape: {pp03b.shape}")
+    
+    # Find join key
+    possible_keys = ["custom_match_id", "match_id_ta_dedup", "match_key"]
+    join_key = None
+    for key in possible_keys:
+        if key in df.columns and key in pp03b.columns:
+            join_key = key
+            break
+    
+    if join_key is None:
+        print("\n  ❌ No common join key!")
+        return
+    
+    print(f"\n[3] Join key: {join_key}")
+    
+    # Merge
+    exclude_cols = ["custom_match_id", "match_id_ta_dedup", "match_key", 
+                    "winner_id", "loser_id"]
+    merge_cols = [c for c in pp03b.columns if c not in exclude_cols]
+    
+    # Check duplicates
+    already = [c for c in merge_cols if c in df.columns]
+    new_cols = [c for c in merge_cols if c not in df.columns]
+    
+    if already:
+        print(f"\n  ⚠️ Skipping existing columns: {already}")
+    
+    print(f"  ✅ New columns: {len(new_cols)}")
+    
+    # Merge
+    pp03b_merge = pp03b.select([join_key] + new_cols)
+    df = df.join(pp03b_merge, on=join_key, how="left")
+    
+    print(f"\n[4] After merge: {len(df.columns)} cols (+{len(df.columns) - original_cols})")
+    
+    # Verify
+    print(f"\n[5] Coverage:")
+    for col in new_cols[:10]:
+        cov = df[col].is_not_null().mean() if df[col].dtype != pl.Utf8 else 1.0
+        print(f"    {col}: {100*cov:.1f}%")
+    
+    # Save
+    current_version = ml_ready_path.stem.split("_")[-1]
+    if current_version.startswith("v"):
+        try:
+            new_version = f"v{int(current_version[1:]) + 1}"
+        except:
+            new_version = "v7"
+    else:
+        new_version = "v7"
+    
+    output_path = OUTPUT_DIR / f"matches_ml_ready_SOTA_{new_version}.parquet"
+    
+    print(f"\n[6] Saving: {output_path}")
+    df.write_parquet(output_path)
+    
+    print(f"\n✅ Complete in {time.time() - start:.1f}s")
+    print(f"   Shape: {df.shape}")
+    print(f"\n   ➡️  Update PP09/PP10 to use {output_path.name}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,113 @@
+======================================================================
+   PP_07 - CHARTING PLAYER + STYLE (GOD MODE)
+   TennisTitan SOTA 2026
+======================================================================
+   Timestamp: 2026-01-08 18:31:34
+   Input: C:\Users\Administrateur\Tennis POLAR v3\data_clean\charting_long
+   Output: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\charting_player_style
+======================================================================
+
+[1/6] Loading charting_long...
+  Loading from C:\Users\Administrateur\Tennis POLAR v3\data_clean\charting_long...
+  ✅ Loaded: 13,278,337 rows
+  Columns: ['match_id', 'player_id', 'player_name', 'player_role', 'table_title', 'set_context', 'stat_category', 'stat_name', 'stat_value', 'stat_count', 'stat_total', 'stat_pct', 'stat_fh_count', 'stat_bh_count', 'tooltip', 'year', 'schema_version']
+  Unique stat_names: 829
+
+[2/6] Pivoting charting stats...
+  Available columns: ['match_id', 'player_id', 'player_name', 'player_role', 'table_title', 'set_context', 'stat_category', 'stat_name', 'stat_value', 'stat_count', 'stat_total', 'stat_pct', 'stat_fh_count', 'stat_bh_count', 'tooltip', 'year', 'schema_version']
+  Match column: match_id
+  Player column: player_id
+  After Overall filter: 12,930,959 rows
+  Stat column: stat_name
+  ✅ Using unified value column: stat_num = coalesce(stat_pct, stat_value)
+  Available stats: 829
+  Priority stats found: 32/32
+  Stats to extract: ['a_pct', 'df_pct', '1stin', '1st_pct', '2nd_pct', 'rpw_pct', 'unret_pct', 'wide_pct', 'body_pct', 't_pct', 'dc_wide_pct', 'dc_body_pct', 'dc_t_pct', 'ad_wide_pct', 'ad_body_pct']...
+  After stat filter: 5,597,802 rows
+  ✅ Pivoted shape: (14728, 34)
+  Chart columns created: 32
+  Examples: ['chart_t_pct', 'chart_won_pct', 'chart_ufe_pct', 'chart_shlw_pct', 'chart_net_pct', 'chart_body_pct', 'chart_wnr_pct', 'chart_unferr_pct', 'chart_rpw_pct', 'chart_pts']
+  📊 chart_a_pct non-null: 14,726 / 14,728
+  📊 chart_rpw_pct non-null: 14,491 / 14,728
+  📊 chart_1st_pct non-null: 14,491 / 14,728
+
+[3/6] Computing player rolling features...
+  Feature columns: 32
+  ✅ Extracted match_date from match_id
+  Sorted by ['player_id', 'match_date', 'match_id']
+  Computing r5 rolling...
+  Computing r10 rolling...
+  Computing r20 rolling...
+  ✅ Created 96 rolling features
+
+[4/6] Adding style features...
+  📊 ace: mean=8.5, p75=11.3, p90=15.7
+  📊 net: mean=38.1, p75=45.5, p90=53.0
+  📊 rpw: mean=36.3, p75=39.4, p90=42.2
+  ✅ chart_style_serve_dominance
+  ✅ chart_style_return_strength
+  ✅ chart_style_aggression
+  ✅ chart_style_rally_preference
+  ✅ chart_style_net_skill (% réussite au filet)
+  ✅ chart_style_category (seuils calibrés NASA)
+
+[5/6] Saving charting features...
+
+  📁 Output: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\charting_player_style\charting_player_style.parquet
+  📊 Shape: (14728, 104)
+  📊 Rolling features: 96
+  📊 Style features: 6
+  📊 Unique players: 762
+  📊 Unique matches: 7,365
+
+  🎾 Style Distribution:
+     • ALL_COURT: 9,926 (67.4%)
+     • GRINDER: 1,395 (9.5%)
+     • COUNTER_PUNCHER: 1,254 (8.5%)
+     • NET_DOMINANT: 1,076 (7.3%)
+     • SERVE_BOT: 779 (5.3%)
+     • AGGRESSIVE_BASELINER: 298 (2.0%)
+
+======================================================================
+   SECTION 6: MERGE TO SOTA_v4 (NASA NO LEAK)
+======================================================================
+  ✅ Loading SOTA_v3
+  ML shape: (543927, 1128)
+  match_id_ta_source non-null: 7,435/543,927 (1.37%)
+  Chart shape: (14728, 104)
+  Features to merge: 102
+
+[6.3] Merging winner (A)...
+[6.4] Merging loser (B)...
+[6.5] Adding diff features...
+
+[6.6] Saving SOTA_v4...
+
+  ✅ Saved SOTA_v4: C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_SOTA_v4.parquet
+     Shape: (543927, 1337)
+     New cols: +209
+
+  📊 Charting Coverage:
+     r10_chart_a_pct_A: 1.28%
+     chart_style_serve_dominance_A: 1.33%
+     chart_style_category_A: 1.33%
+
+======================================================================
+   ✅ PP_07 COMPLETE!
+======================================================================
+   ⏱️  Time: 11.4s
+
+📊 OUTPUT FILES:
+   ✅ C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\charting_player_style/charting_player_style.parquet
+   ✅ C:\Users\Administrateur\Tennis POLAR v3\data_clean/ml_ready/matches_ml_ready_SOTA_v4.parquet
+
+📈 PIPELINE STATUS:
+   PP_01 → PP_04 : matches_ml_ready.parquet (951 cols)
+   PP_05         : SOTA_v2.parquet (994 cols)
+   PP_06         : SOTA_v3.parquet (~1050 cols)
+   PP_07         : SOTA_v4.parquet (~1150 cols) ← VOUS ÊTES ICI
+
+🚀 NEXT STEPS:
+   1. PP_08: Feature Selection + Split temporel
+   2. PP_09: XGBoost/LightGBM baseline
+   3. PP_10+: Deep Learning SOTA

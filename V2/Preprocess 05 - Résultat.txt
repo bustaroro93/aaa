@@ -1,0 +1,401 @@
+✅ Windows parquet schema fix applied
+
+======================================================================
+   PREPROCESS 5 - TRUE SOTA FEATURES
+   FULL QUALITY + MEMORY OPTIMIZED + PHASE 2 ULTIMATE
+======================================================================
+   2026-01-08 18:27:12
+======================================================================
+  💾 Start Memory: 679 MB
+
+======================================================================
+   PHASE 1: ORIGINAL SOTA FEATURES
+======================================================================
+
+======================================================================
+   SECTION 1: LOAD DATA FOR SPEED INDEX
+======================================================================
+
+  Found matches_base: C:\Users\Administrateur\Tennis POLAR v3\data_clean\matches_base
+  Loading 11 columns from matches_base...
+  Loaded 544,245 matches
+  💾 After load Memory: 856 MB
+  ✅ Has raw ace data for TRUE Speed Index calculation
+  Added year column: 1942 - 2025
+
+======================================================================
+   SECTION 2: TRUE TOURNEY SPEED INDEX
+======================================================================
+
+[2.1] Calculating match-level ace rates...
+  Valid matches with ace data: 544,166 (100.0%)
+  💾 After ace calc Memory: 884 MB
+
+[2.2] Creating player-match view for baseline calculation...
+  Player-match rows: 1,088,411
+  💾 After player view Memory: 888 MB
+
+[2.3] Calculating rolling baseline ace rate per player...
+  Using rolling window: 20, min_periods: 3
+  💾 After rolling baseline Memory: 1037 MB
+
+[2.4] Calculating adjusted ace rate...
+  Valid adj_ace values: 91,864 (8.4%)
+
+[2.5] Aggregating by tournament/year...
+  Tourney-year combinations: 2,683
+  💾 After aggregation Memory: 1052 MB
+
+[2.6] Calculating speed_prior3y (strict past only)...
+  Valid speed_prior3y: 2,683 / 2,683
+  ✅ Speed index (raw, clipped) - no global normalization
+
+[2.7] Saving tourney speed index...
+  ✅ Saved 2683 tourney-year entries
+
+  Speed Index stats:
+    Mean: 0.0000
+    Std:  0.0003
+    Min:  -0.0028
+    Max:  0.0136
+  💾 End of speed index Memory: 1041 MB
+  tourney_date_ta dtype: Date, sample: [datetime.date(2024, 2, 26), datetime.date(2017, 9, 18), datetime.date(2010, 7, 12)]
+  Year range: 1990 - 2025
+
+======================================================================
+   SECTION 3: SSI PREFERENCE (TRUE EWM)
+======================================================================
+  💾 Start SSI Memory: 1087 MB
+
+[3.1] Creating player-match view for SSI...
+  ⚠️ No Glicko proba found, using 0.5 default
+  Player-match rows: 1,087,854
+  💾 After player view Memory: 1165 MB
+
+[3.2] Calculating raw preference signal...
+
+[3.3] Calculating EWM preference by player...
+  EWM alpha: 0.05 (~13 match half-life)
+  💾 After EWM Memory: 1263 MB
+
+  pref_ssi stats:
+    Mean: 0.0004
+    Std:  0.0053
+
+[3.4] Saving match-level SSI...
+  ✅ Saved 1,087,854 unique entries to ssi_match_level.parquet
+  ✅ Saved 1,087,854 player-match entries (match-level)
+  💾 End SSI Memory: 1522 MB
+
+======================================================================
+   SECTION 4: ROLLING VS TOP (TRUE ROLLING 20)
+======================================================================
+  💾 Start rolling vs top Memory: 1518 MB
+
+[4.1] Loading ranking data...
+  Loaded 543,927 matches
+  💾 After load Memory: 1504 MB
+
+[4.2] Creating player-match view...
+
+[4.3] Adding tier flags...
+
+[4.4] Calculating TRUE rolling(20) stats...
+  💾 After top10 rolling Memory: 1351 MB
+  💾 After all rolling Memory: 1345 MB
+
+[4.5] Saving match-level rolling vs top...
+  ✅ Saved 1,087,854 unique entries to rolling_vs_top_match_level.parquet
+  ✅ Saved 1,087,854 player-match entries
+  Coverage vs top10: 4.2%
+  Coverage vs top50: 14.1%
+  💾 End rolling vs top Memory: 1702 MB
+
+======================================================================
+   SECTION 5: CHOKE FACTOR (TRUE ROLLING 20)
+======================================================================
+  💾 Start choke Memory: 1702 MB
+
+[5.1] Loading score data...
+  Loaded 543,927 matches
+
+[5.2] Parsing first set results...
+  Valid matches with S1 parse: 541,646
+
+[5.3] Creating player mental view...
+
+[5.4] Calculating choke/comeback...
+  💾 After choke rolling Memory: 1492 MB
+
+[5.5] Saving match-level mental features...
+  ✅ Saved 1,087,854 unique entries to mental_match_level.parquet
+  ✅ Saved 1,087,854 player-match entries
+  Mean choke rate: 0.084
+  Mean comeback rate: 0.086
+  💾 End choke Memory: 1764 MB
+
+======================================================================
+   SECTION 6: MERGE ALL TO ML_READY
+======================================================================
+  💾 Start merge Memory: 1764 MB
+
+[6.1] Loading matches_ml_ready...
+  Loaded 543,927 rows, 1007 columns
+
+[6.2] Merging tourney_speed_index...
+  ✅ tourney_speed_index coverage: 100.0%
+
+[6.3] Merging SSI preference (match-level)...
+  ✅ SSI merged (match-level)
+
+[6.4] Merging rolling vs top (match-level)...
+  ✅ Rolling vs top merged (match-level)
+
+[6.5] Merging mental features (match-level)...
+  ✅ Mental features merged (match-level)
+
+[6.6] Saving matches_ml_ready_SOTA.parquet...
+
+  ✅ Saved to C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_SOTA.parquet
+  Final: 543,927 rows × 1022 columns (+15 new)
+
+  📊 SOTA Features Summary:
+    ✅ tourney_speed_index: 100.0% coverage
+    ✅ pref_ssi_A: 100.0% coverage
+    ✅ pref_ssi_B: 100.0% coverage
+    ✅ diff_pref_ssi: 100.0% coverage
+    ✅ diff_ssi_mismatch: 100.0% coverage
+    ✅ r20_win_rate_vs_top10_A: 5.1% coverage
+    ✅ r20_win_rate_vs_top10_B: 3.3% coverage
+    ✅ r20_win_rate_vs_top50_A: 15.7% coverage
+    ✅ r20_win_rate_vs_top50_B: 12.5% coverage
+    ✅ r20_upset_rate_A: 90.9% coverage
+    ✅ r20_upset_rate_B: 88.9% coverage
+    ✅ r20_choke_rate_A: 98.5% coverage
+    ✅ r20_choke_rate_B: 94.0% coverage
+    ✅ r20_comeback_rate_A: 98.5% coverage
+    ✅ r20_comeback_rate_B: 94.0% coverage
+
+======================================================================
+   PHASE 2 ULTIMATE FEATURES - GOD MODE SOTA 2026
+======================================================================
+
+======================================================================
+   SECTION 7.1: STRAIGHT SETS WIN RATE
+======================================================================
+  💾 Start straight sets Memory: 8574 MB
+  tourney_date_ta dtype: Date, sample: [datetime.date(2024, 2, 26), datetime.date(2017, 9, 18), datetime.date(2010, 7, 12)]
+  Year range: 1990 - 2025
+  Loaded 543,927 matches
+
+[7.1.1] Parsing scores for straight sets detection...
+  Straight sets matches: 362,933 (66.7%)
+
+[7.1.2] Creating player-match view...
+
+[7.1.3] Saving match-level straight sets...
+  ✅ Saved 1,087,854 unique entries to straight_sets_match_level.parquet
+  ✅ Saved 1,087,854 player-match entries
+  💾 End straight sets Memory: 7886 MB
+
+======================================================================
+   SECTION 7.2: RETIREMENT RATE
+======================================================================
+  💾 Start retirement Memory: 7886 MB
+  tourney_date_ta dtype: Date, sample: [datetime.date(2024, 2, 26), datetime.date(2017, 9, 18), datetime.date(2010, 7, 12)]
+  Year range: 1990 - 2025
+  Loaded 543,927 matches
+
+[7.2.1] Detecting retirements...
+  Retirements detected: 21,977 (4.0%)
+
+[7.2.2] Creating player-match view...
+  Player-match rows: 1,087,854
+
+[7.2.3] Computing rolling retirement rates...
+
+[7.2.4] Saving match-level retirement...
+  ✅ Saved 1,087,854 unique entries to retirement_match_level.parquet
+  ✅ Saved 1,087,854 player-match entries
+  💾 End retirement Memory: 7857 MB
+
+======================================================================
+   SECTION 7.3: VENUE HISTORY
+======================================================================
+  💾 Start venue Memory: 7857 MB
+  tourney_date_ta dtype: Date, sample: [datetime.date(2024, 2, 26), datetime.date(2017, 9, 18), datetime.date(2010, 7, 12)]
+  Year range: 1990 - 2025
+  Loaded 543,927 matches
+
+[7.3.1] Detecting finals for defending champion...
+  Finals detected: 16,361
+
+[7.3.2] Creating player-match view...
+  Player-match rows: 635,870
+
+[7.3.3] Computing venue history (cumulative)...
+  💾 After venue cumsum Memory: 7688 MB
+
+[7.3.4] Computing defending champion flag...
+  Defending champion instances: 9,052
+
+[7.3.5] Saving...
+  ✅ Saved 635,870 unique entries to player_venue_detailed.parquet
+  ✅ Saved 37,990 player-year entries
+  💾 End venue Memory: 7789 MB
+
+======================================================================
+   SECTION 7.4: PLAYER STYLE - TEMPORAL (GOD SOTA 2026)
+======================================================================
+  💾 Start style temporal Memory: 7789 MB
+
+[7.4.1] Loading stats from matches_base...
+  Loaded 544,245 matches with 26 columns
+
+[7.4.1b] Converting NaN to null...
+  Numeric columns to fix: 20
+  Sample NaN→null conversions:
+    w_ace: 336,111 NaN → 336,111 null
+    w_df: 357,899 NaN → 357,899 null
+    w_svpt: 357,899 NaN → 357,899 null
+    w_1stIn: 357,899 NaN → 357,899 null
+
+  📊 TRUE COVERAGE (after NaN fix):
+    w_ace: 38.2%
+    w_svpt: 34.2%
+    w_s_ace_p: 38.2%
+    w_rpw_p: 34.2%
+
+[7.4.2] Calculating derived statistics...
+
+[7.4.3] Creating player-match view...
+  Player-match rows: 1,088,490
+
+[7.4.4] Computing ROLLING style stats (shift+rolling)...
+  Window: 100, Min samples: 8
+  💾 After rolling stats Memory: 6569 MB
+
+[7.4.5] Computing style scores (0-100 scale)...
+  style_ace_pct_score: n=579,332, min=0.0, median=5.7, max=27.0
+  style_rpw_pct_score: n=1,005,628, min=26.1, median=35.1, max=49.4
+  style_bp_saved_pct_score: n=575,674, min=15.8, median=56.7, max=87.0
+
+[7.4.6] Classifying players (Z-score based)...
+  z_ace_pct: n=579,332, mean=6.2, std=3.3
+  z_rpw_pct: n=1,005,628, mean=36.0, std=1.8
+  z_bp_saved_pct: n=575,674, mean=56.4, std=5.6
+
+  Z-score ranges:
+    z_ace_pct: min=-1.89, max=6.27, non-zero=574,560
+    z_rpw_pct: min=-5.48, max=7.44, non-zero=1,001,489
+    z_bp_saved_pct: min=-7.21, max=5.45, non-zero=570,625
+
+  Style distribution (FIXED):
+    ALL_COURT      :  527,174 ( 52.4%) █████████████████
+    RETURNER       :  193,036 ( 19.2%) ██████
+    GRINDER        :  103,560 ( 10.3%) ███
+    SERVE_DOMINANT :   99,465 (  9.9%) ███
+    CLUTCH         :   82,393 (  8.2%) ██
+
+[7.4.7] Saving match-level style...
+  ✅ Saved 1,088,490 unique entries to player_style_match_level.parquet
+  Style coverage: 92.4%
+  💾 End style temporal Memory: 7041 MB
+  ✅ Saved matchup matrix with 42 entries
+
+  Sample matchups:
+    SERVE_DOMINANT vs GRINDER on Grass: +0.12
+    GRINDER vs SERVE_DOMINANT on Clay: +0.10
+
+======================================================================
+   SECTION 7.7: SERVE/RETURN PRIORS (GOD NASA SOTA)
+======================================================================
+  📁 Using: C:\Users\Administrateur\Tennis POLAR v3\data_clean\matches_base
+  Available: 16/16 columns
+  Loaded 544,245 matches
+  ✅ GOD: 2nd serve won% available (coverage: 100.0%)
+  Player-match rows: 1,088,490
+  ✅ Saved 1,088,490 unique entries to srvret_priors_match_level.parquet
+  ✅ Saved 1,088,490 player-match entries
+
+  📊 PRIORS STATS (GOD NASA SOTA):
+     p_srv_pt_prior: coverage=100.0%, mean=0.650
+     rpw_prior: coverage=100.0%, mean=0.360
+     s1i_prior: coverage=100.0%, mean=0.620
+     s1w_prior: coverage=100.0%, mean=0.730
+     s2w_prior: coverage=100.0%, mean=0.520
+
+======================================================================
+   SECTION 7.6: MERGE PHASE 2 FEATURES
+======================================================================
+  💾 Start Phase 2 merge Memory: 6836 MB
+  Loaded 543,927 rows, 1022 columns
+
+[7.6.1] Merging straight sets (match-level)...
+  ✅ Straight sets merged
+
+[7.6.2] Merging retirement (match-level)...
+  ✅ Retirement merged
+
+[7.6.3] Merging venue history (match-level)...
+  ✅ Venue history merged
+
+[7.6.4] Merging player style (TEMPORAL)...
+  Style columns: ['custom_match_id', 'player_id', 'player_style_temporal', 'style_ace_pct_score', 'style_first_won_pct_score', 'style_bp_saved_pct_score', 'style_rpw_pct_score']
+  ✅ Player style TEMPORAL merged (no leakage)
+
+[7.6.5] Calculating style differences...
+  ✅ Style differences calculated
+
+[7.6.7] Merging serve/return priors...
+  ✅ Serve/return priors merged
+
+[7.6.6] Saving matches_ml_ready_SOTA_v2.parquet...
+
+  ✅ Saved to C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_SOTA_v2.parquet
+  Final: 543,927 rows × 1057 columns (+35 new Phase 2)
+
+  📊 Phase 2 Features Summary:
+    ✅ r20_straight_sets_win_rate_A: 98.5% coverage
+    ✅ r20_straight_sets_win_rate_B: 94.0% coverage
+    ✅ r20_retirement_given_rate_A: 98.5% coverage
+    ✅ r20_retirement_given_rate_B: 94.0% coverage
+    ✅ venue_wins_prior_A: 58.5% coverage
+    ✅ venue_wins_prior_B: 58.5% coverage
+    ✅ venue_win_rate_A: 25.2% coverage
+    ✅ venue_win_rate_B: 22.3% coverage
+    ✅ is_defending_champion_A: 58.5% coverage
+    ✅ is_defending_champion_B: 58.5% coverage
+    ✅ player_style_A: 96.3% coverage
+    ✅ player_style_B: 88.5% coverage
+    ✅ style_serve_power_A: 59.2% coverage
+    ✅ style_serve_power_B: 47.3% coverage
+    ✅ style_return_A: 96.3% coverage
+    ✅ style_return_B: 88.5% coverage
+    ✅ style_clutch_A: 58.8% coverage
+    ✅ style_clutch_B: 47.0% coverage
+    ✅ diff_style_serve: 100.0% coverage
+    ✅ diff_style_return: 100.0% coverage
+    ✅ diff_style_clutch: 100.0% coverage
+    ✅ style_matchup_advantage_A: 100.0% coverage
+  💾 End Phase 2 merge Memory: 9686 MB
+
+======================================================================
+   ✅ PHASE 2 COMPLETE! Time: 15.1s (0.3 min)
+======================================================================
+
+======================================================================
+   ✅ COMPLETE! Time: 28.7s (0.5 min)
+======================================================================
+
+📊 OUTPUT FILES:
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\tourney_speed_index/tourney_speed_index.parquet
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\sota_player_features/ssi_match_level.parquet
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\sota_player_features/rolling_vs_top_match_level.parquet
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\sota_player_features/mental_match_level.parquet
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\sota_player_features/straight_sets_match_level.parquet
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\sota_player_features/retirement_match_level.parquet
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\sota_player_features/player_style_match_level.parquet
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean/ml_ready/matches_ml_ready_SOTA.parquet (Phase 1)
+   C:\Users\Administrateur\Tennis POLAR v3\data_clean/ml_ready/matches_ml_ready_SOTA_v2.parquet (Phase 1+2)
+  💾 End Memory: 9686 MB

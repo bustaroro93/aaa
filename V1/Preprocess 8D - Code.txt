@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# ===============================================
+# PP_08D - MERGE OPPONENT-ADJUSTED + RENAME A/B
+# TennisTitan - NASA-safe integration
+# ===============================================
+#
+# POSITION PIPELINE:
+#   PP_08 (GOD SOTA) → SOTA_v5.parquet
+#   PP_08b (Opponent Adjusted) → opponent_adj_features.parquet
+#   PP_08c (This) → SOTA_v6.parquet  ← Merge + Rename A/B
+#   PP_09 (NASA Anti-Leakage)
+#   PP_10 (Training)
+#
+# WHAT THIS DOES:
+#   1. Load SOTA_v5.parquet
+#   2. Load opponent_adj_features.parquet
+#   3. Join on custom_match_id
+#   4. Rename *_winner → *_A, *_loser → *_B
+#   5. Save as SOTA_v6.parquet
+#
+# WHY RENAME?
+#   PP09 drops all columns containing "winner" or "loser" (NASA anti-leakage)
+#   By renaming to A/B BEFORE PP09, features survive the shuffle
+#
+# ===============================================
+
+import polars as pl
+from pathlib import Path
+from datetime import datetime
+import time
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+ML_READY_DIR = DATA_CLEAN / "ml_ready"
+FEATURES_DIR = DATA_CLEAN / "features" / "opponent_adjusted"
+
+INPUT_SOTA = ML_READY_DIR / "matches_ml_ready_SOTA_v5.parquet"
+INPUT_OPP_ADJ = FEATURES_DIR / "opponent_adj_features.parquet"
+OUTPUT_SOTA = ML_READY_DIR / "matches_ml_ready_SOTA_v6.parquet"
+
+print("=" * 70)
+print("   PP_08D - MERGE OPPONENT-ADJUSTED + RENAME A/B")
+print("=" * 70)
+print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 70)
+
+
+def main():
+    t0 = time.perf_counter()
+    
+    # =========================================
+    # 1. LOAD DATASETS
+    # =========================================
+    print("\n[1/4] Loading datasets...")
+    
+    if not INPUT_SOTA.exists():
+        print(f"  ❌ SOTA file not found: {INPUT_SOTA}")
+        print("  → Run PP_08 first!")
+        return None
+    
+    if not INPUT_OPP_ADJ.exists():
+        print(f"  ❌ Opponent-adjusted features not found: {INPUT_OPP_ADJ}")
+        print("  → Run PP_08b first!")
+        return None
+    
+    df_sota = pl.read_parquet(INPUT_SOTA)
+    df_opp = pl.read_parquet(INPUT_OPP_ADJ)
+    
+    print(f"  SOTA: {df_sota.shape}")
+    print(f"  Opponent-adjusted: {df_opp.shape}")
+    
+    # =========================================
+    # 2. CHECK JOIN KEY
+    # =========================================
+    print("\n[2/4] Checking join key...")
+    
+    if "custom_match_id" not in df_sota.columns:
+        print("  ❌ custom_match_id not in SOTA!")
+        return None
+    
+    if "custom_match_id" not in df_opp.columns:
+        print("  ❌ custom_match_id not in opponent-adjusted features!")
+        return None
+    
+    # Check overlap
+    sota_ids = set(df_sota["custom_match_id"].to_list())
+    opp_ids = set(df_opp["custom_match_id"].to_list())
+    overlap = len(sota_ids & opp_ids)
+    
+    print(f"  SOTA matches: {len(sota_ids):,}")
+    print(f"  Opp-adj matches: {len(opp_ids):,}")
+    print(f"  Overlap: {overlap:,} ({100*overlap/len(sota_ids):.1f}%)")
+    
+    # =========================================
+    # 3. RENAME winner/loser → A/B
+    # =========================================
+    print("\n[3/4] Renaming winner/loser → A/B...")
+    
+    # Find columns to rename
+    winner_cols = [c for c in df_opp.columns if c.endswith("_winner")]
+    loser_cols = [c for c in df_opp.columns if c.endswith("_loser")]
+    
+    print(f"  Winner columns: {len(winner_cols)}")
+    print(f"  Loser columns: {len(loser_cols)}")
+    
+    # Build rename mapping
+    rename_map = {}
+    
+    for col in winner_cols:
+        # Remove _winner suffix, add _A
+        base = col[:-7]  # Remove "_winner"
+        rename_map[col] = f"{base}_A"
+    
+    for col in loser_cols:
+        # Remove _loser suffix, add _B
+        base = col[:-6]  # Remove "_loser"
+        rename_map[col] = f"{base}_B"
+    
+    # Rename diff_* columns (keep as-is, they represent A-B after rename)
+    # These will be inverted by PP09 during shuffle
+    
+    # Apply rename
+    df_opp_renamed = df_opp.rename(rename_map)
+    
+    # Show some examples
+    print("\n  📋 Rename examples:")
+    for old, new in list(rename_map.items())[:5]:
+        print(f"     {old} → {new}")
+    
+    # =========================================
+    # 4. CHECK COLLISIONS + MERGE + SAVE
+    # =========================================
+    print("\n[4/4] Checking collisions and merging...")
+    
+    # ✅ FIX: Check for column name collisions BEFORE join
+    overlap_cols = set(df_sota.columns) & set(df_opp_renamed.columns) - {"custom_match_id"}
+    
+    if overlap_cols:
+        print(f"\n  ⚠️ Found {len(overlap_cols)} overlapping columns:")
+        print(f"     {list(overlap_cols)[:20]}")
+        print("  → Dropping from opp_adj to avoid collision...")
+        
+        # Drop overlapping columns from opponent-adjusted (keep SOTA version)
+        df_opp_renamed = df_opp_renamed.drop(list(overlap_cols))
+    else:
+        print("  ✅ No column collisions detected")
+    
+    # Left join to keep all SOTA matches
+    df_merged = df_sota.join(
+        df_opp_renamed,
+        on="custom_match_id",
+        how="left"
+    )
+    
+    new_cols = len(df_merged.columns) - len(df_sota.columns)
+    
+    print(f"  Before merge: {len(df_sota.columns)} columns")
+    print(f"  After merge: {len(df_merged.columns)} columns")
+    print(f"  New features: +{new_cols}")
+    
+    # Check coverage of new features
+    print("\n  📊 Coverage of new features:")
+    sample_cols = [
+        "win_rate_vs_top10_A",
+        "win_rate_vs_top50_A",
+        "win_rate_vs_similar_A",
+        "adj_dominance_score_A",
+        "diff_adj_dominance_score",
+    ]
+    
+    for col in sample_cols:
+        if col in df_merged.columns:
+            coverage = df_merged[col].is_not_null().mean()
+            print(f"     {col}: {coverage:.1%}")
+    
+    # Save
+    df_merged.write_parquet(OUTPUT_SOTA, compression="zstd")
+    
+    elapsed = time.perf_counter() - t0
+    
+    print("\n" + "=" * 70)
+    print("   ✅ PP_08D MERGE COMPLETE!")
+    print("=" * 70)
+    print(f"   Input SOTA: {INPUT_SOTA.name}")
+    print(f"   Input Opp-Adj: {INPUT_OPP_ADJ.name}")
+    print(f"   Output: {OUTPUT_SOTA.name}")
+    print(f"   New features: +{new_cols}")
+    print(f"   ⏱️  Time: {elapsed:.1f}s")
+    print("""
+📋 WHAT HAPPENED:
+   ✅ Loaded SOTA_v5 + opponent_adj_features
+   ✅ Renamed *_winner → *_A, *_loser → *_B
+   ✅ Merged on custom_match_id
+   ✅ Saved as SOTA_v6
+
+🔄 NEXT STEPS:
+   1. Update PP_09 to load SOTA_v6 instead of SOTA_v5
+   2. Run PP_09 (will now include opponent-adjusted features)
+   3. Run PP_10
+
+⚠️ IMPORTANT:
+   The diff_* columns (e.g., diff_adj_dominance_score) represent A-B.
+   PP09 will auto-invert them during shuffle (like other diff* columns).
+""")
+    
+    return df_merged
+
+
+if __name__ == "__main__":
+    main()

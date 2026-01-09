@@ -1,0 +1,2886 @@
+#!/usr/bin/env python3
+# ===============================================
+# PREPROCESS 5 - SPEED INDEX & SSI PREFERENCE
+# VERSION FULL QUALITY + MEMORY OPTIMIZED
+# ===============================================
+#
+# Cette version garde TOUTE la qualité SOTA:
+# - Vrai rolling(20) pour les stats
+# - Vrai EWM pour SSI
+# - Vrai Speed Index calculé
+#
+# Optimisations mémoire:
+# - Chargement colonnes minimales
+# - Traitement par chunks pour rolling
+# - gc.collect() agressif
+# - Dtypes optimisés (Float32, Int16)
+#
+# ===============================================
+
+# ═══════════════════════════════════════════════
+# FIX WINDOWS PERMISSIONS - À AJOUTER EN PREMIER
+# ═══════════════════════════════════════════════
+import polars as pl
+import glob as _glob
+from pathlib import Path
+
+_original_read_parquet_schema = pl.read_parquet_schema
+
+def _safe_read_parquet_schema(source, *args, **kwargs):
+    """Fallback pour dossiers partitionnés Windows."""
+    try:
+        return _original_read_parquet_schema(source, *args, **kwargs)
+    except OSError as e:
+        if "os error 5" in str(e).lower() or "accès refusé" in str(e).lower():
+            # Trouver un fichier .parquet dans le dossier
+            if Path(source).is_dir():
+                files = list(_glob.glob(f"{source}/**/*.parquet", recursive=True))
+                if files:
+                    print(f"  ⚠️ Schema fallback: {files[0]}")
+                    return _original_read_parquet_schema(files[0], *args, **kwargs)
+        raise
+
+pl.read_parquet_schema = _safe_read_parquet_schema
+print("✅ Windows parquet schema fix applied")
+
+from pathlib import Path
+from datetime import datetime
+import time
+import json
+import gc
+import numpy as np
+import polars as pl
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+# Input - Chercher matches_base dans plusieurs endroits
+MATCHES_BASE_CANDIDATES = [
+    DATA_CLEAN / "matches_base",
+    ROOT / "matches_base",
+    DATA_CLEAN / "matches_base_scaled",
+]
+
+ML_READY_FILE = DATA_CLEAN / "ml_ready" / "matches_ml_ready.parquet"
+
+# Output
+OUTPUT_DIR = DATA_CLEAN / "features" / "sota_player_features"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SPEED_INDEX_DIR = DATA_CLEAN / "features" / "tourney_speed_index"
+SPEED_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+# Parameters
+EWM_ALPHA = 0.05      # ~15-20 matchs half-life
+ROLLING_WINDOW = 20   # Fenêtre pour les rolling stats
+MIN_PERIODS = 3       # Minimum de matchs pour calculer
+
+# Mapping des rounds pour tri intra-journée
+ROUND_ORDER = {
+    "Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4,
+    "R128": 10, "R64": 20, "R32": 30, "R16": 40,
+    "QF": 50, "SF": 60, "F": 70,
+    "RR": 25, "BR": 65, "ER": 5,
+}
+
+def add_round_order(df: pl.DataFrame) -> pl.DataFrame:
+    '''Ajoute round_order pour tri intra-journée.'''
+    if "round_ta" not in df.columns:
+        return df.with_columns([pl.lit(50).cast(pl.Int8).alias("round_order")])
+    
+    round_expr = pl.col("round_ta").cast(pl.Utf8).str.to_uppercase()
+    result = pl.lit(50)
+    for round_name, order in sorted(ROUND_ORDER.items(), key=lambda x: -x[1]):
+        result = pl.when(round_expr == round_name).then(order).otherwise(result)
+    
+    return df.with_columns([result.cast(pl.Int8).alias("round_order")])
+
+def get_memory_mb():
+    """Get current memory usage in MB."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1024 / 1024
+    except:
+        return 0
+
+def log_memory(msg=""):
+    """Log memory usage."""
+    mem = get_memory_mb()
+    if mem > 0:
+        print(f"  💾 {msg} Memory: {mem:.0f} MB")
+
+REQUIRED_MATCH_KEYS = ["tourney_date_ta", "tourney_slug_ta", "winner_id", "loser_id"]
+
+def ensure_custom_match_id(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    S'assure que custom_match_id existe.
+    - Si déjà présent → on le garde (stable)
+    - Sinon → on le recrée via hash des clés
+    """
+    if "custom_match_id" in df.columns:
+        return df
+    
+    missing = [c for c in REQUIRED_MATCH_KEYS if c not in df.columns]
+    if missing:
+        raise ValueError(f"❌ custom_match_id impossible: colonnes manquantes: {missing}")
+    
+    print(f"  ⚠️ Création custom_match_id via hash (colonnes: {REQUIRED_MATCH_KEYS})")
+    return df.with_columns(
+        pl.concat_str([pl.col(k).cast(pl.Utf8) for k in REQUIRED_MATCH_KEYS], separator="|")
+        .hash(seed=42)
+        .cast(pl.UInt64)
+        .alias("custom_match_id")
+    )
+
+def save_match_level_safe(df: pl.DataFrame, path: Path, key_cols: list = None):
+    """
+    Sauvegarde match-level avec déduplication et validation.
+    """
+    if key_cols is None:
+        key_cols = ["custom_match_id", "player_id"]
+    
+    # Vérifier les colonnes clés
+    missing = [c for c in key_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"❌ Missing key columns: {missing}")
+    
+    # Compter doublons AVANT
+    n_before = len(df)
+    df = df.unique(key_cols)
+    n_after = len(df)
+    
+    if n_before != n_after:
+        print(f"  ⚠️ Removed {n_before - n_after} duplicates on {key_cols}")
+    
+    # Assertion finale
+    dup_check = df.group_by(key_cols).len().filter(pl.col("len") > 1)
+    assert len(dup_check) == 0, f"❌ Still have duplicates after dedup!"
+    
+    # Sauvegarder
+    df.write_parquet(path)
+    print(f"  ✅ Saved {len(df):,} unique entries to {path.name}")
+    
+    return df
+    
+def load_data_for_ssi() -> pl.DataFrame:
+    cols = [
+        "custom_match_id",
+        "tourney_slug_ta", "tourney_date_ta", "tourney_surface_ta",
+        "winner_id", "loser_id",
+        # ✅ FIX: Chercher glicko_prob_blend_A en priorité
+        "glicko_prob_blend_A", "glicko_prob_surface_A", "glicko_prob_A",
+        "g2_proba_A", "g2_win_prob_A", "glicko_proba_A",
+    ]
+    schema = pl.read_parquet_schema(ML_READY_FILE)
+    available = [c for c in cols if c in schema]
+
+    df = pl.read_parquet(ML_READY_FILE, columns=available)
+    df = ensure_custom_match_id(df)
+    df = add_year_column(df)
+    df = add_round_order(df)
+    return df
+
+    
+def add_year_column(df: pl.DataFrame) -> pl.DataFrame:
+    """Ajoute 'year' de manière robuste, quel que soit le format."""
+    if "year" in df.columns:
+        return df
+    
+    dtype = df["tourney_date_ta"].dtype
+    sample = df["tourney_date_ta"].head(3).to_list()
+    print(f"  tourney_date_ta dtype: {dtype}, sample: {sample}")
+    
+    if dtype in [pl.Date, pl.Datetime]:
+        df = df.with_columns([
+            pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year")
+        ])
+    elif dtype in [pl.Int64, pl.Int32, pl.UInt32, pl.UInt64]:
+        first_val = df["tourney_date_ta"].drop_nulls().head(1).to_list()
+        if first_val and first_val[0] > 19000000:
+            df = df.with_columns([
+                (pl.col("tourney_date_ta") // 10000).cast(pl.Int16).alias("year")
+            ])
+        else:
+            df = df.with_columns([
+                pl.col("tourney_date_ta").cast(pl.Datetime).dt.year().cast(pl.Int16).alias("year")
+            ])
+    else:
+        df = df.with_columns([
+            pl.col("tourney_date_ta").cast(pl.Utf8).str.slice(0, 4).cast(pl.Int16).alias("year")
+        ])
+    
+    print(f"  Year range: {df['year'].min()} - {df['year'].max()}")
+    return df
+
+# ═══════════════════════════════════════════════
+# FIX 1: AUTO-NORMALIZE PERCENTAGES
+# ═══════════════════════════════════════════════
+def pct_auto(expr: pl.Expr, default: float = None) -> pl.Expr:
+    """Normalise automatiquement % vers [0,1]."""
+    x = expr.cast(pl.Float32)
+    x01 = pl.when(x.is_not_null() & (x > 1.5)).then(x / 100.0).otherwise(x)
+    if default is not None:
+        x01 = x01.fill_null(default)
+    return x01.clip(0.0, 1.0)
+    
+# ===============================================
+# SECTION 1: LOAD DATA INTELLIGENTLY
+# ===============================================
+
+def find_matches_base() -> Path:
+    """Trouve le dossier matches_base."""
+    for path in MATCHES_BASE_CANDIDATES:
+        if path.exists():
+            return path
+    return None
+
+
+def load_data_for_speed_index() -> pl.DataFrame:
+    """
+    Charge les données nécessaires pour le Speed Index.
+    Essaie d'abord matches_base, sinon ML_READY.
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 1: LOAD DATA FOR SPEED INDEX")
+    print("=" * 70)
+    
+    matches_base = find_matches_base()
+    
+    # Colonnes nécessaires pour Speed Index
+    speed_cols = [
+        "custom_match_id", "tourney_slug_ta", "tourney_date_ta", "round_ta", "tourney_surface_ta",
+        "winner_id", "loser_id",
+        "w_ace", "w_svpt", "l_ace", "l_svpt",  # Pour calcul ace rate
+    ]
+    
+    if matches_base:
+        print(f"\n  Found matches_base: {matches_base}")
+        try:
+            # Lire le schema pour voir les colonnes disponibles
+            schema = pl.read_parquet_schema(matches_base)
+            available = [c for c in speed_cols if c in schema]
+            
+            print(f"  Loading {len(available)} columns from matches_base...")
+            df = pl.read_parquet(matches_base, columns=available)
+            df = ensure_custom_match_id(df)  # ✅ AJOUTER
+            df = add_round_order(df)  # ✅ AJOUTER
+            print(f"  Loaded {len(df):,} matches")
+            log_memory("After load")
+            
+            # Vérifier qu'on a les colonnes ace
+            if "w_ace" in df.columns and "w_svpt" in df.columns:
+                print("  ✅ Has raw ace data for TRUE Speed Index calculation")
+                has_raw_ace = True
+            else:
+                has_raw_ace = False
+            
+            # Add year column
+            if "year" not in df.columns and "tourney_date_ta" in df.columns:
+                if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+                    df = df.with_columns([
+                        (pl.col("tourney_date_ta") // 10000).cast(pl.Int16).alias("year")
+                    ])
+                else:
+                    df = df.with_columns([
+                        pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year")
+                    ])
+                print(f"  Added year column: {df['year'].min()} - {df['year'].max()}")
+            
+            return df, has_raw_ace
+            
+        except Exception as e:
+            print(f"  ⚠️ Error loading matches_base: {e}")
+    
+    # Fallback: ML_READY
+    print(f"\n  Falling back to ML_READY: {ML_READY_FILE}")
+    
+    schema = pl.read_parquet_schema(ML_READY_FILE)
+    
+    # Colonnes alternatives pour ace rate
+    alt_ace_cols = [
+        "tourney_slug_ta", "tourney_date_ta", "tourney_surface_ta",
+        "winner_id", "loser_id",
+    ]
+    
+    # Chercher des colonnes ace rate existantes
+    for pattern in ["ace", "svpt"]:
+        for col in schema.keys():
+            if pattern in col.lower() and col not in alt_ace_cols:
+                alt_ace_cols.append(col)
+    
+    alt_ace_cols = list(dict.fromkeys(alt_ace_cols))[:20]  # Limiter
+    available = [c for c in alt_ace_cols if c in schema]
+    
+    print(f"  Loading {len(available)} columns...")
+    df = pl.read_parquet(ML_READY_FILE, columns=available)
+    df = add_round_order(df) 
+    print(f"  Loaded {len(df):,} rows")
+    log_memory("After load")
+    
+    has_raw_ace = "w_ace" in df.columns and "w_svpt" in df.columns
+    print(f"  Has raw ace data: {has_raw_ace}")
+    
+    # Add year column
+    if "year" not in df.columns and "tourney_date_ta" in df.columns:
+        if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+            df = df.with_columns([
+                (pl.col("tourney_date_ta") // 10000).cast(pl.Int16).alias("year")
+            ])
+        else:
+            df = df.with_columns([
+                pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year")
+            ])
+        print(f"  Added year column: {df['year'].min()} - {df['year'].max()}")
+    
+    return df, has_raw_ace
+
+
+# ===============================================
+# SECTION 2: TRUE TOURNEY SPEED INDEX
+# ===============================================
+
+def calculate_true_speed_index(df: pl.DataFrame, has_raw_ace: bool) -> pl.DataFrame:
+    """
+    Calcule le VRAI Tourney Speed Index.
+    
+    Méthode SOTA:
+    1. Calculer ace rate par match
+    2. Calculer baseline ace rate par joueur (rolling 20)
+    3. adj_ace = match_ace_rate - player_baseline
+    4. Agréger par tournoi/année
+    5. speed_prior3y = expanding mean des années précédentes
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 2: TRUE TOURNEY SPEED INDEX")
+    print("=" * 70)
+    
+    # Add year
+    if "year" not in df.columns:
+        if "tourney_date_ta" in df.columns:
+            if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+                df = df.with_columns([
+                    (pl.col("tourney_date_ta") // 10000).cast(pl.Int16).alias("year")
+                ])
+            else:
+                df = df.with_columns([
+                    pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year")
+                ])
+            print(f"  Added year: {df['year'].min()} - {df['year'].max()}")
+    
+    # ─────────────────────────────────────────────
+    # 2.1 Calculate match-level ace rate
+    # ─────────────────────────────────────────────
+    print("\n[2.1] Calculating match-level ace rates...")
+    
+    if has_raw_ace and "w_ace" in df.columns:
+        df = df.with_columns([
+            pl.when(
+                (pl.col("w_svpt").is_not_null()) & (pl.col("w_svpt") > 0) &
+                (pl.col("l_svpt").is_not_null()) & (pl.col("l_svpt") > 0)
+            ).then(
+                (pl.col("w_ace").fill_null(0) + pl.col("l_ace").fill_null(0)) /
+                (pl.col("w_svpt") + pl.col("l_svpt"))
+            ).otherwise(None)
+            .cast(pl.Float32)
+            .alias("match_ace_rate")
+        ])
+        
+        # Ace rate par joueur dans le match
+        df = df.with_columns([
+            pl.when(pl.col("w_svpt") > 0)
+            .then(pl.col("w_ace") / pl.col("w_svpt"))
+            .otherwise(None)
+            .cast(pl.Float32)
+            .alias("winner_ace_rate"),
+            
+            pl.when(pl.col("l_svpt") > 0)
+            .then(pl.col("l_ace") / pl.col("l_svpt"))
+            .otherwise(None)
+            .cast(pl.Float32)
+            .alias("loser_ace_rate"),
+        ])
+        
+        valid_matches = df.filter(pl.col("match_ace_rate").is_not_null()).height
+        print(f"  Valid matches with ace data: {valid_matches:,} ({100*valid_matches/len(df):.1f}%)")
+    else:
+        print("  ⚠️ No raw ace data, will use surface fallback")
+        df = df.with_columns([pl.lit(None).cast(pl.Float32).alias("match_ace_rate")])
+    
+    log_memory("After ace calc")
+    
+    # ─────────────────────────────────────────────
+    # 2.2 Create player-match view for baseline
+    # ─────────────────────────────────────────────
+    print("\n[2.2] Creating player-match view for baseline calculation...")
+    
+    if "winner_ace_rate" in df.columns:
+        # Winner view
+        winner_data = df.select([
+            pl.col("winner_id").alias("player_id"),
+            pl.col("custom_match_id"),
+            pl.col("tourney_date_ta"),
+            pl.col("tourney_slug_ta"),
+            pl.col("year"),
+            pl.col("round_order"),
+            pl.col("match_ace_rate"),
+            pl.col("winner_ace_rate").alias("player_ace_rate"),
+        ]).filter(
+            pl.col("player_id").is_not_null() & 
+            pl.col("player_ace_rate").is_not_null()
+        )
+        
+        # Loser view
+        loser_data = df.select([
+            pl.col("loser_id").alias("player_id"),
+            pl.col("custom_match_id"),
+            pl.col("tourney_date_ta"),
+            pl.col("tourney_slug_ta"),
+            pl.col("year"),
+            pl.col("round_order"),
+            pl.col("match_ace_rate"),
+            pl.col("loser_ace_rate").alias("player_ace_rate"),
+        ]).filter(
+            pl.col("player_id").is_not_null() & 
+            pl.col("player_ace_rate").is_not_null()
+        )
+        
+        player_matches = pl.concat([winner_data, loser_data])
+        del winner_data, loser_data
+        gc.collect()
+        
+        print(f"  Player-match rows: {len(player_matches):,}")
+        log_memory("After player view")
+        
+        # ─────────────────────────────────────────────
+        # 2.3 Calculate rolling baseline per player
+        # ─────────────────────────────────────────────
+        print("\n[2.3] Calculating rolling baseline ace rate per player...")
+        print(f"  Using rolling window: {ROLLING_WINDOW}, min_periods: {MIN_PERIODS}")
+        
+        # Sort by player and date
+        player_matches = player_matches.sort(
+    ["player_id", "tourney_date_ta", "round_order", "tourney_slug_ta","custom_match_id"]
+)
+        
+        # Rolling mean with SHIFT(1) - CRITICAL for no leakage
+        player_matches = player_matches.with_columns([
+            pl.col("player_ace_rate")
+            .shift(1)  # ✅ Exclude current match
+            .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_PERIODS)
+            .over("player_id")
+            .cast(pl.Float32)
+            .alias("player_baseline_ace")
+        ])
+        
+        log_memory("After rolling baseline")
+        
+        # ─────────────────────────────────────────────
+        # 2.4 Calculate adjusted ace (deviation from baseline)
+        # ─────────────────────────────────────────────
+        print("\n[2.4] Calculating adjusted ace rate...")
+        
+        # adj_ace = actual - baseline (how much above/below their normal level)
+        player_matches = player_matches.with_columns([
+            pl.when(pl.col("player_baseline_ace").is_not_null())
+            .then(pl.col("player_ace_rate") - pl.col("player_baseline_ace"))
+            .otherwise(None)  # ✅ FIX: NULL sera exclu du mean()
+            .cast(pl.Float32)
+            .alias("adj_ace")
+        ])
+        
+        # Check for NaN
+        adj_ace_valid = player_matches.filter(pl.col("adj_ace").is_not_null() & pl.col("adj_ace").is_not_nan()).height
+        print(f"  Valid adj_ace values: {adj_ace_valid:,} ({100*adj_ace_valid/len(player_matches):.1f}%)")
+        
+        # ─────────────────────────────────────────────
+        # 2.5 Aggregate by tourney/year
+        # ─────────────────────────────────────────────
+        print("\n[2.5] Aggregating by tournament/year...")
+        
+        # Filter valid adj_ace values
+        valid_matches = player_matches.filter(
+            pl.col("adj_ace").is_not_null() & 
+            ~pl.col("adj_ace").is_nan() &
+            pl.col("tourney_slug_ta").is_not_null() &
+            pl.col("year").is_not_null()
+        )
+        
+        tourney_annual = valid_matches.group_by(["tourney_slug_ta", "year"]).agg([
+            pl.col("adj_ace").mean().alias("avg_adj_ace"),
+            pl.col("match_ace_rate").mean().alias("avg_match_ace"),
+            pl.len().alias("n_player_matches"),
+        ]).filter(pl.col("n_player_matches") >= 10)
+        
+        del player_matches, valid_matches
+        gc.collect()
+        
+        print(f"  Tourney-year combinations: {len(tourney_annual):,}")
+        log_memory("After aggregation")
+        
+    else:
+        # Fallback: just use surface
+        print("  ⚠️ Creating empty tourney_annual (will use surface fallback)")
+        tourney_annual = None
+    
+    # ─────────────────────────────────────────────
+    # 2.6 Calculate speed_prior3y (no leakage)
+    # ─────────────────────────────────────────────
+
+    if tourney_annual is not None and len(tourney_annual) > 0:
+        print("\n[2.6] Calculating speed_prior3y (strict past only)...")
+        
+        tourney_annual = tourney_annual.sort(["tourney_slug_ta", "year"])
+        
+        # Expanding mean of PREVIOUS years only (shift 1)
+        # fill_null(0.0) pour les tournois sans historique (PAS l'année courante)
+        tourney_annual = tourney_annual.with_columns([
+            pl.col("avg_adj_ace")
+            .shift(1)  # ✅ Exclure année courante
+            .rolling_mean(window_size=3, min_samples=1)
+            .over("tourney_slug_ta")
+            .fill_null(0.0)  # ✅ Default 0 si pas d'historique
+            .cast(pl.Float32)
+            .alias("speed_prior3y")
+        ])
+        
+        # Check for valid values
+        valid_speed = tourney_annual.filter(
+            pl.col("speed_prior3y").is_not_null() & ~pl.col("speed_prior3y").is_nan()
+        ).height
+        print(f"  Valid speed_prior3y: {valid_speed:,} / {len(tourney_annual):,}")
+        
+        # ✅ FIX LEAKAGE : Pas de normalisation globale
+        # Garder speed_prior3y brut avec clip raisonnable
+        tourney_annual = tourney_annual.with_columns([
+            pl.col("speed_prior3y")
+            .fill_null(0.0)
+            .clip(-0.1, 0.1)  # Clip sur range typique ace rate deviation
+            .cast(pl.Float32)
+            .alias("tourney_speed_index")
+        ])
+        
+        print(f"  ✅ Speed index (raw, clipped) - no global normalization")
+        
+        # ─────────────────────────────────────────────
+        # 2.7 Save speed index
+        # ─────────────────────────────────────────────
+        print("\n[2.7] Saving tourney speed index...")
+        
+        speed_output = tourney_annual.select([
+            "tourney_slug_ta", "year",
+            "avg_adj_ace", "avg_match_ace",
+            "speed_prior3y", "tourney_speed_index",
+            "n_player_matches"
+        ])
+        
+        speed_output.write_parquet(SPEED_INDEX_DIR / "tourney_speed_index.parquet")
+        print(f"  ✅ Saved {len(speed_output)} tourney-year entries")
+        
+        # Stats
+        print(f"\n  Speed Index stats:")
+        print(f"    Mean: {speed_output['tourney_speed_index'].mean():.4f}")
+        print(f"    Std:  {speed_output['tourney_speed_index'].std():.4f}")
+        print(f"    Min:  {speed_output['tourney_speed_index'].min():.4f}")
+        print(f"    Max:  {speed_output['tourney_speed_index'].max():.4f}")
+        
+        del tourney_annual
+    else:
+        print("\n[2.6] No valid tourney data, creating surface-based fallback...")
+        speed_output = None
+    
+    gc.collect()
+    log_memory("End of speed index")
+    
+    return df, speed_output
+
+
+# ===============================================
+# SECTION 3: SSI PREFERENCE (TRUE EWM)
+# ===============================================
+
+def calculate_ssi_preference(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calcule la préférence de vitesse de surface (SSI) par joueur.
+    
+    Méthode SOTA:
+    1. Performance résiduelle = Won - Expected
+    2. Raw signal = Résidu × Speed Index
+    3. EWM par joueur (time-decay)
+    4. SHIFT(1) pour éviter le leakage
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 3: SSI PREFERENCE (TRUE EWM)")
+    print("=" * 70)
+    log_memory("Start SSI")
+    
+    # Load speed index
+    speed_path = SPEED_INDEX_DIR / "tourney_speed_index.parquet"
+    if speed_path.exists():
+        speed_df = pl.read_parquet(speed_path).select([
+            "tourney_slug_ta", "year", "tourney_speed_index"
+        ])
+        
+        # Merge speed index to df
+        if "tourney_speed_index" not in df.columns:
+            df = df.join(speed_df, on=["tourney_slug_ta", "year"], how="left")
+        
+        # Surface fallback
+        if "tourney_surface_ta" in df.columns:
+            df = df.with_columns([
+                pl.when(pl.col("tourney_speed_index").is_not_null())
+                .then(pl.col("tourney_speed_index"))
+                .when(pl.col("tourney_surface_ta") == "Grass").then(0.06)
+                .when(pl.col("tourney_surface_ta") == "Carpet").then(0.04)
+                .when(pl.col("tourney_surface_ta") == "Hard").then(0.00)
+                .when(pl.col("tourney_surface_ta") == "Clay").then(-0.05)
+                .otherwise(0.0)
+                .cast(pl.Float32)
+                .alias("tourney_speed_index")
+            ])
+        
+        del speed_df
+    else:
+        print("  ⚠️ No speed index file, using surface fallback")
+        if "tourney_surface_ta" in df.columns:
+            df = df.with_columns([
+                pl.when(pl.col("tourney_surface_ta") == "Grass").then(0.06)   # ✅ FIX
+                .when(pl.col("tourney_surface_ta") == "Carpet").then(0.04)   # ✅ FIX
+                .when(pl.col("tourney_surface_ta") == "Hard").then(0.00)
+                .when(pl.col("tourney_surface_ta") == "Clay").then(-0.05)    # ✅ FIX
+                .otherwise(0.0)
+                .cast(pl.Float32)
+                .alias("tourney_speed_index")
+            ])
+    
+    gc.collect()
+    
+    # ─────────────────────────────────────────────
+    # 3.1 Create player-match view (AVEC custom_match_id)
+    # ─────────────────────────────────────────────
+    print("\n[3.1] Creating player-match view for SSI...")
+    
+    # Vérifier custom_match_id
+    df = ensure_custom_match_id(df)
+
+    
+    # ✅ FIX: Chercher glicko_prob_blend_A en priorité
+    glicko_col = None
+    for col in ["glicko_prob_blend_A", "glicko_prob_surface_A", "glicko_prob_A", 
+                "g2_proba_A", "g2_win_prob_A", "glicko_proba_A"]:
+        if col in df.columns:
+            coverage = df[col].is_not_null().mean()
+            if coverage > 0.1:
+                glicko_col = col
+                print(f"  ✅ Using {glicko_col} for SSI expected (coverage: {coverage:.1%})")
+                break
+    
+    if glicko_col is None:
+        print("  ⚠️ No Glicko proba found, using 0.5 default")
+    
+    # Winner view - AVEC custom_match_id
+    winner_select = [
+        pl.col("custom_match_id"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("round_order"),
+        pl.col("year"),
+        pl.col("tourney_speed_index"),
+        pl.lit(1).cast(pl.Float32).alias("won"),
+    ]
+    if glicko_col:
+        winner_select.append(pl.col(glicko_col).fill_null(0.5).alias("expected"))
+    else:
+        winner_select.append(pl.lit(0.5).cast(pl.Float32).alias("expected"))
+    
+    winner_data = df.select(winner_select)
+    
+    # Loser view - AVEC custom_match_id
+    loser_select = [
+        pl.col("custom_match_id"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("round_order"),
+        pl.col("year"),
+        pl.col("tourney_speed_index"),
+        pl.lit(0).cast(pl.Float32).alias("won"),
+    ]
+    if glicko_col:
+        loser_select.append((1 - pl.col(glicko_col).fill_null(0.5)).alias("expected"))
+    else:
+        loser_select.append(pl.lit(0.5).cast(pl.Float32).alias("expected"))
+    
+    loser_data = df.select(loser_select)
+    
+    player_matches = pl.concat([winner_data, loser_data])
+    del winner_data, loser_data
+    gc.collect()
+    
+    player_matches = player_matches.filter(pl.col("player_id").is_not_null())
+    print(f"  Player-match rows: {len(player_matches):,}")
+    log_memory("After player view")
+    
+    # ─────────────────────────────────────────────
+    # 3.2 Calculate performance residual × speed
+    # ─────────────────────────────────────────────
+    print("\n[3.2] Calculating raw preference signal...")
+    
+    # Performance residual = Won - Expected
+    # Raw signal = Residual × Speed Index
+    player_matches = player_matches.with_columns([
+        ((pl.col("won") - pl.col("expected")) * 
+         pl.col("tourney_speed_index").fill_null(0))
+        .cast(pl.Float32)
+        .alias("raw_pref_signal")
+    ])
+    
+    # ─────────────────────────────────────────────
+    # 3.3 EWM by player with SHIFT(1)
+    # ─────────────────────────────────────────────
+    print("\n[3.3] Calculating EWM preference by player...")
+    print(f"  EWM alpha: {EWM_ALPHA} (~{int(np.log(2)/EWM_ALPHA):.0f} match half-life)")
+    
+    # Sort chronologically
+    player_matches = player_matches.sort(["player_id", "tourney_date_ta", "round_order", "custom_match_id"])
+    
+    # EWM with SHIFT(1) - CRITICAL for no leakage
+    player_matches = player_matches.with_columns([
+        pl.col("raw_pref_signal")
+        .shift(1)
+        .ewm_mean(alpha=EWM_ALPHA, adjust=False, min_samples=3)
+        .over("player_id")
+        .fill_null(0.0)
+        .cast(pl.Float32)
+        .alias("pref_ssi")
+    ])
+    
+    log_memory("After EWM")
+    
+    # Stats
+    print(f"\n  pref_ssi stats:")
+    print(f"    Mean: {player_matches['pref_ssi'].mean():.4f}")
+    print(f"    Std:  {player_matches['pref_ssi'].std():.4f}")
+    
+    # ─────────────────────────────────────────────
+    # 3.4 Save MATCH-LEVEL (anti-leakage)
+    # ─────────────────────────────────────────────
+    print("\n[3.4] Saving match-level SSI...")
+    
+    # ✅ MATCH-LEVEL output (pas year-level)
+    ssi_match = player_matches.select([
+        "custom_match_id", "player_id", "pref_ssi"
+    ])
+    
+    save_match_level_safe(ssi_match, OUTPUT_DIR / "ssi_match_level.parquet")
+    print(f"  ✅ Saved {len(ssi_match):,} player-match entries (match-level)")
+    
+    del player_matches
+    gc.collect()
+    log_memory("End SSI")
+    
+    return ssi_match  # Retourner match-level, pas year-level
+
+
+# ===============================================
+# SECTION 4: ROLLING VS TOP (TRUE ROLLING 20)
+# ===============================================
+
+def calculate_rolling_vs_top() -> pl.DataFrame:
+    """
+    Calcule les VRAIES rolling stats vs Top10/Top50.
+    Utilise rolling(20) avec shift(1).
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 4: ROLLING VS TOP (TRUE ROLLING 20)")
+    print("=" * 70)
+    log_memory("Start rolling vs top")
+    
+    # Load minimal columns from ML_READY
+    required_cols = [
+        "custom_match_id",  # ✅ AJOUTER
+        "tourney_slug_ta",  # ✅ AJOUTER (pour hash fallback)
+        "round_ta",   # ✅ AJOUTER
+        "winner_id", "loser_id", "tourney_date_ta",
+        "winner_rank_ta", "loser_rank_ta"
+    ]
+    
+    schema = pl.read_parquet_schema(ML_READY_FILE)
+    available = [c for c in required_cols if c in schema]
+    
+    if "winner_rank_ta" not in available:
+        print("  ⚠️ No ranking data, skipping")
+        return None
+    
+    print(f"\n[4.1] Loading ranking data...")
+    df = pl.read_parquet(ML_READY_FILE, columns=available)
+    df = ensure_custom_match_id(df)
+    df = add_round_order(df)
+    # Add year
+    if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+        df = df.with_columns([
+            (pl.col("tourney_date_ta") // 10000).cast(pl.Int16).alias("year")
+        ])
+    else:
+        df = df.with_columns([
+            pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year")
+        ])
+    
+    print(f"  Loaded {len(df):,} matches")
+    log_memory("After load")
+    
+    # ─────────────────────────────────────────────
+    # 4.2 Create player-match view (AVEC custom_match_id)
+    # ─────────────────────────────────────────────
+    print("\n[4.2] Creating player-match view...")
+    
+    # Ajouter custom_match_id si absent
+    df = ensure_custom_match_id(df)
+
+    
+    winner_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.col("winner_rank_ta").alias("player_rank"),
+        pl.col("loser_rank_ta").fill_null(9999).alias("opp_rank"),
+        pl.lit(1).cast(pl.Int8).alias("won"),
+    ])
+    
+    loser_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.col("loser_rank_ta").alias("player_rank"),
+        pl.col("winner_rank_ta").fill_null(9999).alias("opp_rank"),
+        pl.lit(0).cast(pl.Int8).alias("won"),
+    ])
+    
+    pm = pl.concat([winner_view, loser_view])
+    pm = pm.sort(["player_id", "tourney_date_ta", "round_order", "custom_match_id"])
+    del winner_view, loser_view, df
+    gc.collect()
+    
+    # ─────────────────────────────────────────────
+    # 4.3 Add tier flags
+    # ─────────────────────────────────────────────
+    print("\n[4.3] Adding tier flags...")
+    
+    pm = pm.with_columns([
+        (pl.col("opp_rank") <= 10).cast(pl.Int8).alias("vs_top10"),
+        (pl.col("opp_rank") <= 50).cast(pl.Int8).alias("vs_top50"),
+        (pl.col("opp_rank") < pl.col("player_rank").fill_null(9999)).cast(pl.Int8).alias("vs_higher"),
+    ])
+    
+    # ─────────────────────────────────────────────
+    # 4.4 Calculate TRUE rolling(20) stats
+    # ─────────────────────────────────────────────
+    print("\n[4.4] Calculating TRUE rolling(20) stats...")
+    
+    # Wins vs Top10 (rolling 20, shifted)
+    pm = pm.with_columns([
+        (pl.col("won") * pl.col("vs_top10"))
+        .shift(1)  # ✅ SHIFT FIRST
+        .rolling_sum(window_size=ROLLING_WINDOW, min_samples=1)
+        .over("player_id")
+        .alias("_wins_top10_r20"),
+        
+        pl.col("vs_top10")
+        .shift(1)  # ✅ SHIFT FIRST
+        .rolling_sum(window_size=ROLLING_WINDOW, min_samples=1)
+        .over("player_id")
+        .alias("_matches_top10_r20"),
+    ])
+    
+    pm = pm.with_columns([
+        pl.when(pl.col("_matches_top10_r20") >= 3)
+        .then(pl.col("_wins_top10_r20") / pl.col("_matches_top10_r20"))
+        .otherwise(None)
+        .cast(pl.Float32)
+        .alias("r20_win_rate_vs_top10")
+    ])
+    
+    log_memory("After top10 rolling")
+    
+    # Wins vs Top50 (rolling 20, shifted)
+    pm = pm.with_columns([
+        (pl.col("won") * pl.col("vs_top50"))
+        .shift(1)
+        .rolling_sum(window_size=ROLLING_WINDOW, min_samples=1)
+        .over("player_id")
+        .alias("_wins_top50_r20"),
+        
+        pl.col("vs_top50")
+        .shift(1)
+        .rolling_sum(window_size=ROLLING_WINDOW, min_samples=1)
+        .over("player_id")
+        .alias("_matches_top50_r20"),
+    ])
+    
+    pm = pm.with_columns([
+        pl.when(pl.col("_matches_top50_r20") >= 3)
+        .then(pl.col("_wins_top50_r20") / pl.col("_matches_top50_r20"))
+        .otherwise(None)
+        .cast(pl.Float32)
+        .alias("r20_win_rate_vs_top50")
+    ])
+    
+    # Upset rate (rolling 20, shifted)
+    pm = pm.with_columns([
+        (pl.col("won") * pl.col("vs_higher"))
+        .shift(1)
+        .rolling_sum(window_size=ROLLING_WINDOW, min_samples=1)
+        .over("player_id")
+        .alias("_upsets_r20"),
+        
+        pl.col("vs_higher")
+        .shift(1)
+        .rolling_sum(window_size=ROLLING_WINDOW, min_samples=1)
+        .over("player_id")
+        .alias("_vs_higher_r20"),
+    ])
+    
+    pm = pm.with_columns([
+        pl.when(pl.col("_vs_higher_r20") >= 3)
+        .then(pl.col("_upsets_r20") / pl.col("_vs_higher_r20"))
+        .otherwise(None)
+        .cast(pl.Float32)
+        .alias("r20_upset_rate")
+    ])
+    
+    log_memory("After all rolling")
+    
+    # ─────────────────────────────────────────────
+    # 4.5 Save MATCH-LEVEL (anti-leakage)
+    # ─────────────────────────────────────────────
+    print("\n[4.5] Saving match-level rolling vs top...")
+    
+    # ✅ MATCH-LEVEL output
+    rolling_match = pm.select([
+        "custom_match_id", "player_id",
+        "r20_win_rate_vs_top10", "r20_win_rate_vs_top50", "r20_upset_rate"
+    ])
+    
+    save_match_level_safe(rolling_match, OUTPUT_DIR / "rolling_vs_top_match_level.parquet")
+    print(f"  ✅ Saved {len(rolling_match):,} player-match entries")
+    
+    # Stats
+    coverage_10 = pm["r20_win_rate_vs_top10"].is_not_null().mean()
+    coverage_50 = pm["r20_win_rate_vs_top50"].is_not_null().mean()
+    print(f"  Coverage vs top10: {coverage_10:.1%}")
+    print(f"  Coverage vs top50: {coverage_50:.1%}")
+    
+    del pm
+    gc.collect()
+    log_memory("End rolling vs top")
+    
+    return rolling_match
+
+
+# ===============================================
+# SECTION 5: CHOKE FACTOR (TRUE ROLLING 20)
+# ===============================================
+
+def calculate_choke_factor() -> pl.DataFrame:
+    """
+    Calcule le Choke Factor avec TRUE rolling(20).
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 5: CHOKE FACTOR (TRUE ROLLING 20)")
+    print("=" * 70)
+    log_memory("Start choke")
+    
+    # Load minimal columns
+    required_cols = [
+    "custom_match_id",  # ✅ AJOUTER
+    "tourney_slug_ta",  # ✅ AJOUTER
+    "round_ta",   # ✅ AJOUTER
+    "winner_id", "loser_id", "tourney_date_ta",
+    "score_ta"
+]
+    
+    schema = pl.read_parquet_schema(ML_READY_FILE)
+    available = [c for c in required_cols if c in schema]
+    
+    if "score_ta" not in available:
+        print("  ⚠️ No score data, skipping")
+        return None
+    
+    print(f"\n[5.1] Loading score data...")
+    df = pl.read_parquet(ML_READY_FILE, columns=available)
+    df = ensure_custom_match_id(df)
+    df = add_round_order(df)
+    # Add year
+    if "tourney_date_ta" in df.columns:
+        if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+            df = df.with_columns([
+                (pl.col("tourney_date_ta") // 10000).cast(pl.Int16).alias("year")
+            ])
+        else:
+            df = df.with_columns([
+                pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year")
+            ])
+    
+    print(f"  Loaded {len(df):,} matches")
+    
+    # ─────────────────────────────────────────────
+    # 5.2 Parse first set
+    # ─────────────────────────────────────────────
+    print("\n[5.2] Parsing first set results...")
+    
+    df = df.with_columns([
+        pl.col("score_ta")
+        .str.extract(r"^(\d+)-(\d+)", 1)
+        .cast(pl.Int8)
+        .alias("s1_w"),
+        pl.col("score_ta")
+        .str.extract(r"^(\d+)-(\d+)", 2)
+        .cast(pl.Int8)
+        .alias("s1_l"),
+    ])
+    
+    df = df.with_columns([
+        (pl.col("s1_w") > pl.col("s1_l")).alias("winner_won_s1")
+    ])
+    
+    valid = df.filter(pl.col("winner_won_s1").is_not_null()).height
+    print(f"  Valid matches with S1 parse: {valid:,}")
+    
+    # ─────────────────────────────────────────────
+    # 5.3 Create player mental view (AVEC custom_match_id)
+    # ─────────────────────────────────────────────
+    print("\n[5.3] Creating player mental view...")
+    
+    df = ensure_custom_match_id(df)
+
+    
+    winner_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.lit(1).cast(pl.Int8).alias("won"),
+        pl.col("winner_won_s1").cast(pl.Int8).alias("won_s1"),
+    ])
+    
+    loser_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.lit(0).cast(pl.Int8).alias("won"),
+        (~pl.col("winner_won_s1")).cast(pl.Int8).alias("won_s1"),
+    ])
+    
+    pm = pl.concat([winner_view, loser_view])
+    pm = pm.sort(["player_id", "tourney_date_ta", "round_order", "custom_match_id"])
+    del winner_view, loser_view, df
+    gc.collect()
+    
+    # ─────────────────────────────────────────────
+    # 5.4 Calculate choke/comeback flags
+    # ─────────────────────────────────────────────
+    print("\n[5.4] Calculating choke/comeback...")
+    
+    # Choke = Won S1 but lost match
+    # Comeback = Lost S1 but won match
+    pm = pm.with_columns([
+        ((pl.col("won_s1") == 1) & (pl.col("won") == 0)).cast(pl.Int8).alias("choked"),
+        ((pl.col("won_s1") == 0) & (pl.col("won") == 1)).cast(pl.Int8).alias("comeback"),
+    ])
+    
+    # TRUE rolling(20) with shift(1)
+    pm = pm.with_columns([
+        pl.col("choked")
+        .shift(1)
+        .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_PERIODS)
+        .over("player_id")
+        .cast(pl.Float32)
+        .alias("r20_choke_rate"),
+        
+        pl.col("comeback")
+        .shift(1)
+        .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_PERIODS)
+        .over("player_id")
+        .cast(pl.Float32)
+        .alias("r20_comeback_rate"),
+    ])
+    
+    log_memory("After choke rolling")
+    
+    # ─────────────────────────────────────────────
+    # 5.5 Save MATCH-LEVEL (anti-leakage)
+    # ─────────────────────────────────────────────
+    print("\n[5.5] Saving match-level mental features...")
+    
+    # ✅ MATCH-LEVEL output
+    mental_match = pm.select([
+        "custom_match_id", "player_id",
+        "r20_choke_rate", "r20_comeback_rate"
+    ])
+    
+    save_match_level_safe(mental_match, OUTPUT_DIR / "mental_match_level.parquet")
+    print(f"  ✅ Saved {len(mental_match):,} player-match entries")
+    
+    choke_mean = pm["r20_choke_rate"].mean()
+    comeback_mean = pm["r20_comeback_rate"].mean()
+    if choke_mean:
+        print(f"  Mean choke rate: {choke_mean:.3f}")
+    if comeback_mean:
+        print(f"  Mean comeback rate: {comeback_mean:.3f}")
+    
+    del pm
+    gc.collect()
+    log_memory("End choke")
+    
+    return mental_match
+
+
+# ===============================================
+# SECTION 6: MERGE ALL TO ML_READY
+# ===============================================
+
+def merge_all_to_ml_ready():
+
+    """
+    Merge toutes les features SOTA dans matches_ml_ready.
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 6: MERGE ALL TO ML_READY")
+    print("=" * 70)
+    log_memory("Start merge")
+    
+    # Load ML ready
+    print("\n[6.1] Loading matches_ml_ready...")
+    df = pl.read_parquet(ML_READY_FILE)
+    original_cols = len(df.columns)
+    print(f"  Loaded {len(df):,} rows, {original_cols} columns")
+    
+    # Add year if needed
+    if "year" not in df.columns:
+        if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+            df = df.with_columns([
+                (pl.col("tourney_date_ta") // 10000).cast(pl.Int16).alias("year")
+            ])
+    
+    # ─────────────────────────────────────────────
+    # 6.2 Merge Speed Index
+    # ─────────────────────────────────────────────
+    print("\n[6.2] Merging tourney_speed_index...")
+    
+    speed_path = SPEED_INDEX_DIR / "tourney_speed_index.parquet"
+    if speed_path.exists():
+        speed_df = pl.read_parquet(speed_path).select([
+            "tourney_slug_ta", "year", "tourney_speed_index"
+        ])
+        
+        if "tourney_speed_index" in df.columns:
+            df = df.drop("tourney_speed_index")
+        
+        df = df.join(speed_df, on=["tourney_slug_ta", "year"], how="left")
+        
+        # Surface fallback
+        if "tourney_surface_ta" in df.columns:
+            df = df.with_columns([
+                pl.when(pl.col("tourney_speed_index").is_not_null())
+                .then(pl.col("tourney_speed_index"))
+                .when(pl.col("tourney_surface_ta") == "Grass").then(0.06)
+                .when(pl.col("tourney_surface_ta") == "Carpet").then(0.04)
+                .when(pl.col("tourney_surface_ta") == "Hard").then(0.00)
+                .when(pl.col("tourney_surface_ta") == "Clay").then(-0.05)
+                .otherwise(0.0)
+                .cast(pl.Float32)
+                .alias("tourney_speed_index")
+            ])
+        
+        coverage = df["tourney_speed_index"].is_not_null().mean()
+        print(f"  ✅ tourney_speed_index coverage: {coverage:.1%}")
+        del speed_df
+    
+    gc.collect()
+    
+    # ─────────────────────────────────────────────
+    # 6.3 Merge SSI Preference (MATCH-LEVEL)
+    # ─────────────────────────────────────────────
+    print("\n[6.3] Merging SSI preference (match-level)...")
+    
+    ssi_path = OUTPUT_DIR / "ssi_match_level.parquet"
+    if ssi_path.exists():
+        ssi = pl.read_parquet(ssi_path)
+        
+        # Winner (A)
+        df = df.join(
+            ssi.select([
+                pl.col("custom_match_id"),
+                pl.col("player_id").alias("winner_id"),
+                pl.col("pref_ssi").alias("pref_ssi_A")
+            ]),
+            on=["custom_match_id", "winner_id"],
+            how="left"
+        )
+        
+        # Loser (B)
+        df = df.join(
+            ssi.select([
+                pl.col("custom_match_id"),
+                pl.col("player_id").alias("loser_id"),
+                pl.col("pref_ssi").alias("pref_ssi_B")
+            ]),
+            on=["custom_match_id", "loser_id"],
+            how="left"
+        )
+        
+        df = df.with_columns([
+            (pl.col("pref_ssi_A").fill_null(0) - pl.col("pref_ssi_B").fill_null(0))
+            .cast(pl.Float32).alias("diff_pref_ssi"),
+            (
+                (pl.col("tourney_speed_index").fill_null(0) - pl.col("pref_ssi_A").fill_null(0)).abs() -
+                (pl.col("tourney_speed_index").fill_null(0) - pl.col("pref_ssi_B").fill_null(0)).abs()
+            ).cast(pl.Float32).alias("diff_ssi_mismatch")
+        ])
+        print("  ✅ SSI merged (match-level)")
+        del ssi
+    
+    gc.collect()
+    
+    # ─────────────────────────────────────────────
+    # 6.4 Merge Rolling vs Top (MATCH-LEVEL)
+    # ─────────────────────────────────────────────
+    print("\n[6.4] Merging rolling vs top (match-level)...")
+    
+    rolling_path = OUTPUT_DIR / "rolling_vs_top_match_level.parquet"
+    if rolling_path.exists():
+        rolling = pl.read_parquet(rolling_path)
+        
+        for suffix, id_col in [("_A", "winner_id"), ("_B", "loser_id")]:
+            df = df.join(
+                rolling.select([
+                    pl.col("custom_match_id"),
+                    pl.col("player_id").alias(id_col),
+                    pl.col("r20_win_rate_vs_top10").alias(f"r20_win_rate_vs_top10{suffix}"),
+                    pl.col("r20_win_rate_vs_top50").alias(f"r20_win_rate_vs_top50{suffix}"),
+                    pl.col("r20_upset_rate").alias(f"r20_upset_rate{suffix}"),
+                ]),
+                on=["custom_match_id", id_col],
+                how="left"
+            )
+        print("  ✅ Rolling vs top merged (match-level)")
+        del rolling
+    
+    gc.collect()
+    
+    # ─────────────────────────────────────────────
+    # 6.5 Merge Mental Features (MATCH-LEVEL)
+    # ─────────────────────────────────────────────
+    print("\n[6.5] Merging mental features (match-level)...")
+    
+    mental_path = OUTPUT_DIR / "mental_match_level.parquet"
+    if mental_path.exists():
+        mental = pl.read_parquet(mental_path)
+        
+        for suffix, id_col in [("_A", "winner_id"), ("_B", "loser_id")]:
+            df = df.join(
+                mental.select([
+                    pl.col("custom_match_id"),
+                    pl.col("player_id").alias(id_col),
+                    pl.col("r20_choke_rate").alias(f"r20_choke_rate{suffix}"),
+                    pl.col("r20_comeback_rate").alias(f"r20_comeback_rate{suffix}"),
+                ]),
+                on=["custom_match_id", id_col],
+                how="left"
+            )
+        print("  ✅ Mental features merged (match-level)")
+        del mental
+    
+    gc.collect()
+    
+    # ─────────────────────────────────────────────
+    # 6.6 Save enriched file
+    # ─────────────────────────────────────────────
+    print("\n[6.6] Saving matches_ml_ready_SOTA.parquet...")
+    
+    output_path = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA.parquet"
+    df.write_parquet(output_path)
+    
+    new_cols = len(df.columns) - original_cols
+    print(f"\n  ✅ Saved to {output_path}")
+    print(f"  Final: {len(df):,} rows × {len(df.columns)} columns (+{new_cols} new)")
+    
+    # Summary of new features
+    new_features = [
+        "tourney_speed_index",
+        "pref_ssi_A", "pref_ssi_B", "diff_pref_ssi", "diff_ssi_mismatch",
+        "r20_win_rate_vs_top10_A", "r20_win_rate_vs_top10_B",
+        "r20_win_rate_vs_top50_A", "r20_win_rate_vs_top50_B",
+        "r20_upset_rate_A", "r20_upset_rate_B",
+        "r20_choke_rate_A", "r20_choke_rate_B",
+        "r20_comeback_rate_A", "r20_comeback_rate_B",
+    ]
+    
+    print("\n  📊 SOTA Features Summary:")
+    for f in new_features:
+        if f in df.columns:
+            cov = df[f].is_not_null().mean()
+            print(f"    ✅ {f}: {cov:.1%} coverage")
+        else:
+            print(f"    ❌ {f}: NOT ADDED")
+    
+    return df
+
+# ===============================================
+# SECTION 7: PHASE 2 ULTIMATE FEATURES
+# TennisTitan SOTA 2026 - GOD MODE
+# ===============================================
+#
+# Features ajoutées:
+#   - straight_sets_win_rate (r20)
+#   - retirement_rate (r20)
+#   - venue_wins / venue_matches
+#   - defending_champion flag
+#   - player_style_category (SERVE_BOT, GRINDER, etc.)
+#   - style_matchup_advantage
+#
+# ===============================================
+
+
+# ===============================================
+# SECTION 7.1: STRAIGHT SETS WIN RATE
+# ===============================================
+
+def calculate_straight_sets_features() -> pl.DataFrame:
+    """
+    Calcule le taux de victoires en sets secs (rolling 20).
+    
+    - Bo3: 2-0 = straight sets
+    - Bo5: 3-0 = straight sets
+    
+    Anti-leakage: shift(1) avant rolling
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 7.1: STRAIGHT SETS WIN RATE")
+    print("=" * 70)
+    log_memory("Start straight sets")
+    
+    # Load data
+    required_cols = [
+    "custom_match_id",  # ✅ AJOUTER
+    "tourney_slug_ta",  # ✅ AJOUTER
+    "round_ta",   # ✅ AJOUTER
+    "winner_id", "loser_id", "tourney_date_ta",
+    "score_ta", "best_of_ta"
+]
+    schema = pl.read_parquet_schema(ML_READY_FILE)
+    available = [c for c in required_cols if c in schema]
+    df = pl.read_parquet(ML_READY_FILE, columns=available)
+    df = ensure_custom_match_id(df)
+    df = add_round_order(df)
+    # Add year
+    df = add_year_column(df)
+
+    
+    print(f"  Loaded {len(df):,} matches")
+    
+    # ─────────────────────────────────────────────
+    # 7.1.1 Parse score to detect straight sets
+    # ─────────────────────────────────────────────
+    print("\n[7.1.1] Parsing scores for straight sets detection...")
+    
+    # Count sets in score (number of spaces + 1, roughly)
+    # More accurate: count the pattern "X-Y" occurrences
+    df = df.with_columns([
+        # Count sets played (number of "X-Y" patterns)
+        pl.col("score_ta")
+        .str.count_matches(r"\d+-\d+")
+        .cast(pl.Int8)
+        .alias("sets_played"),
+        
+        # Best of
+        pl.col("best_of_ta").fill_null(3).cast(pl.Int8).alias("best_of"),
+    ])
+    
+    # Straight sets detection
+    # Bo3: sets_played == 2 means 2-0
+    # Bo5: sets_played == 3 means 3-0
+    df = df.with_columns([
+        pl.when(
+            ((pl.col("best_of") == 3) & (pl.col("sets_played") == 2)) |
+            ((pl.col("best_of") == 5) & (pl.col("sets_played") == 3))
+        )
+        .then(1)
+        .otherwise(0)
+        .cast(pl.Int8)
+        .alias("is_straight_sets")
+    ])
+    
+    straight_count = df.filter(pl.col("is_straight_sets") == 1).height
+    print(f"  Straight sets matches: {straight_count:,} ({100*straight_count/len(df):.1f}%)")
+    
+    # ─────────────────────────────────────────────
+    # 7.1.2 Create player-match view (UNIFIÉ)
+    # ─────────────────────────────────────────────
+    print("\n[7.1.2] Creating player-match view...")
+    
+    # Winner: a gagné, potentiellement en straight
+    winner_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.col("is_straight_sets").cast(pl.Int8).alias("won_straight"),
+        pl.lit(0).cast(pl.Int8).alias("lost_straight"),
+    ])
+    
+    # Loser: a perdu, potentiellement en straight
+    loser_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.lit(0).cast(pl.Int8).alias("won_straight"),
+        pl.col("is_straight_sets").cast(pl.Int8).alias("lost_straight"),
+    ])
+    
+    pm = pl.concat([winner_view, loser_view])
+    pm = pm.filter(pl.col("player_id").is_not_null())
+    pm = pm.sort(["player_id", "tourney_date_ta", "round_order", "custom_match_id"])
+    
+    del winner_view, loser_view
+    gc.collect()
+    
+    # Rolling sur les DEUX indicateurs dans le même DataFrame
+    pm = pm.with_columns([
+        pl.col("won_straight")
+        .shift(1)
+        .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_PERIODS)
+        .over("player_id")
+        .cast(pl.Float32)
+        .alias("r20_straight_sets_win_rate"),
+        
+        pl.col("lost_straight")
+        .shift(1)
+        .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_PERIODS)
+        .over("player_id")
+        .cast(pl.Float32)
+        .alias("r20_straight_sets_loss_rate"),
+    ])
+    
+    # ─────────────────────────────────────────────
+    # 7.1.3 Save MATCH-LEVEL
+    # ─────────────────────────────────────────────
+    print("\n[7.1.3] Saving match-level straight sets...")
+    
+    straight_match = pm.select([
+        "custom_match_id", "player_id", 
+        "r20_straight_sets_win_rate", "r20_straight_sets_loss_rate"
+    ])
+    
+    save_match_level_safe(straight_match, OUTPUT_DIR / "straight_sets_match_level.parquet")
+    print(f"  ✅ Saved {len(straight_match):,} player-match entries")
+    
+    del df, pm
+    gc.collect()
+    log_memory("End straight sets")
+    
+    return straight_match
+
+# ===============================================
+# SECTION 7.2: RETIREMENT RATE
+# ===============================================
+
+def calculate_retirement_features() -> pl.DataFrame:
+    """
+    Calcule le taux d'abandons (rolling 20).
+    
+    - Retirement given (joueur abandonne)
+    - Retirement received (adversaire abandonne)
+    
+    Anti-leakage: shift(1) avant rolling
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 7.2: RETIREMENT RATE")
+    print("=" * 70)
+    log_memory("Start retirement")
+    
+    # Load data
+    required_cols = [
+    "custom_match_id",  # ✅ AJOUTER
+    "tourney_slug_ta",  # ✅ AJOUTER
+    "round_ta",   # ✅ AJOUTER
+    "winner_id", "loser_id", "tourney_date_ta",
+    "match_status", "score_ta"
+]
+    schema = pl.read_parquet_schema(ML_READY_FILE)
+    available = [c for c in required_cols if c in schema]
+    df = pl.read_parquet(ML_READY_FILE, columns=available)
+    df = ensure_custom_match_id(df)
+    df = add_round_order(df)
+    # Add year
+    df = add_year_column(df)
+
+    
+    print(f"  Loaded {len(df):,} matches")
+    
+    # ─────────────────────────────────────────────
+    # 7.2.1 Detect retirements
+    # ─────────────────────────────────────────────
+    print("\n[7.2.1] Detecting retirements...")
+    
+    # Retirement patterns in match_status or score
+    df = df.with_columns([
+        # Check match_status
+        pl.col("match_status")
+        .cast(pl.Utf8).str.to_uppercase()
+        .str.contains(r"RET|W\.?O|DEF|WALKOVER|RETIRED|DEFAULT")
+        .fill_null(False)
+        .alias("_ret_status"),
+        
+        # Check score for RET pattern
+        pl.col("score_ta")
+        .cast(pl.Utf8).str.to_uppercase()
+        .str.contains(r"RET|W\.?O|DEF")
+        .fill_null(False)
+        .alias("_ret_score"),
+    ])
+    
+    # Combine
+    df = df.with_columns([
+        (pl.col("_ret_status") | pl.col("_ret_score"))
+        .cast(pl.Int8)
+        .alias("is_retirement")
+    ])
+    
+    ret_count = df.filter(pl.col("is_retirement") == 1).height
+    print(f"  Retirements detected: {ret_count:,} ({100*ret_count/len(df):.1f}%)")
+    
+    # ─────────────────────────────────────────────
+    # 7.2.2 Create player-match view
+    # ─────────────────────────────────────────────
+    print("\n[7.2.2] Creating player-match view...")
+    
+    # Winner received a retirement (opponent retired)
+    winner_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.col("is_retirement").alias("retirement_received"),
+        pl.lit(0).cast(pl.Int8).alias("retirement_given"),  # Winner didn't retire
+    ])
+    
+    # Loser gave a retirement (they retired)
+    loser_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.lit(0).cast(pl.Int8).alias("retirement_received"),
+        pl.col("is_retirement").alias("retirement_given"),  # Loser retired
+    ])
+    
+    pm = pl.concat([winner_view, loser_view])
+    del winner_view, loser_view
+    gc.collect()
+    
+    pm = pm.filter(pl.col("player_id").is_not_null())
+    pm = pm.sort(["player_id", "tourney_date_ta", "round_order", "custom_match_id"])
+    
+    print(f"  Player-match rows: {len(pm):,}")
+    
+    # ─────────────────────────────────────────────
+    # 7.2.3 Rolling retirement rates
+    # ─────────────────────────────────────────────
+    print("\n[7.2.3] Computing rolling retirement rates...")
+    
+    pm = pm.with_columns([
+        # How often player retires (injury prone indicator)
+        pl.col("retirement_given")
+        .shift(1)
+        .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_PERIODS)
+        .over("player_id")
+        .cast(pl.Float32)
+        .alias("r20_retirement_given_rate"),
+        
+        # How often opponent retires against player (dominance indicator)
+        pl.col("retirement_received")
+        .shift(1)
+        .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_PERIODS)
+        .over("player_id")
+        .cast(pl.Float32)
+        .alias("r20_retirement_received_rate"),
+    ])
+    
+    # ─────────────────────────────────────────────
+    # 7.2.4 Save MATCH-LEVEL
+    # ─────────────────────────────────────────────
+    print("\n[7.2.4] Saving match-level retirement...")
+    
+    retirement_match = pm.select([
+        "custom_match_id", "player_id",
+        "r20_retirement_given_rate", "r20_retirement_received_rate"
+    ])
+    
+    save_match_level_safe(retirement_match, OUTPUT_DIR / "retirement_match_level.parquet")
+    print(f"  ✅ Saved {len(retirement_match):,} player-match entries")
+    
+    del pm, df
+    gc.collect()
+    log_memory("End retirement")
+    
+    return retirement_match
+
+
+# ===============================================
+# SECTION 7.3: VENUE HISTORY
+# ===============================================
+
+def calculate_venue_history() -> pl.DataFrame:
+    """
+    Calcule l'historique au tournoi:
+    - venue_wins: victoires au même tournoi (all-time avant match)
+    - venue_matches: matchs joués au même tournoi
+    - defending_champion: a gagné la finale l'an dernier
+    
+    Anti-leakage: strict passé uniquement
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 7.3: VENUE HISTORY")
+    print("=" * 70)
+    log_memory("Start venue")
+    
+    # Load data
+    required_cols = [
+    "custom_match_id",  # ✅ AJOUTER
+    "winner_id", "loser_id", "tourney_date_ta",
+    "tourney_slug_ta", "round_ta"
+]
+    schema = pl.read_parquet_schema(ML_READY_FILE)
+    available = [c for c in required_cols if c in schema]
+    df = pl.read_parquet(ML_READY_FILE, columns=available)
+    df = ensure_custom_match_id(df)
+    df = add_round_order(df)
+    # Add year
+    df = add_year_column(df)
+
+    
+    print(f"  Loaded {len(df):,} matches")
+    
+    # Clean tourney_slug (extract base name without year)
+    df = df.with_columns([
+        pl.col("tourney_slug_ta")
+        .cast(pl.Utf8).str.replace(r"^\d{4}", "")  # Remove leading year
+        .str.replace(r"_\d{4}$", "")  # Remove trailing year
+        .str.to_lowercase()
+        .str.strip_chars()
+        .alias("tourney_base")
+    ])
+    
+    # ─────────────────────────────────────────────
+    # 7.3.1 Detect finals (for defending champion)
+    # ─────────────────────────────────────────────
+    print("\n[7.3.1] Detecting finals for defending champion...")
+    
+    df = df.with_columns([
+        (pl.col("round_ta").cast(pl.Utf8).str.to_uppercase() == "F").cast(pl.Int8).alias("is_final")
+    ])
+    
+    finals_count = df.filter(pl.col("is_final") == 1).height
+    print(f"  Finals detected: {finals_count:,}")
+    
+    # ─────────────────────────────────────────────
+    # 7.3.2 Create player-match view
+    # ─────────────────────────────────────────────
+    print("\n[7.3.2] Creating player-match view...")
+    
+    winner_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.col("tourney_base"),
+        pl.lit(1).cast(pl.Int8).alias("won"),
+        pl.col("is_final").alias("won_final"),
+    ])
+    
+    loser_view = df.select([
+        pl.col("custom_match_id"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("round_order"),
+        pl.col("tourney_base"),
+        pl.lit(0).cast(pl.Int8).alias("won"),
+        pl.lit(0).cast(pl.Int8).alias("won_final"),  # Loser didn't win final
+    ])
+    
+    pm = pl.concat([winner_view, loser_view])
+    del winner_view, loser_view
+    gc.collect()
+    
+    pm = pm.filter(
+        pl.col("player_id").is_not_null() & 
+        pl.col("tourney_base").is_not_null() &
+        (pl.col("tourney_base") != "nan")
+    )
+    pm = pm.sort(["player_id", "tourney_base", "tourney_date_ta", "round_order", "custom_match_id"])
+    
+    print(f"  Player-match rows: {len(pm):,}")
+    
+    # ─────────────────────────────────────────────
+    # 7.3.3 Calculate venue wins/matches (cumulative, shifted)
+    # ─────────────────────────────────────────────
+    print("\n[7.3.3] Computing venue history (cumulative)...")
+    
+    # IMPORTANT: Créer colonne _one d'abord (pl.lit(1) ne marche pas avec .over())
+    pm = pm.with_columns([
+        pl.lit(1).cast(pl.Int8).alias("_one")
+    ])
+    
+    # Cumulative wins at venue BEFORE current match (shift 1)
+    pm = pm.with_columns([
+        pl.col("won")
+        .cum_sum()
+        .shift(1)
+        .over(["player_id", "tourney_base"])
+        .fill_null(0)
+        .cast(pl.Int16)
+        .alias("venue_wins_prior"),
+        
+        # Match count at venue - UTILISER LA COLONNE _one
+        pl.col("_one")
+        .cum_sum()
+        .shift(1)
+        .over(["player_id", "tourney_base"])
+        .fill_null(0)
+        .cast(pl.Int16)
+        .alias("venue_matches_prior"),
+    ])
+    
+    # Venue win rate
+    pm = pm.with_columns([
+        pl.when(pl.col("venue_matches_prior") >= 3)
+        .then(pl.col("venue_wins_prior") / pl.col("venue_matches_prior"))
+        .otherwise(None)
+        .cast(pl.Float32)
+        .alias("venue_win_rate")
+    ])
+    
+    log_memory("After venue cumsum")
+    
+    # ─────────────────────────────────────────────
+    # 7.3.4 Defending champion flag
+    # ─────────────────────────────────────────────
+    print("\n[7.3.4] Computing defending champion flag...")
+    
+    # Find all final wins per player/venue/year
+    final_wins = pm.filter(pl.col("won_final") == 1).select([
+        "player_id", "tourney_base", "year"
+    ]).unique()
+    
+    # For each match, check if player won final at same venue last year
+    pm = pm.with_columns([
+        (pl.col("year") - 1).alias("prev_year")
+    ])
+    
+    # Join to check if defending champion
+    pm = pm.join(
+        final_wins.select([
+            pl.col("player_id"),
+            pl.col("tourney_base"),
+            pl.col("year").alias("prev_year"),
+            pl.lit(1).cast(pl.Int8).alias("is_defending_champion")
+        ]),
+        on=["player_id", "tourney_base", "prev_year"],
+        how="left"
+    )
+    
+    pm = pm.with_columns([
+        pl.col("is_defending_champion").fill_null(0).cast(pl.Int8)
+    ])
+    
+    defending_count = pm.filter(pl.col("is_defending_champion") == 1).height
+    print(f"  Defending champion instances: {defending_count:,}")
+    
+    # ─────────────────────────────────────────────
+    # 7.3.5 Save
+    # ─────────────────────────────────────────────
+    print("\n[7.3.5] Saving...")
+    
+    # 1. D'ABORD créer pm_detail
+    pm_detail = pm.select([
+        "player_id", "custom_match_id", "tourney_date_ta", "tourney_base", "year",
+        "venue_wins_prior", "venue_matches_prior", "venue_win_rate",
+        "is_defending_champion"
+    ])
+    
+    # 2. ENSUITE sauvegarder avec déduplication
+    save_match_level_safe(pm_detail, OUTPUT_DIR / "player_venue_detailed.parquet")
+    
+    # 3. Puis créer l'agrégat year-level (optionnel, pour stats)
+    venue_features = pm.group_by(["player_id", "year"]).agg([
+        pl.col("venue_wins_prior").mean().alias("avg_venue_wins"),
+        pl.col("venue_matches_prior").mean().alias("avg_venue_matches"),
+        pl.col("venue_win_rate").mean().alias("avg_venue_win_rate"),
+        pl.col("is_defending_champion").max().alias("has_defending_title"),
+    ])
+    
+    venue_features.write_parquet(OUTPUT_DIR / "player_venue_history.parquet")
+    print(f"  ✅ Saved {len(venue_features):,} player-year entries")
+    
+    del pm, df
+    gc.collect()
+    log_memory("End venue")
+    
+    return pm_detail  # Retourner le match-level pour le merge
+
+# ===============================================
+# SECTION 7.4: PLAYER STYLE CLASSIFICATION - TEMPORAL
+# GOD SOTA 2026 - NO LEAKAGE VERSION
+# ===============================================
+
+STYLE_ROLLING = 100  # Fenêtre pour style (caractéristique plus stable)
+STYLE_MIN_MATCHES = 8  # Minimum pour calculer un style fiable
+
+def calculate_player_style_temporal() -> pl.DataFrame:
+    """
+    Classification SOTA 2026 - VERSION TEMPORELLE (NO LEAKAGE).
+    
+    Changements vs version originale:
+    1. Rolling 100 matchs au lieu de carrière complète
+    2. shift(1) avant rolling pour exclure match courant
+    3. Output au niveau MATCH (pas player global)
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 7.4: PLAYER STYLE - TEMPORAL (GOD SOTA 2026)")
+    print("=" * 70)
+    log_memory("Start style temporal")
+    
+    # ─────────────────────────────────────────────
+    # 1. Load stats from matches_base
+    # ─────────────────────────────────────────────
+    print("\n[7.4.1] Loading stats from matches_base...")
+    
+    matches_base_path = None
+    for path in [DATA_CLEAN / "matches_base", ROOT / "matches_base"]:
+        if path.exists():
+            matches_base_path = path
+            break
+    
+    if matches_base_path is None:
+        print("  ⚠️ matches_base not found, trying ML_READY")
+        matches_base_path = ML_READY_FILE
+    
+    # Colonnes nécessaires
+    style_cols = [
+        "custom_match_id", "tourney_slug_ta",
+        "winner_id", "loser_id", "tourney_date_ta", "round_ta",
+        "w_ace", "w_df", "w_svpt", "w_1stIn", "w_1stWon",
+        "l_ace", "l_df", "l_svpt", "l_1stIn", "l_1stWon",
+        "w_bpSaved", "w_bpFaced", "l_bpSaved", "l_bpFaced",
+        "w_s_ace_p", "w_s_1stWon_p", "w_rpw_p",
+        "l_s_ace_p", "l_s_1stWon_p", "l_rpw_p",
+    ]
+    
+    schema = pl.read_parquet_schema(matches_base_path)
+    available_cols = [c for c in style_cols if c in schema]
+    
+    mb = pl.read_parquet(matches_base_path, columns=available_cols)
+    mb = ensure_custom_match_id(mb)
+    mb = add_round_order(mb) 
+    print(f"  Loaded {len(mb):,} matches with {len(available_cols)} columns")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # FIX CRITIQUE: Convertir NaN → null pour toutes les colonnes numériques
+    # ═══════════════════════════════════════════════════════════════════════
+    print("\n[7.4.1b] Converting NaN to null...")
+    
+    numeric_cols = [col for col in mb.columns if mb[col].dtype in [pl.Float64, pl.Float32, pl.Int64, pl.Int32]]
+    print(f"  Numeric columns to fix: {len(numeric_cols)}")
+    
+    # Compter les NaN avant
+    nan_counts_before = {}
+    for col in numeric_cols[:6]:  # Juste un échantillon pour le log
+        nan_count = mb[col].is_nan().sum() if mb[col].dtype in [pl.Float64, pl.Float32] else 0
+        nan_counts_before[col] = nan_count
+    
+    mb = mb.with_columns([
+        pl.when(pl.col(col).is_nan())
+        .then(None)
+        .otherwise(pl.col(col))
+        .alias(col)
+        for col in numeric_cols
+        if mb[col].dtype in [pl.Float64, pl.Float32]
+    ])
+    
+    # Vérifier après
+    print(f"  Sample NaN→null conversions:")
+    for col, nan_before in list(nan_counts_before.items())[:4]:
+        null_after = mb[col].is_null().sum()
+        print(f"    {col}: {nan_before:,} NaN → {null_after:,} null")
+    
+    # Vérifier la vraie couverture maintenant
+    print(f"\n  📊 TRUE COVERAGE (after NaN fix):")
+    for col in ["w_ace", "w_svpt", "w_s_ace_p", "w_rpw_p"]:
+        if col in mb.columns:
+            coverage = mb[col].is_not_null().mean()
+            print(f"    {col}: {coverage:.1%}")
+    # ─────────────────────────────────────────────
+    # 2. Calculate derived stats
+    # ─────────────────────────────────────────────
+    print("\n[7.4.2] Calculating derived statistics...")
+    
+    def safe_pct(num_col: str, denom_col: str) -> pl.Expr:
+        return (
+            pl.when((pl.col(denom_col) > 0) & pl.col(num_col).is_not_null())
+            .then(pl.col(num_col) / pl.col(denom_col))
+            .otherwise(None)
+            .cast(pl.Float32)
+        )
+    
+    # Winner stats - avec pct_auto pour normaliser automatiquement
+    mb = mb.with_columns([
+        # Ace%
+        pl.coalesce([
+            pct_auto(pl.col("w_s_ace_p")),
+            safe_pct("w_ace", "w_svpt")
+        ]).alias("w_ace_pct"),
+        
+        # 1stWon%
+        pl.coalesce([
+            pct_auto(pl.col("w_s_1stWon_p")),
+            safe_pct("w_1stWon", "w_1stIn")
+        ]).alias("w_1stWon_pct"),
+        
+        # BP Saved%
+        safe_pct("w_bpSaved", "w_bpFaced").alias("w_bpSaved_pct"),
+        
+        # RPW% - cette colonne est souvent en [0,100]
+        pct_auto(pl.col("w_rpw_p"), default=0.35).alias("w_rpw_pct"),
+    ])
+    
+    # Loser stats
+    mb = mb.with_columns([
+        pl.coalesce([
+            pct_auto(pl.col("l_s_ace_p")),
+            safe_pct("l_ace", "l_svpt")
+        ]).alias("l_ace_pct"),
+        
+        pl.coalesce([
+            pct_auto(pl.col("l_s_1stWon_p")),
+            safe_pct("l_1stWon", "l_1stIn")
+        ]).alias("l_1stWon_pct"),
+        
+        safe_pct("l_bpSaved", "l_bpFaced").alias("l_bpSaved_pct"),
+        
+        pct_auto(pl.col("l_rpw_p"), default=0.35).alias("l_rpw_pct"),
+    ])
+    
+    # ─────────────────────────────────────────────
+    # 3. Create player-match view
+    # ─────────────────────────────────────────────
+    print("\n[7.4.3] Creating player-match view...")
+    
+    winner_view = mb.select([
+        pl.col("custom_match_id"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("round_order"),
+        pl.col("w_ace_pct").alias("ace_pct"),
+        pl.col("w_1stWon_pct").alias("first_won_pct"),
+        pl.col("w_bpSaved_pct").alias("bp_saved_pct"),
+        pl.col("w_rpw_pct").alias("rpw_pct"),
+    ])
+    
+    loser_view = mb.select([
+        pl.col("custom_match_id"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("round_order"),
+        pl.col("l_ace_pct").alias("ace_pct"),
+        pl.col("l_1stWon_pct").alias("first_won_pct"),
+        pl.col("l_bpSaved_pct").alias("bp_saved_pct"),
+        pl.col("l_rpw_pct").alias("rpw_pct"),
+    ])
+    
+    pm = pl.concat([winner_view, loser_view])
+    pm = pm.filter(pl.col("player_id").is_not_null())
+    pm = pm.sort(["player_id", "tourney_date_ta", "round_order", "custom_match_id"])
+    
+    del winner_view, loser_view, mb
+    gc.collect()
+    
+    print(f"  Player-match rows: {len(pm):,}")
+    
+    # ─────────────────────────────────────────────
+    # 4. ROLLING STATS avec SHIFT(1) - ANTI-LEAKAGE
+    # ─────────────────────────────────────────────
+    print("\n[7.4.4] Computing ROLLING style stats (shift+rolling)...")
+    print(f"  Window: {STYLE_ROLLING}, Min samples: {STYLE_MIN_MATCHES}")
+    
+    style_stats = ["ace_pct", "first_won_pct", "bp_saved_pct", "rpw_pct"]
+    
+    for stat in style_stats:
+        pm = pm.with_columns([
+            pl.col(stat)
+            .shift(1)  # ✅ CRITICAL: Exclure match courant
+            .rolling_mean(window_size=STYLE_ROLLING, min_samples=STYLE_MIN_MATCHES)
+            .over("player_id")
+            .cast(pl.Float32)
+            .alias(f"r100_{stat}")
+        ])
+    
+    log_memory("After rolling stats")
+    
+    # ─────────────────────────────────────────────
+    # 5. ✅ FIX: Scores en [0,100] - SANS NaN
+    # ─────────────────────────────────────────────
+    print("\n[7.4.5] Computing style scores (0-100 scale)...")
+    
+    # ✅ FIX: Convertir NaN en null AVANT de multiplier
+    pm = pm.with_columns([
+        pl.when(pl.col("r100_ace_pct").is_nan())
+        .then(None)
+        .otherwise(pl.col("r100_ace_pct") * 100)
+        .cast(pl.Float32)
+        .alias("style_ace_pct_score"),
+        
+        pl.when(pl.col("r100_rpw_pct").is_nan())
+        .then(None)
+        .otherwise(pl.col("r100_rpw_pct") * 100)
+        .cast(pl.Float32)
+        .alias("style_rpw_pct_score"),
+        
+        pl.when(pl.col("r100_bp_saved_pct").is_nan())
+        .then(None)
+        .otherwise(pl.col("r100_bp_saved_pct") * 100)
+        .cast(pl.Float32)
+        .alias("style_bp_saved_pct_score"),
+        
+        pl.when(pl.col("r100_first_won_pct").is_nan())
+        .then(None)
+        .otherwise(pl.col("r100_first_won_pct") * 100)
+        .cast(pl.Float32)
+        .alias("style_first_won_pct_score"),
+    ])
+    
+    # Debug - maintenant median devrait être un nombre
+    for col in ["style_ace_pct_score", "style_rpw_pct_score", "style_bp_saved_pct_score"]:
+        valid = pm.filter(pl.col(col).is_not_null())
+        n_valid = len(valid)
+        if n_valid > 0:
+            stats = valid[col]
+            print(f"  {col}: n={n_valid:,}, min={stats.min():.1f}, median={stats.median():.1f}, max={stats.max():.1f}")
+        else:
+            print(f"  ⚠️ {col}: NO VALID DATA")
+    
+    # ─────────────────────────────────────────────
+    # 6. ✅ FIX: Classification par Z-SCORES (ROBUSTE)
+    # ─────────────────────────────────────────────
+    print("\n[7.4.6] Classifying players (Z-score based)...")
+    
+    for stat in ["ace_pct", "rpw_pct", "bp_saved_pct"]:
+        score_col = f"style_{stat}_score"
+        if score_col in pm.columns:
+            # ✅ FIX: Filtrer BOTH null AND NaN
+            valid_data = pm.filter(
+                pl.col(score_col).is_not_null() & ~pl.col(score_col).is_nan()
+            )[score_col]
+            
+            n_valid = len(valid_data)
+            
+            if n_valid > 100:
+                mean_val = float(valid_data.mean())
+                std_val = float(valid_data.std())
+                
+                if std_val is not None and std_val > 0.01:
+                    pm = pm.with_columns([
+                        pl.when(pl.col(score_col).is_not_null() & ~pl.col(score_col).is_nan())
+                        .then((pl.col(score_col) - mean_val) / std_val)
+                        .otherwise(0.0)
+                        .cast(pl.Float32)
+                        .alias(f"z_{stat}")
+                    ])
+                    print(f"  z_{stat}: n={n_valid:,}, mean={mean_val:.1f}, std={std_val:.1f}")
+                else:
+                    pm = pm.with_columns([pl.lit(0.0).cast(pl.Float32).alias(f"z_{stat}")])
+                    print(f"  ⚠️ z_{stat}: std too small ({std_val})")
+            else:
+                pm = pm.with_columns([pl.lit(0.0).cast(pl.Float32).alias(f"z_{stat}")])
+                print(f"  ⚠️ z_{stat}: Not enough data ({n_valid} valid)")
+    
+    # Vérifier que les z-scores existent
+    for z_col in ["z_ace_pct", "z_rpw_pct", "z_bp_saved_pct"]:
+        if z_col not in pm.columns:
+            pm = pm.with_columns([pl.lit(0.0).cast(pl.Float32).alias(z_col)])
+    
+    # Debug z-scores
+    print("\n  Z-score ranges:")
+    for z_col in ["z_ace_pct", "z_rpw_pct", "z_bp_saved_pct"]:
+        z_valid = pm.filter(pl.col(z_col).abs() > 0.01)
+        print(f"    {z_col}: min={pm[z_col].min():.2f}, max={pm[z_col].max():.2f}, non-zero={len(z_valid):,}")
+    
+    # Classification argmax-like
+    pm = pm.with_columns([
+        pl.when(
+            # Pas de données → NULL (pas ALL_COURT)
+            (pl.col("z_ace_pct") == 0.0) & 
+            (pl.col("z_rpw_pct") == 0.0) & 
+            (pl.col("z_bp_saved_pct") == 0.0)
+        ).then(None)  # ✅ NULL si pas de données
+        .when(
+            (pl.col("z_ace_pct") > pl.col("z_rpw_pct")) & 
+            (pl.col("z_ace_pct") > pl.col("z_bp_saved_pct")) &
+            (pl.col("z_ace_pct") > 0.5)
+        ).then(pl.lit("SERVE_DOMINANT"))
+        .when(
+            (pl.col("z_rpw_pct") > pl.col("z_ace_pct")) & 
+            (pl.col("z_rpw_pct") > pl.col("z_bp_saved_pct")) &
+            (pl.col("z_rpw_pct") > 0.5)
+        ).then(pl.lit("RETURNER"))
+        .when(
+            (pl.col("z_bp_saved_pct") > pl.col("z_ace_pct")) & 
+            (pl.col("z_bp_saved_pct") > pl.col("z_rpw_pct")) &
+            (pl.col("z_bp_saved_pct") > 0.5)
+        ).then(pl.lit("CLUTCH"))
+        .when(pl.col("z_ace_pct") < -0.5)
+        .then(pl.lit("GRINDER"))
+        .otherwise(pl.lit("ALL_COURT"))  # Vrais ALL_COURT (données mais pas de dominance)
+        .alias("player_style_temporal")
+    ])
+    
+    # Stats distribution
+    style_dist = pm.filter(
+        pl.col("player_style_temporal").is_not_null()
+    ).group_by("player_style_temporal").len().sort("len", descending=True)
+    
+    print(f"\n  Style distribution (FIXED):")
+    total = pm.filter(pl.col("player_style_temporal").is_not_null()).height
+    for row in style_dist.iter_rows():
+        pct = 100.0 * row[1] / total if total > 0 else 0
+        bar = "█" * int(pct / 3)
+        print(f"    {row[0]:15s}: {row[1]:8,} ({pct:5.1f}%) {bar}")
+    
+    # ─────────────────────────────────────────────
+    # 7. Save MATCH-LEVEL output
+    # ─────────────────────────────────────────────
+    print("\n[7.4.7] Saving match-level style...")
+    
+    style_match = pm.select([
+        "custom_match_id",
+        "player_id",
+        "player_style_temporal",
+        "style_ace_pct_score",
+        "style_first_won_pct_score",
+        "style_bp_saved_pct_score",
+        "style_rpw_pct_score",
+    ])
+    
+    # ✅ DÉDUPLIQUER avant save
+    save_match_level_safe(style_match, OUTPUT_DIR / "player_style_match_level.parquet")
+    
+    # Coverage stats
+    coverage = style_match["player_style_temporal"].is_not_null().mean()
+    print(f"  Style coverage: {coverage:.1%}")
+    
+    del pm
+    gc.collect()
+    log_memory("End style temporal")
+    
+    return style_match
+
+# ===============================================
+# SECTION 7.5: STYLE MATCHUP ADVANTAGE
+# ===============================================
+
+def calculate_style_matchup_matrix() -> dict:
+    # ✅ Uniquement les labels produits par la classification
+    MATCHUP_MATRIX = {
+        # GRASS
+        ("SERVE_DOMINANT", "GRINDER", "Grass"): 0.12,
+        ("SERVE_DOMINANT", "RETURNER", "Grass"): 0.05,
+        ("SERVE_DOMINANT", "CLUTCH", "Grass"): 0.03,
+        ("SERVE_DOMINANT", "ALL_COURT", "Grass"): 0.06,
+        
+        # CLAY
+        ("GRINDER", "SERVE_DOMINANT", "Clay"): 0.10,
+        ("RETURNER", "SERVE_DOMINANT", "Clay"): 0.06,
+        ("CLUTCH", "SERVE_DOMINANT", "Clay"): 0.04,
+        
+        # HARD
+        ("SERVE_DOMINANT", "GRINDER", "Hard"): 0.05,
+        ("CLUTCH", "GRINDER", "Hard"): 0.03,
+        ("RETURNER", "GRINDER", "Hard"): 0.04,
+        
+        # CARPET
+        ("SERVE_DOMINANT", "GRINDER", "Carpet"): 0.10,
+    }
+    
+    # Symétrique + same-style = 0
+    symmetric_matrix = {}
+    for (a, b, surf), adv in MATCHUP_MATRIX.items():
+        symmetric_matrix[(a, b, surf)] = adv
+        symmetric_matrix[(b, a, surf)] = -adv
+    
+    # ✅ Labels RÉELS uniquement
+    ALL_STYLES = ["SERVE_DOMINANT", "RETURNER", "CLUTCH", "GRINDER", "ALL_COURT"]
+    for style in ALL_STYLES:
+        for surf in ["Hard", "Clay", "Grass", "Carpet"]:
+            symmetric_matrix[(style, style, surf)] = 0.0
+    
+    # Save as JSON
+    matrix_path = OUTPUT_DIR / "style_matchup_matrix.json"
+    json_matrix = {f"{k[0]}_{k[1]}_{k[2]}": v for k, v in symmetric_matrix.items()}
+    matrix_path.write_text(json.dumps(json_matrix, indent=2))
+    
+    print(f"  ✅ Saved matchup matrix with {len(symmetric_matrix)} entries")
+    print(f"\n  Sample matchups:")
+    print(f"    SERVE_DOMINANT vs GRINDER on Grass: +{MATCHUP_MATRIX.get(('SERVE_DOMINANT', 'GRINDER', 'Grass'), 0):.2f}")
+    print(f"    GRINDER vs SERVE_DOMINANT on Clay: +{symmetric_matrix.get(('GRINDER', 'SERVE_DOMINANT', 'Clay'), 0):.2f}")
+    
+    return symmetric_matrix
+
+
+# ===============================================
+# SECTION 7.6: MERGE PHASE 2 FEATURES TO ML_READY
+# ===============================================
+
+def merge_phase2_features():
+    """
+    Merge Phase 2 avec les BONNES colonnes du style temporal.
+    """
+    
+    print("\n" + "=" * 70)
+    print("   SECTION 7.6: MERGE PHASE 2 FEATURES")
+    print("=" * 70)
+    log_memory("Start Phase 2 merge")
+    
+    # Load ML_READY_SOTA
+    sota_path = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA.parquet"
+    
+    if sota_path.exists():
+        df = pl.read_parquet(sota_path)
+    else:
+        df = pl.read_parquet(ML_READY_FILE)
+    
+    original_cols = len(df.columns)
+    print(f"  Loaded {len(df):,} rows, {original_cols} columns")
+    
+    # Add year if missing
+    if "year" not in df.columns:
+        if df["tourney_date_ta"].dtype in [pl.Int64, pl.Int32]:
+            df = df.with_columns([
+                (pl.col("tourney_date_ta") // 10000).cast(pl.Int16).alias("year")
+            ])
+    
+    # ─────────────────────────────────────────────
+    # 7.6.1 Merge Straight Sets (MATCH-LEVEL)
+    # ─────────────────────────────────────────────
+    print("\n[7.6.1] Merging straight sets (match-level)...")
+    
+    straight_path = OUTPUT_DIR / "straight_sets_match_level.parquet"
+    if straight_path.exists():
+        straight = pl.read_parquet(straight_path)
+        
+        for suffix, id_col in [("_A", "winner_id"), ("_B", "loser_id")]:
+            df = df.join(
+                straight.select([
+                    pl.col("custom_match_id"),
+                    pl.col("player_id").alias(id_col),
+                    pl.col("r20_straight_sets_win_rate").alias(f"r20_straight_sets_win_rate{suffix}"),
+                    pl.col("r20_straight_sets_loss_rate").alias(f"r20_straight_sets_loss_rate{suffix}"),
+                ]),
+                on=["custom_match_id", id_col],
+                how="left"
+            )
+        print("  ✅ Straight sets merged")
+        del straight
+    
+    # ─────────────────────────────────────────────
+    # 7.6.2 Merge Retirement (MATCH-LEVEL)
+    # ─────────────────────────────────────────────
+    print("\n[7.6.2] Merging retirement (match-level)...")
+    
+    ret_path = OUTPUT_DIR / "retirement_match_level.parquet"
+    if ret_path.exists():
+        ret = pl.read_parquet(ret_path)
+        
+        for suffix, id_col in [("_A", "winner_id"), ("_B", "loser_id")]:
+            df = df.join(
+                ret.select([
+                    pl.col("custom_match_id"),
+                    pl.col("player_id").alias(id_col),
+                    pl.col("r20_retirement_given_rate").alias(f"r20_retirement_given_rate{suffix}"),
+                    pl.col("r20_retirement_received_rate").alias(f"r20_retirement_received_rate{suffix}"),
+                ]),
+                on=["custom_match_id", id_col],
+                how="left"
+            )
+        print("  ✅ Retirement merged")
+        del ret
+    
+    # ─────────────────────────────────────────────
+    # 7.6.3 Merge Venue History (MATCH-LEVEL via pm_detail)
+    # ─────────────────────────────────────────────
+    print("\n[7.6.3] Merging venue history (match-level)...")
+    
+    venue_detail_path = OUTPUT_DIR / "player_venue_detailed.parquet"
+    if venue_detail_path.exists():
+        venue = pl.read_parquet(venue_detail_path)
+        
+        for suffix, id_col in [("_A", "winner_id"), ("_B", "loser_id")]:
+            df = df.join(
+                venue.select([
+                    pl.col("custom_match_id"),
+                    pl.col("player_id").alias(id_col),
+                    pl.col("venue_wins_prior").alias(f"venue_wins_prior{suffix}"),
+                    pl.col("venue_matches_prior").alias(f"venue_matches_prior{suffix}"),
+                    pl.col("venue_win_rate").alias(f"venue_win_rate{suffix}"),
+                    pl.col("is_defending_champion").alias(f"is_defending_champion{suffix}"),
+                ]),
+                on=["custom_match_id", id_col],
+                how="left"
+            )
+        print("  ✅ Venue history merged")
+        del venue
+    
+    # ─────────────────────────────────────────────
+    # 7.6.4 Merge Player Style (TEMPORAL) - CORRIGÉ
+    # ─────────────────────────────────────────────
+    print("\n[7.6.4] Merging player style (TEMPORAL)...")
+    
+    style_path = OUTPUT_DIR / "player_style_match_level.parquet"
+    if style_path.exists():
+        style = pl.read_parquet(style_path)
+        
+        # Vérifier les colonnes disponibles
+        print(f"  Style columns: {style.columns}")
+        
+        # ✅ COLONNES CORRIGÉES (celles qui existent vraiment)
+        style_cols_to_merge = [
+            "custom_match_id",
+            "player_id",
+            "player_style_temporal",      # ✅ Existe
+            "style_ace_pct_score",        # ✅ Existe  
+            "style_first_won_pct_score",  # ✅ Existe
+            "style_bp_saved_pct_score",   # ✅ Existe
+            "style_rpw_pct_score",        # ✅ Existe
+        ]
+        
+        # Filtrer les colonnes qui existent vraiment
+        available_style_cols = [c for c in style_cols_to_merge if c in style.columns]
+        
+        # Merge pour A (winner)
+        style_A = style.select([
+            pl.col("custom_match_id"),
+            pl.col("player_id").alias("winner_id"),
+        ] + [
+            pl.col(c).alias(f"{c}_A" if c not in ["custom_match_id", "player_id"] else c)
+            for c in available_style_cols if c not in ["custom_match_id", "player_id"]
+        ])
+        
+        # Renommer correctement
+        style_A = style.select([
+            pl.col("custom_match_id"),
+            pl.col("player_id").alias("winner_id"),
+            pl.col("player_style_temporal").alias("player_style_A"),
+            pl.col("style_ace_pct_score").alias("style_serve_power_A"),
+            pl.col("style_rpw_pct_score").alias("style_return_A"),
+            pl.col("style_bp_saved_pct_score").alias("style_clutch_A"),
+            pl.col("style_first_won_pct_score").alias("style_efficiency_A"),
+        ])
+        
+        df = df.join(style_A, on=["custom_match_id", "winner_id"], how="left")
+        
+        # Merge pour B (loser)
+        style_B = style.select([
+            pl.col("custom_match_id"),
+            pl.col("player_id").alias("loser_id"),
+            pl.col("player_style_temporal").alias("player_style_B"),
+            pl.col("style_ace_pct_score").alias("style_serve_power_B"),
+            pl.col("style_rpw_pct_score").alias("style_return_B"),
+            pl.col("style_bp_saved_pct_score").alias("style_clutch_B"),
+            pl.col("style_first_won_pct_score").alias("style_efficiency_B"),
+        ])
+        
+        df = df.join(style_B, on=["custom_match_id", "loser_id"], how="left")
+        
+        print("  ✅ Player style TEMPORAL merged (no leakage)")
+        del style, style_A, style_B
+        
+        # ─────────────────────────────────────────────
+        # 7.6.5 Calculate Style Differences
+        # ─────────────────────────────────────────────
+        print("\n[7.6.5] Calculating style differences...")
+        
+        df = df.with_columns([
+            # Serve power (ace%) - médiane ~7%
+            (pl.col("style_serve_power_A").fill_null(7.0) - 
+             pl.col("style_serve_power_B").fill_null(7.0))
+            .cast(pl.Float32)
+            .alias("diff_style_serve"),
+            
+            # Return (RPW%) - médiane ~38%
+            (pl.col("style_return_A").fill_null(38.0) - 
+             pl.col("style_return_B").fill_null(38.0))
+            .cast(pl.Float32)
+            .alias("diff_style_return"),
+            
+            # Clutch (BP saved%) - médiane ~65%
+            (pl.col("style_clutch_A").fill_null(65.0) - 
+             pl.col("style_clutch_B").fill_null(65.0))
+            .cast(pl.Float32)
+            .alias("diff_style_clutch"),
+            
+            # Efficiency (1st won%) - médiane ~72%
+            (pl.col("style_efficiency_A").fill_null(72.0) - 
+             pl.col("style_efficiency_B").fill_null(72.0))
+            .cast(pl.Float32)
+            .alias("diff_style_efficiency"),
+        ])
+        
+        # Surface-weighted matchup advantage
+        if "tourney_surface_ta" in df.columns:
+            df = df.with_columns([
+                pl.when(pl.col("tourney_surface_ta") == "Grass")
+                .then(0.15 * pl.col("diff_style_serve") - 0.05 * pl.col("diff_style_return"))
+                .when(pl.col("tourney_surface_ta") == "Clay")
+                .then(-0.05 * pl.col("diff_style_serve") + 0.12 * pl.col("diff_style_return"))
+                .when(pl.col("tourney_surface_ta") == "Hard")
+                .then(0.05 * pl.col("diff_style_serve") + 0.05 * pl.col("diff_style_clutch"))
+                .otherwise(0.0)
+                .cast(pl.Float32)
+                .alias("style_matchup_advantage_A")
+            ])
+        
+        print("  ✅ Style differences calculated")
+    
+    else:
+        print("  ⚠️ No style file found, skipping")
+    
+    gc.collect()
+
+    # ─────────────────────────────────────────────
+    # 7.6.6 Merge Serve/Return Priors
+    # ─────────────────────────────────────────────
+    print("\n[7.6.7] Merging serve/return priors...")
+    
+    priors_path = OUTPUT_DIR / "srvret_priors_match_level.parquet"
+    if priors_path.exists():
+        priors = pl.read_parquet(priors_path)
+        
+        for suffix, id_col in [("_A", "winner_id"), ("_B", "loser_id")]:
+            df = df.join(
+                priors.select([
+                    pl.col("custom_match_id"),
+                    pl.col("player_id").alias(id_col),
+                    pl.col("p_srv_pt_prior").alias(f"p_srv_pt_prior{suffix}"),
+                    pl.col("rpw_prior").alias(f"rpw_prior{suffix}"),
+                ]),
+                on=["custom_match_id", id_col],
+                how="left"
+            )
+        print("  ✅ Serve/return priors merged")
+        del priors
+        
+    # ─────────────────────────────────────────────
+    # 7.6.7 Save final file
+    # ─────────────────────────────────────────────
+    print("\n[7.6.6] Saving matches_ml_ready_SOTA_v2.parquet...")
+    
+    output_path = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v2.parquet"
+    df.write_parquet(output_path)
+    
+    new_cols = len(df.columns) - original_cols
+    print(f"\n  ✅ Saved to {output_path}")
+    print(f"  Final: {len(df):,} rows × {len(df.columns)} columns (+{new_cols} new Phase 2)")
+    
+    # Summary
+    phase2_features = [
+        "r20_straight_sets_win_rate_A", "r20_straight_sets_win_rate_B",
+        "r20_retirement_given_rate_A", "r20_retirement_given_rate_B",
+        "venue_wins_prior_A", "venue_wins_prior_B",
+        "venue_win_rate_A", "venue_win_rate_B",
+        "is_defending_champion_A", "is_defending_champion_B",
+        "player_style_A", "player_style_B",
+        "style_serve_power_A", "style_serve_power_B",
+        "style_return_A", "style_return_B",
+        "style_clutch_A", "style_clutch_B",
+        "diff_style_serve", "diff_style_return", "diff_style_clutch",
+        "style_matchup_advantage_A",
+    ]
+    
+    print("\n  📊 Phase 2 Features Summary:")
+    for f in phase2_features:
+        if f in df.columns:
+            cov = df[f].is_not_null().mean()
+            print(f"    ✅ {f}: {cov:.1%} coverage")
+        else:
+            print(f"    ❌ {f}: NOT FOUND")
+    
+    log_memory("End Phase 2 merge")
+
+    return df
+# ===============================================
+# SECTION 7.7: SERVE/RETURN PRIORS (ANTI-LEAK pour PP08)
+# ===============================================
+
+# ===============================================
+# SECTION 7.7: SERVE/RETURN PRIORS (GOD NASA SOTA)
+# ===============================================
+
+def calculate_srvret_priors() -> pl.DataFrame:
+    """
+    Calcule les priors serve/return pour SRGS/Markov dans PP08.
+    
+    ✅ GOD NASA SOTA:
+    - Rolling + shift(1) = ANTI-LEAK
+    - s2w_prior (2nd serve won%) au lieu du 0.52 fixe
+    - Force matches_base (pas de fallback ML_READY)
+    """
+    print("\n" + "=" * 70)
+    print("   SECTION 7.7: SERVE/RETURN PRIORS (GOD NASA SOTA)")
+    print("=" * 70)
+    
+    # ✅ FORCE matches_base (pas de fallback dangereux)
+    matches_base_path = find_matches_base()
+    if matches_base_path is None:
+        print("  ❌ CRITICAL: matches_base not found!")
+        print("  ⚠️ Cannot compute priors without raw serve stats")
+        return None
+    
+    print(f"  📁 Using: {matches_base_path}")
+    
+    # Colonnes nécessaires (GOD version avec 2ndWon)
+    cols = [
+        "custom_match_id", "tourney_slug_ta", "tourney_date_ta", "round_ta",
+        "winner_id", "loser_id",
+        # 1st serve
+        "w_svpt", "w_1stIn", "w_1stWon",
+        "l_svpt", "l_1stIn", "l_1stWon",
+        # ✅ GOD: 2nd serve
+        "w_2ndWon", "l_2ndWon",
+        # RPW
+        "w_rpw_p", "l_rpw_p",
+    ]
+    
+    schema = pl.read_parquet_schema(matches_base_path)
+    available = [c for c in cols if c in schema]
+    missing = [c for c in cols if c not in schema]
+    
+    print(f"  Available: {len(available)}/{len(cols)} columns")
+    if missing:
+        print(f"  ⚠️ Missing: {missing}")
+    
+    # Vérifier colonnes critiques
+    critical = ["w_svpt", "w_1stIn", "w_1stWon"]
+    missing_critical = [c for c in critical if c not in schema]
+    if missing_critical:
+        print(f"  ❌ CRITICAL MISSING: {missing_critical}")
+        print("  Cannot compute priors!")
+        return None
+    
+    df = pl.read_parquet(matches_base_path, columns=available)
+    df = ensure_custom_match_id(df)
+    df = add_round_order(df)
+    
+    print(f"  Loaded {len(df):,} matches")
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Calculer les % match-level
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    def safe_pct(num, den):
+        return pl.when((pl.col(den) > 0) & pl.col(num).is_not_null())\
+                 .then(pl.col(num) / pl.col(den)).otherwise(None).cast(pl.Float32)
+    
+    # 1st serve in %
+    df = df.with_columns([
+        safe_pct("w_1stIn", "w_svpt").alias("w_s1i"),
+        safe_pct("l_1stIn", "l_svpt").alias("l_s1i"),
+    ])
+    
+    # 1st serve won %
+    df = df.with_columns([
+        safe_pct("w_1stWon", "w_1stIn").alias("w_s1w"),
+        safe_pct("l_1stWon", "l_1stIn").alias("l_s1w"),
+    ])
+    
+    # ✅ GOD: 2nd serve won % (au lieu du 0.52 fixe)
+    has_2nd = "w_2ndWon" in df.columns
+    if has_2nd:
+        # 2nd serve attempts = svpt - 1stIn
+        df = df.with_columns([
+            (pl.col("w_svpt") - pl.col("w_1stIn")).clip(1, None).alias("w_2ndAtt"),
+            (pl.col("l_svpt") - pl.col("l_1stIn")).clip(1, None).alias("l_2ndAtt"),
+        ])
+        
+        df = df.with_columns([
+            safe_pct("w_2ndWon", "w_2ndAtt").alias("w_s2w"),
+            safe_pct("l_2ndWon", "l_2ndAtt").alias("l_s2w"),
+        ])
+        
+        s2w_coverage = df["w_s2w"].is_not_null().mean()
+        print(f"  ✅ GOD: 2nd serve won% available (coverage: {s2w_coverage:.1%})")
+    else:
+        print(f"  ⚠️ w_2ndWon not available, using 0.52 default")
+        df = df.with_columns([
+            pl.lit(0.52).cast(pl.Float32).alias("w_s2w"),
+            pl.lit(0.52).cast(pl.Float32).alias("l_s2w"),
+        ])
+    
+    # RPW si disponible
+    if "w_rpw_p" in df.columns:
+        df = df.with_columns([
+            pct_auto(pl.col("w_rpw_p"), default=0.36).alias("w_rpw"),
+            pct_auto(pl.col("l_rpw_p"), default=0.36).alias("l_rpw"),
+        ])
+    else:
+        df = df.with_columns([
+            pl.lit(0.36).cast(pl.Float32).alias("w_rpw"),
+            pl.lit(0.36).cast(pl.Float32).alias("l_rpw"),
+        ])
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Player-match view
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    winner = df.select([
+        "custom_match_id", "tourney_date_ta", "round_order",
+        pl.col("winner_id").alias("player_id"),
+        pl.col("w_s1i").alias("s1i"),
+        pl.col("w_s1w").alias("s1w"),
+        pl.col("w_s2w").alias("s2w"),
+        pl.col("w_rpw").alias("rpw"),
+    ])
+    
+    loser = df.select([
+        "custom_match_id", "tourney_date_ta", "round_order",
+        pl.col("loser_id").alias("player_id"),
+        pl.col("l_s1i").alias("s1i"),
+        pl.col("l_s1w").alias("s1w"),
+        pl.col("l_s2w").alias("s2w"),
+        pl.col("l_rpw").alias("rpw"),
+    ])
+    
+    pm = pl.concat([winner, loser]).filter(pl.col("player_id").is_not_null())
+    
+    # ✅ FIX: Tri complet avec round_order
+    pm = pm.sort(["player_id", "tourney_date_ta", "round_order", "custom_match_id"])
+    
+    del winner, loser, df
+    gc.collect()
+    
+    print(f"  Player-match rows: {len(pm):,}")
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # ROLLING avec SHIFT(1) - ANTI-LEAK
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    PRIOR_WINDOW = 100
+    PRIOR_MIN = 8
+    
+    # Defaults réalistes
+    DEFAULT_S1I = 0.62  # 62% first serve in
+    DEFAULT_S1W = 0.73  # 73% first serve won
+    DEFAULT_S2W = 0.52  # 52% second serve won
+    DEFAULT_RPW = 0.36  # 36% return points won
+    
+    pm = pm.with_columns([
+        pl.col("s1i").shift(1).rolling_mean(PRIOR_WINDOW, min_samples=PRIOR_MIN)
+          .over("player_id").fill_null(DEFAULT_S1I).cast(pl.Float32).alias("s1i_prior"),
+        
+        pl.col("s1w").shift(1).rolling_mean(PRIOR_WINDOW, min_samples=PRIOR_MIN)
+          .over("player_id").fill_null(DEFAULT_S1W).cast(pl.Float32).alias("s1w_prior"),
+        
+        # ✅ GOD: s2w_prior
+        pl.col("s2w").shift(1).rolling_mean(PRIOR_WINDOW, min_samples=PRIOR_MIN)
+          .over("player_id").fill_null(DEFAULT_S2W).cast(pl.Float32).alias("s2w_prior"),
+        
+        pl.col("rpw").shift(1).rolling_mean(PRIOR_WINDOW, min_samples=PRIOR_MIN)
+          .over("player_id").fill_null(DEFAULT_RPW).cast(pl.Float32).alias("rpw_prior"),
+    ])
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # p_srv_pt_prior (GOD: utilise s2w_prior au lieu de 0.52 fixe)
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    # P(win serve point) = P(1st in) * P(win|1st) + P(2nd) * P(win|2nd)
+    pm = pm.with_columns([
+        (
+            pl.col("s1i_prior") * pl.col("s1w_prior") + 
+            (1 - pl.col("s1i_prior")) * pl.col("s2w_prior")  # ✅ GOD: s2w_prior
+        )
+        .clip(0.50, 0.75)
+        .cast(pl.Float32)
+        .alias("p_srv_pt_prior")
+    ])
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # Save
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    out = pm.select([
+        "custom_match_id", "player_id",
+        "p_srv_pt_prior", "rpw_prior",
+        "s1i_prior", "s1w_prior", "s2w_prior"  # ✅ GOD: inclure s2w_prior
+    ])
+    
+    save_match_level_safe(out, OUTPUT_DIR / "srvret_priors_match_level.parquet")
+    print(f"  ✅ Saved {len(out):,} player-match entries")
+    
+    # Stats
+    print(f"\n  📊 PRIORS STATS (GOD NASA SOTA):")
+    for col in ["p_srv_pt_prior", "rpw_prior", "s1i_prior", "s1w_prior", "s2w_prior"]:
+        if col in out.columns:
+            coverage = out[col].is_not_null().mean()
+            mean_val = out[col].mean()
+            print(f"     {col}: coverage={coverage:.1%}, mean={mean_val:.3f}")
+    
+    return out
+# ===============================================
+# MAIN PHASE 2
+# ===============================================
+
+def run_phase2_features():
+    """Execute all Phase 2 feature calculations."""
+    
+    print("\n" + "=" * 70)
+    print("   PHASE 2 ULTIMATE FEATURES - GOD MODE SOTA 2026")
+    print("=" * 70)
+    
+    t0 = time.perf_counter()
+    
+    # 7.1 Straight Sets
+    straight_features = calculate_straight_sets_features()
+    gc.collect()
+    
+    # 7.2 Retirement
+    retirement_features = calculate_retirement_features()
+    gc.collect()
+    
+    # 7.3 Venue History
+    venue_features = calculate_venue_history()
+    gc.collect()
+    
+    # 7.4 Player Style Classification
+    player_style = calculate_player_style_temporal()
+    gc.collect()
+    
+    # 7.5 Style Matchup Matrix
+    matchup_matrix = calculate_style_matchup_matrix()
+
+    # 7.6 Serve/Return Priors (pour PP08)
+    srvret_priors = calculate_srvret_priors()
+    gc.collect()   
+    
+    # 7.7 Merge all to ML_READY
+    df_final = merge_phase2_features() 
+    
+    elapsed = time.perf_counter() - t0
+    
+    print("\n" + "=" * 70)
+    print(f"   ✅ PHASE 2 COMPLETE! Time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print("=" * 70)
+    
+    return df_final
+    
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    """Pipeline SOTA complet avec vraies features."""
+    
+    print("\n" + "=" * 70)
+    print("   PREPROCESS 5 - TRUE SOTA FEATURES")
+    print("   FULL QUALITY + MEMORY OPTIMIZED + PHASE 2 ULTIMATE")
+    print("=" * 70)
+    print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+    log_memory("Start")
+    
+    t0 = time.perf_counter()
+    
+    # ═══════════════════════════════════════════
+    # PHASE 1: Original SOTA features
+    # ═══════════════════════════════════════════
+    print("\n" + "=" * 70)
+    print("   PHASE 1: ORIGINAL SOTA FEATURES")
+    print("=" * 70)
+    
+    # 1. Load data and calculate Speed Index
+    df, has_raw_ace = load_data_for_speed_index()
+    df, speed_output = calculate_true_speed_index(df, has_raw_ace)
+    del df, speed_output
+    gc.collect()
+    
+    # 2. SSI Preference
+    df_ssi = load_data_for_ssi()
+    player_ssi = calculate_ssi_preference(df_ssi)
+    del df_ssi
+
+    gc.collect()
+    
+    # 3. Rolling vs Top
+    player_rolling = calculate_rolling_vs_top()
+    gc.collect()
+    
+    # 4. Choke Factor
+    player_mental = calculate_choke_factor()
+    gc.collect()
+    
+    # 5. Merge Phase 1
+    df_phase1 = merge_all_to_ml_ready()
+    del df_phase1
+    gc.collect()
+    
+    # ═══════════════════════════════════════════
+    # PHASE 2: Ultimate features (NEW!)
+    # ═══════════════════════════════════════════
+    df_final = run_phase2_features()
+    
+    elapsed = time.perf_counter() - t0
+    
+    print("\n" + "=" * 70)
+    print(f"   ✅ COMPLETE! Time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print("=" * 70)
+    
+    print("\n📊 OUTPUT FILES:")
+    print(f"   {SPEED_INDEX_DIR}/tourney_speed_index.parquet")
+    print(f"   {OUTPUT_DIR}/ssi_match_level.parquet")
+    print(f"   {OUTPUT_DIR}/rolling_vs_top_match_level.parquet")
+    print(f"   {OUTPUT_DIR}/mental_match_level.parquet")
+    print(f"   {OUTPUT_DIR}/straight_sets_match_level.parquet")
+    print(f"   {OUTPUT_DIR}/retirement_match_level.parquet")
+    print(f"   {OUTPUT_DIR}/player_style_match_level.parquet")
+    print(f"   {DATA_CLEAN}/ml_ready/matches_ml_ready_SOTA.parquet (Phase 1)")
+    print(f"   {DATA_CLEAN}/ml_ready/matches_ml_ready_SOTA_v2.parquet (Phase 1+2)")
+    
+    log_memory("End")
+    
+    return df_final
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2138 @@
+# ===============================================
+# TennisTitan 2026 - Preprocess 1 GOD MODE COMPLET (Polars)
+# ===============================================
+# Toutes les cellules: A, B, C, D, E, F, F-bis
+# Performance: 5-50x plus rapide que Pandas
+# ===============================================
+from __future__ import annotations
+
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+import shutil
+import re
+import unicodedata
+import hashlib
+from datetime import datetime
+import warnings
+
+import numpy as np
+import polars as pl
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# ===============================================
+# CONFIGURATION & CONSTANTES
+# ===============================================
+SCHEMA_VERSION = "2.0.0"  # Polars GOD MODE
+DEBUG = False
+
+SURF_MAP = {'hard': 'Hard', 'clay': 'Clay', 'grass': 'Grass', 'carpet': 'Carpet'}
+
+ROUND_ORDER = {
+    'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'QUAL': 3, 'QUALIFYING': 3,
+    'R128': 10, 'R64': 11, 'R32': 12, 'R16': 13,
+    'QF': 14, 'SF': 15, 'F': 16, 'RR': 11, 'BR': 15,
+    '3RD': 15, 'BRONZE': 15
+}
+
+STAT_COLS = [
+    'w_ace','w_df','w_svpt','w_1stIn','w_1stWon','w_2ndWon',
+    'w_bpSaved','w_bpFaced','w_s_1stIn_p','w_s_1stWon_p','w_s_2ndWon_p',
+    'w_tpw_p','w_rpw_p','w_bp_conv_p',
+    'l_ace','l_df','l_svpt','l_1stIn','l_1stWon','l_2ndWon',
+    'l_bpSaved','l_bpFaced','l_s_1stIn_p','l_s_1stWon_p','l_s_2ndWon_p',
+    'l_tpw_p','l_rpw_p','l_bp_conv_p'
+]
+
+TEXT_COLS = [
+    'tourney_name_ta','tourney_slug_ta','tourney_surface_ta','round_ta',
+    'score_ta','match_status','match_id_ta_dedup','match_id_ta_source',
+    'custom_match_id','winner_name','loser_name'
+]
+
+# Stats SOTA pour charting
+KEY_STATS_CHARTING = {
+    'a_pct', 'df_pct', '1stin', '1st_pct', '2nd_pct',
+    'wide_pct', 'body_pct', 't_pct', 
+    'dc_wide_pct', 'dc_t_pct', 'ad_wide_pct', 'ad_t_pct',
+    'avgrally', 'rallylen', 'inplay_pct', 'inplayw_pct',
+    'wnr_pct', 'ufe_pct', 'fcde_pct',
+    'net_pct', 'wnr_at_net',
+    'rpw_pct', 'unret_pct',
+    'bpsaved', 'lte3w_pct'
+}
+
+# Stats FINALES pour le modèle (après feature engineering)
+KEY_STATS_SEQUENTIAL_MODEL = [
+    "a_pct", "df_pct", "1stin", "1st_pct", "2nd_pct",
+    "bpsaved_rate", "bpsaved_opps", "rpw_pct",
+    "ufe_fh_and_bh", "winners_fh_and_bh",
+]
+
+# Mapping features dérivées → stat brute dans le long
+DERIVED_FROM = {
+    "bpsaved_rate": "bpsaved",
+    "bpsaved_opps": "bpsaved",
+}
+
+# Stats à filtrer dans le long (sources)
+KEY_STATS_SEQUENTIAL_SOURCE = sorted({DERIVED_FROM.get(k, k) for k in KEY_STATS_SEQUENTIAL_MODEL})
+
+
+SET_ORDER_MAP = {
+    'set 1': 1, 'set1': 1, '1': 1,
+    'set 2': 2, 'set2': 2, '2': 2,
+    'set 3': 3, 'set3': 3, '3': 3,
+    'set 4': 4, 'set4': 4, '4': 4,
+    'set 5': 5, 'set5': 5, '5': 5,
+    'overall': 0,
+}
+
+# ===============================================
+# ANTI-LEAKAGE GOD MODE (FIX CRITIQUE)
+# ===============================================
+FORBIDDEN_FUTURE_COLS = {
+    "w_rank_gained", "l_rank_gained", 
+    "w_rank_after", "l_rank_after",
+    "w_ranking_points_gained", "l_ranking_points_gained",
+    "w_elo_after", "l_elo_after", 
+    "w_rating_after", "l_rating_after",
+    "post_match_elo", "post_match_rank",
+}
+
+FORBIDDEN_FUTURE_PATTERNS = [
+    r"_after$",   # Tout ce qui finit par _after
+    r"^post_",    # Tout ce qui commence par post_
+    r"_gained$",  # Tout ce qui finit par _gained
+]
+
+MATCH_KEY = "match_key"
+
+def check_forbidden_future_cols(df: pl.DataFrame) -> list[str]:
+    """
+    ✅ GOD MODE ANTI-LEAKAGE: Vérifie qu'aucune colonne future n'est présente.
+    Bloque le pipeline si data leakage détecté.
+    """
+    import re
+    
+    found = []
+    for c in df.columns:
+        c_lower = c.lower()
+        # Check exact match
+        if c_lower in FORBIDDEN_FUTURE_COLS:
+            found.append(c)
+            continue
+        # Check patterns
+        for pattern in FORBIDDEN_FUTURE_PATTERNS:
+            if re.search(pattern, c_lower):
+                found.append(c)
+                break
+    
+    if found:
+        raise ValueError(f"🔴 LEAKAGE DÉTECTÉ: Colonnes futures trouvées: {found}")
+    
+    return found
+    
+# ===============================================
+# IO PATHS
+# ===============================================
+@dataclass
+class IO:
+    root: Path = Path.cwd()
+    
+    @property
+    def raw_matches_dir(self) -> Path:
+        return self.root / 'data_tennis_abstract_production_async' / 'matches_by_year'
+    
+    @property
+    def raw_charting_dir(self) -> Path:
+        return self.root / 'data_tennis_abstract_production_async' / 'charting_data_v4_6_singlepool'
+    
+    @property
+    def players_master_path(self) -> Path:
+        return self.root / "data_atp_detailed" / "atp_master_players.csv"
+    
+    @property
+    def clean_root(self) -> Path:
+        return self.root / 'data_clean'
+    
+    @property
+    def matches_base_dir(self) -> Path:
+        return self.clean_root / 'matches_base'
+    
+    @property
+    def charting_long_dir(self) -> Path:
+        return self.clean_root / 'charting_long'
+    
+    @property
+    def charting_sequential_dir(self) -> Path:
+        return self.clean_root / 'features' / 'charting_sequential'
+    
+    @property
+    def players_ref_dir(self) -> Path:
+        return self.clean_root / 'players_ref'
+    
+    @property
+    def aux_dir(self) -> Path:
+        return self.clean_root / 'aux_data'
+    
+    @property
+    def reports_dir(self) -> Path:
+        return self.clean_root / '_reports'
+    
+    @property
+    def charting_agg_path(self) -> Path:
+        return self.aux_dir / 'charting_agg.parquet'
+    
+    def ensure(self):
+        for d in [self.matches_base_dir, self.charting_long_dir, 
+                  self.players_ref_dir, self.aux_dir, self.reports_dir,
+                  self.charting_sequential_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+        return self
+
+# ===============================================
+# UTILS - VALIDATION MATCH_KEY
+# ===============================================
+def assert_match_key_coverage(df: pl.DataFrame, min_coverage: float = 0.98, context: str = ""):
+    """
+    ✅ GOD SOTA: Vérifie que match_key a une couverture suffisante.
+    Bloque si < min_coverage (par défaut 98%).
+    """
+    if "match_key" not in df.columns:
+        raise ValueError(f"🔴 [{context}] Colonne 'match_key' absente!")
+    
+    n_total = len(df)
+    n_with_key = df.filter(pl.col("match_key").is_not_null()).height
+    coverage = n_with_key / n_total if n_total > 0 else 0
+    
+    print(f"   [{context}] match_key: {n_with_key:,}/{n_total:,} ({100*coverage:.1f}%)")
+    
+    if coverage < min_coverage:
+        raise ValueError(
+            f"🔴 [{context}] match_key coverage {100*coverage:.1f}% < {100*min_coverage:.1f}% requis!"
+        )
+    
+    return coverage
+    
+# ===============================================
+# UTILS NORMALISATION (GOD MODE - normalisé avant hash)
+# ===============================================
+def norm_ascii_lower(s: str) -> str:
+    """Normalisation SOTA: accents → ascii, lowercase, alphanum only"""
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return ""
+    s = str(s).strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.lower()
+    s = re.sub(r'[^a-z0-9]+', ' ', s)
+    return " ".join(s.split())
+
+
+def tmp_id_for_name(name: str) -> str:
+    """
+    ✅ FIX GOD MODE: Normalise AVANT hash
+    "Novak Djokovic" et "NOVAK DJOKOVIC" → même tmp_id
+    """
+    s = norm_ascii_lower(name)  # ← FIX: normalisation avant hash
+    h = hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+    return f"tmp_{h}"
+
+
+# ============================================================
+# GOD SOTA 2026: MAPPING HISTORIQUE DES TOURNOIS
+# ============================================================
+# Certains tournois changent de catégorie selon les années
+
+TOURNAMENT_HISTORY = {
+  # Format: "slug_normalise": [(year_start, year_end, level), ...]
+  # Source: atp_tournaments_referential.xlsx + données historiques ATP
+
+  # ============================================
+  # MASTERS 1000 (M) - Changements historiques
+  # ============================================
+
+  # HAMBOURG: Masters Series → ATP 500 (2009)
+  # Restructuration ATP en 2009
+  "hamburg": [
+      (1990, 2008, "M"),
+      (2009, 2030, "A"),
+  ],
+
+  # STUTTGART (outdoor): Masters Series → ATP 250 (2002)
+  # Le Masters Stuttgart outdoor a disparu, remplacé par ATP 250 indoor
+  "stuttgart outdoor": [
+      (1990, 2001, "M"),
+  ],
+  "stuttgart": [
+      (1990, 2001, "M"),  # Masters outdoor
+      (2002, 2030, "B"),  # ATP 250 indoor
+  ],
+
+  # ESSEN/ANVERS: Masters Series → disparu (1998)
+  "essen": [(1990, 1998, "M")],
+  "antwerp": [(1990, 1998, "M")],  # ATP Masters 1000 Essen était à Anvers aussi
+
+  # MADRID: ATP 500 → Masters 1000 (2009)
+  # Créé en 2002 comme ATP 500, promu Masters en 2009
+  "madrid": [
+      (2002, 2008, "A"),
+      (2009, 2030, "M"),
+  ],
+
+  # SHANGHAI: Masters 1000 depuis 2009 (nouveau tournoi)
+  "shanghai": [(2009, 2030, "M")],
+
+  # ============================================
+  # MASTERS 1000 STABLES (M)
+  # ============================================
+  "montreal": [(1990, 2030, "M")],
+  "toronto": [(1990, 2030, "M")],
+  "rogers cup": [(1990, 2030, "M")],
+  "canadian": [(1990, 2030, "M")],
+  "indian wells": [(1990, 2030, "M")],
+  "miami": [(1990, 2030, "M")],
+  "monte carlo": [(1990, 2030, "M")],
+  "monte-carlo": [(1990, 2030, "M")],
+  "rome": [(1990, 2030, "M")],
+  "cincinnati": [(1990, 2030, "M")],
+  "paris": [(1990, 2030, "M")],  # Bercy
+
+  # ============================================
+  # ATP 500 (A) - Stables
+  # ============================================
+  "acapulco": [(1993, 2030, "A")],
+  "rotterdam": [(1990, 2030, "A")],
+  "dubai": [(1993, 2030, "A")],
+  "barcelona": [(1990, 2030, "A")],
+  "queens": [(1990, 2030, "A")],
+  "queen's": [(1990, 2030, "A")],
+  "london": [(1990, 2030, "A")],  # Queen's Club
+  "halle": [(1993, 2030, "A")],
+  "washington": [(1990, 2030, "A")],
+  "beijing": [(2004, 2030, "A")],
+  "tokyo": [(1990, 2030, "A")],
+  "basel": [(1990, 2030, "A")],
+  "vienna": [(1990, 2030, "A")],
+  "doha": [(1993, 2030, "A")],
+  "dallas": [(1990, 2030, "A")],
+  "rio de janeiro": [(2014, 2030, "A")],
+  "rio": [(2014, 2030, "A")],
+
+  # MEMPHIS: ATP 500 disparu (1990-2013)
+  "memphis": [(1990, 2013, "A")],
+
+  # MUNICH/BMW Open: ATP 500
+  "munich": [(1990, 2030, "A")],
+
+  # ============================================
+  # GRAND SLAMS (G) - Stables
+  # ============================================
+  "australian open": [(1990, 2030, "G")],
+  "roland garros": [(1990, 2030, "G")],
+  "french open": [(1990, 2030, "G")],
+  "wimbledon": [(1990, 2030, "G")],
+  "us open": [(1990, 2030, "G")],
+
+  # Grand Slam Cup (tournoi spécial Munich, disparu en 1999)
+  "grand slam cup": [(1990, 1999, "G")],
+}
+
+
+# Points ATP par niveau (pour weighting dans les features)
+TOURNEY_POINTS_MAP = {
+  'G': 2000,   # Grand Slam
+  'F': 1500,   # Tour Finals
+  'M': 1000,   # Masters 1000
+  'O': 750,    # Olympics
+  'A': 500,    # ATP 500
+  'B': 250,    # ATP 250
+  'DC': 200,   # Davis Cup
+  'AC': 200,   # ATP Cup
+  'LC': 0,     # Laver Cup (exhibition)
+  'C': 125,    # Challenger
+  'I': 50,     # ITF/Futures
+  'X': 100,    # Unknown → fallback
+}
+
+def normalize_tourney_slug(name: str) -> str:
+  """
+  Normalise le nom du tournoi pour lookup historique.
+  Source: atp_tournaments_referential.xlsx
+  """
+  if name is None:
+      return ""
+  name = str(name).lower().strip()
+
+  # Nettoyer les suffixes courants
+  for suffix in [" open", " masters", " championship", " classic",
+                 " international", " indoors", " indoor", " cup",
+                 " tournament", " championships"]:
+      name = name.replace(suffix, "")
+
+  # Mappings spéciaux (noms officiels → slug normalisé)
+  mappings = {
+      # Masters 1000
+      "rogers": "montreal",
+      "canadian": "montreal",
+      "bnp paribas indian": "indian wells",
+      "rolex monte": "monte carlo",
+      "mutua madrid": "madrid",
+      "internazionali": "rome",
+      "foro italico": "rome",
+      "western & southern": "cincinnati",
+      "coupe rogers": "montreal",
+      "rolex paris": "paris",
+      "rolex shanghai": "shanghai",
+
+      # ATP 500
+      "abierto mexicano": "acapulco",
+      "conde de godo": "barcelona",
+      "trofeo conde": "barcelona",
+      "swiss indoors": "basel",
+      "china": "beijing",
+      "dubai duty free": "dubai",
+      "terra wortmann": "halle",
+      "gerry weber": "halle",
+      "german": "hamburg",
+      "cinch": "queens",
+      "queen's": "queens",
+      "regions morgan keegan": "memphis",
+      "bmw": "munich",
+      "rio de janeiro": "rio",
+      "brasil": "rio",
+      "abn amro": "rotterdam",
+      "abn-amro": "rotterdam",
+      "rakuten": "tokyo",
+      "japan": "tokyo",
+      "erste bank": "vienna",
+      "citi": "washington",
+      "legg mason": "washington",
+
+      # ATP 250
+      "tata": "pune",
+      "sud de france": "montpellier",
+      "garanti koza": "sofia",
+      "open 13": "marseille",
+      "open parc": "lyon",
+      "nature valley": "eastbourne",
+      "generali": "kitzbuhel",
+      "hall of fame": "newport",
+      "libema": "s-hertogenbosch",
+
+      # Grand Slams
+      "french": "roland garros",
+  }
+
+  for pattern, slug in mappings.items():
+      if pattern in name:
+          return slug
+
+  # Rogers Cup spécial (dépend de la ville)
+  if "rogers" in name or "canadian" in name:
+      return "montreal" if "montreal" in name else "toronto"
+
+  return name.strip()
+
+def get_tournament_level_historical(tourney_name: str, year: int) -> Optional[str]:
+  """
+  Retourne la catégorie historique correcte pour un tournoi à une année donnée.
+
+  Exemple:
+      get_tournament_level_historical("Hamburg", 2005) → "M" (Masters)
+      get_tournament_level_historical("Hamburg", 2015) → "A" (ATP 500)
+
+  Returns None si pas trouvé dans l'historique (fallback sur regex).
+  """
+  slug = normalize_tourney_slug(tourney_name)
+
+  if slug in TOURNAMENT_HISTORY:
+      for (year_start, year_end, level) in TOURNAMENT_HISTORY[slug]:
+          if year_start <= year <= year_end:
+              return level
+
+  return None  # Pas trouvé → fallback sur classification regex
+
+def normalize_level(name: Optional[str], provided: Optional[str], year: Optional[int] = None) -> str:
+  """
+  Classification GOD SOTA 2026 des niveaux de tournoi.
+
+  ORDRE DE PRIORITÉ:
+  1. Lookup historique (tournois qui changent de catégorie)
+  2. Code fourni si valide
+  3. Fallback regex sur tourney_name
+  """
+
+  # 1. PRIORITÉ 1: Lookup historique (si année disponible)
+  if year and name:
+      historical = get_tournament_level_historical(name, year)
+      if historical:
+          return historical
+
+  # 2. PRIORITÉ 2: Code fourni valide
+  if provided and provided in ['G','F','M','A','B','C','I','DC','O','AC','LC'] and provided != 'X':
+      return provided
+
+  if not name:
+      return provided if provided in ['G','F','M','A','B','C','I','DC','O','AC','LC','X'] else 'X'
+
+  n = str(name).lower().strip()
+  if n.endswith(' ch') or n.endswith(' ch.'):
+        return 'C'
+
+  if re.search(r'^[a-z]+\s+\d+\s+\d+$', n):  # "spain 2 3"
+        return 'I'
+      
+  # Détecte: "france f8", "spain f14", "usa f3", "uzbekistan f2", etc.
+  # Pattern: mot + espace + "f" + chiffres
+  if re.search(r'\bf\d+\b', n):  # "f" suivi de chiffres (f1, f8, f14, f23...)
+        return 'I'   
+      
+  # 3. PRIORITÉ 3: Classification regex (existante mais étendue)
+
+  # Grand Chelems
+  if any(k in n for k in ['grand slam', 'roland garros', 'wimbledon', 'us open',
+                          'australian open', 'us national', 'french open']):
+      return 'G'
+
+  # Tour Finals (inclut Next Gen ATP Finals)
+  if any(k in n for k in ['atp finals', 'masters cup', 'tour finals', 'nitto',
+                          'world tour final', 'next gen', 'nextgen']):
+      return 'F'
+
+  # Masters 1000 (liste étendue)
+  m1000 = ['indian wells', 'miami', 'monte carlo', 'monte-carlo', 'madrid',
+           'rome', 'internazionali', 'foro italico', 'canada', 'rogers cup',
+           'cincinnati', 'western & southern', 'shanghai', 'paris', 'bercy',
+           'masters 1000', '1000', 'coupe rogers']
+  if any(k in n for k in m1000):
+      return 'M'
+
+  # ATP 500 (liste étendue - source: atp_tournaments_referential.xlsx)
+  atp500 = [
+      # Tournois actuels ATP 500
+      'acapulco', 'abierto mexicano',
+      'barcelona', 'conde de godo', 'trofeo conde',
+      'basel', 'swiss indoors',
+      'beijing', 'china open',
+      'dallas', 'atp dallas',
+      'doha', 'qatar exxonmobil', 'qatar open',
+      'dubai', 'dubai duty free',
+      'halle', 'terra wortmann', 'gerry weber',
+      'hamburg', 'german open',
+      "queen's", 'queens', 'london queen', 'cinch championships',
+      'memphis', 'regions morgan keegan',  # disparu 2013
+      'munich', 'bmw open', 'munchen',
+      'rio', 'rio open', 'rio de janeiro', 'brasil open',
+      'rotterdam', 'abn amro', 'abn-amro',
+      'tokyo', 'rakuten', 'japan open',
+      'vienna', 'erste bank', 'wiener',
+      'washington', 'citi open', 'legg mason',
+      'san jose', 'sap open', 'siebel',
+      # Pattern générique
+      '500', 'atp 500',
+  ]
+  if any(k in n for k in atp500):
+      return 'A'
+
+  # Davis Cup / ATP Cup
+  if any(k in n for k in ['davis cup', 'davis', 'coupe davis']):
+      return 'DC'
+  if any(k in n for k in ['atp cup', 'united cup', 'team cup']):
+      return 'AC'
+
+  # Laver Cup
+  if 'laver cup' in n:
+      return 'LC'
+
+  # Olympics
+  if any(k in n for k in ['olympic', 'jeux olymp', 'olympics']):
+      return 'O'
+
+  # ATP 250 (liste étendue - source: atp_tournaments_referential.xlsx)
+  atp250 = [
+      # A - Tournois commençant par A
+      'adelaide', 'almaty', 'antalya', 'athens', 'atlanta', 'auckland', 'amersfoort','amsterdam', 'antwerp', 
+      # B - Tournois commençant par B
+      'bangkok', 'banja luka', 'bastad', 'belgrade', 'bogota', 'brisbane',
+      'brussels', 'bucharest', 'budapest', 'buenos aires',
+      # C - Tournois commençant par C
+      'cagliari', 'chengdu', 'cologne', 'cordoba', 'chennai', 'casablanca', 'costa do sauipe', 'copenhagen',
+      # D - Tournois commençant par D
+      'delray', 'delray beach', 'dusseldorf',
+      # E - Tournois commençant par E
+      'eastbourne', 'estoril', 'nature valley',
+      # F - Tournois commençant par F
+      'florence', 'firenze',
+      # G - Tournois commençant par G
+      'geneva', 'gijon', 'gstaad', 'swiss open', 'great ocean road',
+      # H - Tournois commençant par H
+      'hangzhou', 'hong kong', 'houston', 'us clay',
+      # I - Tournois commençant par I
+      'indianapolis', 'istanbul',
+      # J - Tournois commençant par J
+      'johannesburg',
+      # K - Tournois commençant par K
+      'kitzbuhel', 'generali', 'kuala lumpur',
+      # L - Tournois commençant par L
+      'long island', 'los angeles', 'los cabos', 'lyon', 'open parc', 'las vegas',
+      # M - Tournois commençant par M
+      'mallorca', 'marbella', 'marrakech', 'marseille', 'open 13',
+      'melbourne', 'metz', 'moselle', 'montpellier', 'sud de france', 'moscow', 'mumbai', 'milan', 'murray river',
+      # N - Tournois commençant par N
+      'naples', 'napoli', 'new haven', 'newport', 'hall of fame', 'nice', 'nottingham', 'new york', 'nur sultan',
+      # O - Tournois commençant par O
+      'oeiras',
+      # P - Tournois commençant par P
+      'parma', 'pune', 'tata', 'poertschach', 'palermo',
+      # Q - Tournois commençant par Q
+      'quito',
+      # S - Tournois commençant par S
+      'san diego', 'santiago', 'chile', 'sao paulo', 'sardinia', 'seoul',
+      'shenzhen', 's-hertogenbosch', 'hertogenbosch', 'libema',
+      'singapore', 'sofia', 'garanti koza', 'stockholm', 'if stockholm',
+      'st petersburg', 'st. petersburg', 'stuttgart', 'sydney', 'sopot', 'st poelten', 'st. poelten', 'scottsdale',
+      # T - Tournois commençant par T
+      'tel aviv', 'tashkent',
+      # U - Tournois commençant par U
+      'umag', 'croatia',
+      # V - Tournois commençant par V
+      'valencia', 'vina del mar',
+      # W - Tournois commençant par W
+      'winston', 'winston-salem',
+      # Z - Tournois commençant par Z
+      'zagreb', 'zhuhai',
+      # Patterns génériques
+      '250', 'atp 250', 'atp tour', 'open de',
+      # Noms alternatifs/anciens
+      'bb&t', 'nordea', 'banque', 'european', 'serbia', 'astana',
+      'portoroz', 'antwerp european',  # Antwerp ATP 250 (pas le Masters disparu)
+  ]
+  if any(k in n for k in atp250):
+      return 'B'
+
+  # Challengers (étendu)
+  if any(k in n for k in ['challenger', ' ch ', 'chal', 'atp challenger']):
+      return 'C'
+
+  # ITF/Futures
+  if any(k in n for k in ['futures', 'itf', 'satellite', '$15', '$25', '$50',
+                           '15k', '25k', '50k', '75k', '100k', 'm15', 'm25',
+                           'm75', 'm100', 'itf men']):
+      return 'I'
+
+  # Fallback: Retourner le code fourni ou X
+  return provided if provided else 'X'
+
+
+def map_hand(v: str) -> Optional[str]:
+    if not v or (isinstance(v, float) and np.isnan(v)):
+        return None
+    t = str(v).strip().lower()
+    if t.startswith("right"):
+        return "R"
+    if t.startswith("left"):
+        return "L"
+    return None
+
+
+def map_backhand(v: str) -> Optional[str]:
+    if not v or (isinstance(v, float) and np.isnan(v)):
+        return None
+    t = str(v).strip().lower()
+    if "two" in t or "2" in t:
+        return "2H"
+    if "one" in t or "1" in t:
+        return "1H"
+    return None
+
+
+# ===============================================
+# ÉCRITURE PARQUET PARTITIONNÉ
+# ===============================================
+def write_partitioned_parquet(df: pl.DataFrame, out_dir: Path, partition_cols: list):
+    """Écrit en Parquet partitionné - VERSION POLARS NATIVE (fix bug PyArrow)"""
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ✅ FIX GOD MODE: Utiliser Polars natif au lieu de PyArrow
+    # PyArrow a un bug avec pl.lit() qui crée des listes JSON
+    
+    # Assurer les types corrects + nettoyer artefacts JSON
+    for col in partition_cols:
+        if col in df.columns:
+            if col == "gender":
+                # Forcer en string simple + nettoyer les artefacts [\n"atp"\n]
+                df = df.with_columns([
+                    pl.col(col).cast(pl.Utf8).str.replace_all(r'[\[\]\n\s"]', '').alias(col)
+                ])
+            elif col == "year":
+                df = df.with_columns([
+                    pl.col(col).cast(pl.Int32)
+                ])
+    
+    # Debug
+    for col in partition_cols:
+        if col in df.columns:
+            first_val = df[col][0]
+            print(f"[partition] {col} = {repr(first_val)}")
+    
+    # ✅ Écriture Polars native avec partition_by (PAS PyArrow!)
+    df.write_parquet(
+        out_dir,
+        partition_by=partition_cols,
+        compression="zstd"
+    )
+    print(f"✔ Écrit → {out_dir}")
+
+
+def read_parquet_polars(path: Path) -> pl.DataFrame:
+    """Lecture Parquet avec Polars (gère partitions)"""
+    if not path.exists():
+        return pl.DataFrame()
+    return pl.read_parquet(path)
+
+
+# ===============================================
+# CELLULE A - BUILD MATCHES_BASE (Polars)
+# ===============================================
+def read_all_raw_matches_polars(io: IO, gender: str) -> pl.LazyFrame:
+    """Lecture lazy de tous les CSV avec schéma unifié"""
+    gdir = io.raw_matches_dir / gender
+    if not gdir.exists():
+        print(f"[{gender.upper()}] Dossier RAW introuvable: {gdir}")
+        return pl.LazyFrame()
+    
+    files = sorted(gdir.glob(f'TA_matches_{gender}_*.csv.gz'))
+    if not files:
+        print(f"[{gender.upper()}] Aucun fichier trouvé")
+        return pl.LazyFrame()
+    
+    print(f"[{gender.upper()}] Lecture de {len(files)} fichiers...")
+    
+    # ✅ FIX: Forcer les colonnes problématiques en String
+    schema_overrides = {
+        "winner_id": pl.String,
+        "loser_id": pl.String,
+        "match_id_ta_source": pl.String,
+        "match_id_ta_dedup": pl.String,
+        "custom_match_id": pl.String,
+        "charting_url_ta": pl.String,
+        "player1_name_chart_ta": pl.String,
+        "player2_name_chart_ta": pl.String,
+    }
+    
+    frames = []
+    for fp in files:
+        year = fp.stem.split('_')[-1]
+        lf = pl.scan_csv(
+            fp,
+            infer_schema_length=10000,
+            ignore_errors=True,
+            truncate_ragged_lines=True,
+            schema_overrides=schema_overrides  # ✅ FIX
+        ).with_columns(pl.lit(year).alias("__src_year"))
+        frames.append(lf)
+    
+    # ✅ FIX: Utiliser how="diagonal_relaxed" pour gérer les différences de schéma
+    return pl.concat(frames, how="diagonal_relaxed")
+
+
+def clean_matches_polars(lf: pl.LazyFrame, gender: str) -> pl.DataFrame:
+    """Pipeline de nettoyage vectorisé Polars"""
+    
+    # 1. Parsing dates
+    lf = lf.with_columns([
+        pl.col("tourney_date_ta").cast(pl.String).str.strptime(
+            pl.Date, "%Y%m%d", strict=False
+        ).alias("tourney_date_parsed"),
+    ])
+    
+    # 2. Normalisation surfaces
+    lf = lf.with_columns([
+        pl.col("tourney_surface_ta").cast(pl.String).str.to_lowercase().alias("surface_lower")
+    ]).with_columns([
+        pl.when(pl.col("surface_lower").str.contains("hard")).then(pl.lit("Hard"))
+        .when(pl.col("surface_lower").str.contains("clay")).then(pl.lit("Clay"))
+        .when(pl.col("surface_lower").str.contains("grass")).then(pl.lit("Grass"))
+        .when(pl.col("surface_lower").str.contains("carpet")).then(pl.lit("Carpet"))
+        .otherwise(None)
+        .alias("tourney_surface_ta_clean")
+    ])
+    
+    # 3. Normalisation statuts
+    lf = lf.with_columns([
+        pl.col("match_status").cast(pl.String).str.to_uppercase().str.strip_chars()
+        .alias("match_status_clean")
+    ])
+    
+    # 4. Round order
+    round_map = pl.DataFrame({
+        "round_key": list(ROUND_ORDER.keys()),
+        "round_order": list(ROUND_ORDER.values())
+    }).lazy()
+    
+    lf = lf.with_columns([
+        pl.col("round_ta").cast(pl.String).str.to_uppercase().str.strip_chars()
+        .str.replace_all(r"\s+", "").alias("round_key")
+    ])
+    
+    lf = lf.join(round_map, on="round_key", how="left").with_columns([
+        pl.col("round_order").fill_null(10).cast(pl.Int8)
+    ])
+    
+    # 5. Année (✅ PAS de gender ici)
+    lf = lf.with_columns([
+        pl.col("tourney_date_parsed").dt.year().cast(pl.Int32).alias("year")
+    ])
+    
+    # 6. tourney_date_int et match_sequence_key
+    lf = lf.with_columns([
+        (pl.col("tourney_date_parsed").dt.strftime("%Y%m%d").cast(pl.Int32))
+        .alias("tourney_date_int")
+    ]).with_columns([
+        (pl.col("tourney_date_int") * 100 + pl.col("round_order"))
+        .alias("match_sequence_key")
+    ])
+    
+    # Collect
+    df = lf.collect()
+
+    # ✅ FIX: Ajouter gender APRÈS collect avec pl.repeat (évite bug pl.lit + PyArrow)
+    df = df.with_columns([
+        pl.repeat(gender, n=len(df)).cast(pl.Utf8).alias("gender")
+    ])
+    
+    # ✅ FIX GOD MODE: Vérifier colonnes futures (ANTI-LEAKAGE)
+    check_forbidden_future_cols(df)
+    
+    # 7. Normalisation pourcentages (0-100 → 0-1)
+    pct_cols = [c for c in df.columns if re.search(r"(_p$|_pct$)", c)]
+    for c in pct_cols:
+        if c in df.columns:
+            s = df[c].cast(pl.Float64, strict=False)
+            max_val = s.max()
+            if max_val is not None and max_val > 1.0:
+                df = df.with_columns([
+                    (pl.col(c).cast(pl.Float64, strict=False) / 100.0)
+                    .clip(0.0, 1.0)
+                    .alias(c)
+                ])
+    
+    # 8. IDs joueurs: strip et clean
+    for col in ['winner_id', 'loser_id']:
+        if col in df.columns:
+            df = df.with_columns([
+                pl.col(col).cast(pl.String).str.strip_chars()
+                .str.replace(r"\.0$", "")
+                .alias(col)
+            ])
+            df = df.with_columns([
+                pl.when(pl.col(col).str.to_lowercase().is_in(["", "nan", "none", "<na>"]))
+                .then(None)
+                .otherwise(pl.col(col))
+                .alias(col)
+            ])
+    
+    # 9. Noms joueurs: strip
+    for col in ['winner_name', 'loser_name']:
+        if col in df.columns:
+            df = df.with_columns([
+                pl.col(col).cast(pl.String).str.strip_chars().alias(col)
+            ])
+    
+    # 10. Colonnes manquantes
+    required_cols = [
+        'tourney_date_ta', 'tourney_name_ta', 'tourney_slug_ta', 'tourney_surface_ta',
+        'is_indoor', 'tourney_level_ta', 'round_ta', 'best_of_ta',
+        'winner_id', 'winner_name', 'loser_id', 'loser_name',
+        'score_ta', 'match_status', 'match_id_ta_dedup', 'match_id_ta_source',
+        'custom_match_id', 'is_charted_ta'
+    ]
+    for c in required_cols:
+        if c not in df.columns:
+            df = df.with_columns(pl.lit(None).alias(c))
+    
+    # 11. Renommer colonnes nettoyées
+    if "tourney_surface_ta_clean" in df.columns:
+        df = df.with_columns([pl.col("tourney_surface_ta_clean").alias("tourney_surface_ta")])
+    if "match_status_clean" in df.columns:
+        df = df.with_columns([pl.col("match_status_clean").alias("match_status")])
+    if "tourney_date_parsed" in df.columns:
+        df = df.with_columns([pl.col("tourney_date_parsed").alias("tourney_date_ta")])
+    
+    # 12. Schema version
+    df = df.with_columns([pl.lit(SCHEMA_VERSION).alias("schema_version")])
+
+    # ✅ FIX: Normaliser les IDs "NaN" string en vrai null
+    for c in ["match_id_ta_source", "match_id_ta_dedup", "custom_match_id"]:
+        if c in df.columns:
+            df = df.with_columns([
+                pl.when(
+                    pl.col(c).cast(pl.Utf8).str.to_lowercase().is_in(["nan", "none", "<na>", ""])
+                )
+                .then(None)
+                .otherwise(pl.col(c).cast(pl.Utf8))
+                .alias(c)
+            ])
+        
+    return df
+
+
+def normalize_levels_polars(df: pl.DataFrame) -> pl.DataFrame:
+  """
+  Applique la classification GOD SOTA des niveaux.
+  Utilise l'année pour le lookup historique.
+  """
+  names = df["tourney_name_ta"].to_list()
+  provided = df["tourney_level_ta"].to_list() if "tourney_level_ta" in df.columns else [None] * len(df)
+
+  # Extraire l'année
+  if "year" in df.columns:
+      years = df["year"].to_list()
+  elif "tourney_date_ta" in df.columns:
+      # Extraire depuis la date
+      years = df.select(
+          pl.col("tourney_date_ta").dt.year()
+      ).to_series().to_list()
+  else:
+      years = [None] * len(df)
+
+  # Appliquer avec année
+  levels = [normalize_level(n, p, y) for n, p, y in zip(names, provided, years)]
+
+  # Stats
+  level_counts = {}
+  for l in levels:
+      level_counts[l] = level_counts.get(l, 0) + 1
+
+  unknown_pct = level_counts.get('X', 0) / len(levels) * 100
+  print(f"  ✅ Tourney level classification:")
+  for level, count in sorted(level_counts.items(), key=lambda x: -x[1]):
+      print(f"      {level}: {count:,} ({count/len(levels)*100:.1f}%)")
+  print(f"  {'✅' if unknown_pct < 5 else '⚠️'} Unknown (X): {unknown_pct:.1f}% (target: <5%)")
+  historical_used = sum(1 for n, p, y in zip(names, provided, years)
+                        if y and n and get_tournament_level_historical(n, y))
+  print(f"  ✅ Historical lookup used: {historical_used:,} matches")
+  return df.with_columns([pl.Series("tourney_level_ta", levels)])
+
+
+def reconcile_ids_polars(df: pl.DataFrame, io: IO) -> pl.DataFrame:
+    """Réconcilie les IDs manquants via mapping name→ID"""
+    map_path = io.aux_dir / "name_to_id_unique_atp.parquet"
+    if not map_path.exists():
+        print("[IDs] Pas de mapping ATP trouvé")
+        return df
+    
+    map_df = pl.read_parquet(map_path)
+    
+    winner_names = df["winner_name"].to_list()
+    loser_names = df["loser_name"].to_list()
+    
+    df = df.with_columns([
+        pl.Series("winner_name_norm", [norm_ascii_lower(n) if n else "" for n in winner_names]),
+        pl.Series("loser_name_norm", [norm_ascii_lower(n) if n else "" for n in loser_names])
+    ])
+    
+    # Join pour winners
+    df = df.join(
+        map_df.select(["name_norm", "player_ref_id"]).rename({"player_ref_id": "winner_id_map"}),
+        left_on="winner_name_norm",
+        right_on="name_norm",
+        how="left"
+    )
+    
+    # Join pour losers
+    df = df.join(
+        map_df.select(["name_norm", "player_ref_id"]).rename({"player_ref_id": "loser_id_map"}),
+        left_on="loser_name_norm",
+        right_on="name_norm",
+        how="left"
+    )
+    
+    # Remplir uniquement les NA
+    df = df.with_columns([
+        pl.when(pl.col("winner_id").is_null())
+        .then(pl.col("winner_id_map"))
+        .otherwise(pl.col("winner_id"))
+        .alias("winner_id"),
+        
+        pl.when(pl.col("loser_id").is_null())
+        .then(pl.col("loser_id_map"))
+        .otherwise(pl.col("loser_id"))
+        .alias("loser_id")
+    ])
+    
+    # Cleanup
+    drop_cols = ["winner_name_norm", "loser_name_norm", "winner_id_map", "loser_id_map", "name_norm", "name_norm_right"]
+    df = df.drop([c for c in drop_cols if c in df.columns])
+    
+    return df
+
+
+def fill_tmp_ids_polars(df: pl.DataFrame, io: IO) -> pl.DataFrame:
+    """Génère tmp_id pour les joueurs sans ID (avec normalisation GOD MODE)"""
+    
+    # IDs manquants
+    missing_winner = df.filter(
+        pl.col("winner_id").is_null() & pl.col("winner_name").is_not_null()
+    )["winner_name"].unique().to_list()
+    
+    missing_loser = df.filter(
+        pl.col("loser_id").is_null() & pl.col("loser_name").is_not_null()
+    )["loser_name"].unique().to_list()
+    
+    all_missing = set(missing_winner + missing_loser)
+    
+    if not all_missing:
+        print("[TMP IDs] Aucun ID manquant")
+        return df
+    
+    # Charger mapping existant
+    tmp_map_path = io.aux_dir / "tmp_name_to_id.parquet"
+    if tmp_map_path.exists():
+        tmp_map_df = pl.read_parquet(tmp_map_path)
+        existing = set(tmp_map_df["name_exact"].to_list())
+    else:
+        # ✅ FIX: Créer DataFrame vide avec les bons types (pas Null)
+        tmp_map_df = pl.DataFrame({
+            "name_exact": pl.Series([], dtype=pl.String),
+            "tmp_id": pl.Series([], dtype=pl.String),
+            "name_norm": pl.Series([], dtype=pl.String)
+        })
+        existing = set()
+    
+    # Nouveaux noms
+    new_names = all_missing - existing
+    
+    if new_names:
+        new_rows = [{
+            "name_exact": n,
+            "tmp_id": tmp_id_for_name(n),
+            "name_norm": norm_ascii_lower(n)
+        } for n in new_names]
+        
+        new_df = pl.DataFrame(new_rows)
+        tmp_map_df = pl.concat([tmp_map_df, new_df])
+        tmp_map_df = tmp_map_df.unique(subset=["name_exact"])
+        tmp_map_df.write_parquet(tmp_map_path)
+        print(f"[TMP IDs] {len(new_names)} nouveaux mappings ajoutés")
+    
+    # Appliquer
+    name_to_tmp = dict(zip(tmp_map_df["name_exact"].to_list(), tmp_map_df["tmp_id"].to_list()))
+    
+    winner_names = df["winner_name"].to_list()
+    winner_ids = df["winner_id"].to_list()
+    new_winner_ids = [
+        name_to_tmp.get(str(n).strip(), wid) if wid is None and n else wid
+        for n, wid in zip(winner_names, winner_ids)
+    ]
+    
+    loser_names = df["loser_name"].to_list()
+    loser_ids = df["loser_id"].to_list()
+    new_loser_ids = [
+        name_to_tmp.get(str(n).strip(), lid) if lid is None and n else lid
+        for n, lid in zip(loser_names, loser_ids)
+    ]
+    
+    df = df.with_columns([
+        pl.Series("winner_id", new_winner_ids),
+        pl.Series("loser_id", new_loser_ids)
+    ])
+    
+    # ID kind
+    def get_id_kind(id_val):
+        if id_val is None:
+            return "unknown"
+        id_str = str(id_val)
+        if id_str.startswith("tmp_"):
+            return "tmp"
+        if re.match(r"^[a-z]\d{3,}$", id_str):
+            return "atp"
+        return "master"
+    
+    df = df.with_columns([
+        pl.Series("winner_id_kind", [get_id_kind(x) for x in new_winner_ids]),
+        pl.Series("loser_id_kind", [get_id_kind(x) for x in new_loser_ids])
+    ])
+    
+    n_tmp_w = sum(1 for wid in new_winner_ids if wid and str(wid).startswith("tmp_"))
+    n_tmp_l = sum(1 for lid in new_loser_ids if lid and str(lid).startswith("tmp_"))
+    print(f"[TMP IDs] Applied: winners={n_tmp_w}, losers={n_tmp_l}")
+    
+    return df
+
+
+def upgrade_tmp_to_atp_polars(df: pl.DataFrame, io: IO) -> pl.DataFrame:
+    """Upgrade tmp_id → ATPid quand disponible"""
+    tmp_map_path = io.aux_dir / "tmp_name_to_id.parquet"
+    atp_map_path = io.aux_dir / "name_to_id_unique_atp.parquet"
+    
+    if not tmp_map_path.exists() or not atp_map_path.exists():
+        return df
+    
+    tmp_map_df = pl.read_parquet(tmp_map_path)
+    atp_map_df = pl.read_parquet(atp_map_path)
+    
+    # Normaliser pour join
+    if "name_norm" not in tmp_map_df.columns:
+        tmp_map_df = tmp_map_df.with_columns([
+            pl.col("name_exact").map_elements(norm_ascii_lower, return_dtype=pl.String).alias("name_norm")
+        ])
+    
+    # Join pour trouver les upgrades
+    upg = tmp_map_df.join(
+        atp_map_df.select(["name_norm", "player_ref_id"]),
+        on="name_norm",
+        how="left"
+    )
+    
+    # Candidats: tmp_ qui ont un ATPid
+    need_upg = (
+        upg.filter(
+            pl.col("tmp_id").str.starts_with("tmp_") & 
+            pl.col("player_ref_id").is_not_null()
+        )
+    )
+    
+    if len(need_upg) > 0:
+        # Créer mapping name_exact → new_id
+        name_to_final = dict(zip(
+            need_upg["name_exact"].to_list(),
+            need_upg["player_ref_id"].to_list()
+        ))
+        
+        # Appliquer sur df
+        winner_names = df["winner_name"].to_list()
+        winner_ids = df["winner_id"].to_list()
+        new_winner_ids = [
+            name_to_final.get(str(n).strip(), wid) if wid and str(wid).startswith("tmp_") else wid
+            for n, wid in zip(winner_names, winner_ids)
+        ]
+        
+        loser_names = df["loser_name"].to_list()
+        loser_ids = df["loser_id"].to_list()
+        new_loser_ids = [
+            name_to_final.get(str(n).strip(), lid) if lid and str(lid).startswith("tmp_") else lid
+            for n, lid in zip(loser_names, loser_ids)
+        ]
+        
+        df = df.with_columns([
+            pl.Series("winner_id", new_winner_ids),
+            pl.Series("loser_id", new_loser_ids)
+        ])
+        
+        # Mettre à jour le mapping
+        for name_exact, new_id in name_to_final.items():
+            tmp_map_df = tmp_map_df.with_columns([
+                pl.when(pl.col("name_exact") == name_exact)
+                .then(pl.lit(new_id))
+                .otherwise(pl.col("tmp_id"))
+                .alias("tmp_id")
+            ])
+        
+        tmp_map_df.write_parquet(tmp_map_path)
+        print(f"[TMP→ATPid] {len(need_upg)} upgrades appliqués")
+    else:
+        print("[TMP→ATPid] Aucun upgrade nécessaire")
+    
+    return df
+
+
+def flag_qualifiers_wc_ll_polars(df: pl.DataFrame) -> pl.DataFrame:
+    """Détecte qualifiers, wildcards, lucky losers"""
+    
+    # Clé tournoi
+    if "tourney_slug_ta" in df.columns and "tourney_date_ta" in df.columns:
+        df = df.with_columns([
+            (pl.col("tourney_slug_ta").cast(pl.String).fill_null("") + "_" +
+             pl.col("tourney_date_ta").dt.strftime("%Y%m%d").fill_null(""))
+            .alias("tkey")
+        ])
+    else:
+        df = df.with_columns([pl.lit("").alias("tkey")])
+    
+    # Identifier rounds de qualifs
+    df = df.with_columns([
+        pl.col("round_ta").cast(pl.String).str.to_uppercase().str.replace_all(r"\s+", "")
+        .alias("round_clean")
+    ])
+    
+    df = df.with_columns([
+        pl.col("round_clean").str.contains(r"^(Q|Q[1-9]|QUAL|QUALIFYING)$").alias("is_qual_round")
+    ])
+    
+    # Pour l'instant, on marque juste les colonnes avec des valeurs par défaut
+    # Une implémentation complète nécessiterait des agrégations complexes
+    for col in ['w_is_qualifier', 'l_is_qualifier', 'w_is_wildcard', 'l_is_wildcard',
+                'w_is_lucky_loser', 'l_is_lucky_loser', 'w_qualifier_matches', 'l_qualifier_matches',
+                'w_qualifier_minutes', 'l_qualifier_minutes']:
+        if col not in df.columns:
+            if 'is_' in col:
+                df = df.with_columns([pl.lit(False).alias(col)])
+            else:
+                df = df.with_columns([pl.lit(None).cast(pl.Int32).alias(col)])
+    
+    # Cleanup
+    df = df.drop(["tkey", "round_clean", "is_qual_round"], strict=False)
+    
+    return df
+
+
+def dedup_best_row_polars(df: pl.DataFrame) -> pl.DataFrame:
+    """Déduplication qualité: garde la meilleure ligne par match"""
+    stat_cols_present = [c for c in STAT_COLS if c in df.columns]
+    
+    # Scores de qualité
+    if stat_cols_present:
+        df = df.with_columns([
+            pl.sum_horizontal([pl.col(c).is_not_null().cast(pl.Int32) for c in stat_cols_present])
+            .alias("__stats_count")
+        ])
+    else:
+        df = df.with_columns([pl.lit(0).alias("__stats_count")])
+    
+    df = df.with_columns([
+        pl.col("is_charted_ta").fill_null(False).alias("__has_chart"),
+        (pl.col("match_status") == "COMPLETED").fill_null(False).alias("__is_completed"),
+        pl.col("duration_minutes_ta").is_not_null().alias("__has_duration") if "duration_minutes_ta" in df.columns else pl.lit(False).alias("__has_duration"),
+        (pl.col("winner_id").is_not_null() & pl.col("loser_id").is_not_null()).alias("__ids_ok")
+    ])
+    
+    # Trier
+    df = df.sort([
+        "__has_chart", "__is_completed", "__stats_count", "__has_duration", "__ids_ok"
+    ], descending=[True, True, True, True, True])
+    
+    # Garder première ligne
+    df = df.unique(subset=["gender", "match_id_ta_dedup"], keep="first")
+    
+    # Row quality rank
+    df = df.with_columns([pl.lit(0).alias("row_quality_rank")])
+    
+    # Cleanup
+    df = df.drop(["__stats_count", "__has_chart", "__is_completed", "__has_duration", "__ids_ok"])
+    
+    return df
+
+
+def validate_polars(df: pl.DataFrame) -> pl.DataFrame:
+    """Validations et filtres finaux"""
+    
+    # Exclure winner_id == loser_id
+    bad_mask = (
+        pl.col("winner_id").is_not_null() & 
+        pl.col("loser_id").is_not_null() & 
+        (pl.col("winner_id") == pl.col("loser_id"))
+    )
+    
+    n_bad = df.filter(bad_mask).height
+    if n_bad > 0:
+        print(f"[Validation] ⚠ {n_bad} matchs winner==loser exclus")
+        df = df.filter(~bad_mask)
+    
+    return df
+
+
+def build_matches_base_polars(io: IO, gender: str = "atp") -> pl.DataFrame:
+    """CELLULE A - Pipeline complet Polars GOD MODE"""
+    
+    print("="*60)
+    print(f"CELLULE A - BUILD MATCHES_BASE (Polars) - {gender.upper()}")
+    print("="*60)
+    
+    import time
+    start = time.time()
+    
+    # 1. Lecture lazy
+    print("\n[1/10] Lecture RAW (lazy)...")
+    lf = read_all_raw_matches_polars(io, gender)
+    
+    # 2. Nettoyage
+    print("[2/10] Nettoyage et normalisation...")
+    df = clean_matches_polars(lf, gender)
+    print(f"       Rows: {len(df):,}")
+    
+    # 3. Classification niveaux
+    print("[3/10] Classification niveaux tournois...")
+    df = normalize_levels_polars(df)
+    
+    # 4. Réconciliation IDs
+    print("[4/10] Réconciliation IDs (mapping ATP)...")
+    df = reconcile_ids_polars(df, io)
+    
+    # 5. TMP IDs
+    print("[5/10] Génération TMP IDs (normalisés)...")
+    df = fill_tmp_ids_polars(df, io)
+    
+    # 6. Upgrade TMP → ATP
+    print("[6/10] Upgrade TMP→ATPid...")
+    df = upgrade_tmp_to_atp_polars(df, io)
+    
+    # 7. Qualifiers/WC/LL
+    print("[7/10] Flags qualifiers/WC/LL...")
+    df = flag_qualifiers_wc_ll_polars(df)
+    
+    # 8. Dedup
+    print("[8/10] Déduplication best-row-wins...")
+    df = dedup_best_row_polars(df)
+    print(f"       After dedup: {len(df):,}")
+    
+    # ============================
+    # ✅ 9. CANONICAL JOIN KEY (GOD SOTA) - APRÈS DEDUP!
+    # ============================
+    print("[9/10] Canonical join key...")
+    
+    # ✅ Guard null AVANT d'utiliser comme clé canonique
+    n_null = df.filter(pl.col("match_id_ta_dedup").is_null()).height
+    if n_null > 0:
+        raise ValueError(f"🔴 FATAL: match_id_ta_dedup is NULL for {n_null} rows (cannot be canonical key)")
+    
+    # Garder l'ancien custom_match_id pour debug
+    if "custom_match_id" in df.columns:
+        df = df.with_columns([
+            pl.col("custom_match_id").cast(pl.Utf8).alias("custom_match_id_raw")
+        ])
+    
+    # Clé canonique UNIQUE et stable
+    df = df.with_columns([
+        pl.col("match_id_ta_dedup").cast(pl.Utf8).alias("custom_match_id")
+    ])
+    
+    # ✅ match_key = CLÉ OFFICIELLE pour tous les notebooks
+    df = df.with_columns([
+        pl.col("custom_match_id").alias("match_key")
+    ])
+    
+    # ✅ Assert sur match_key (clé officielle)
+    dup = df.select("match_key").is_duplicated().sum()
+    if dup > 0:
+        raise ValueError(f"🔴 FATAL: match_key has {dup} duplicates after canonical fix")
+    print("       ✅ match_id_ta_dedup: 0 nulls")
+    print("       ✅ match_key = clé officielle (0 doublons)")
+    
+    # 10. Validation finale
+    print("[10/10] Validation finale...")
+    df = validate_polars(df)
+    
+    # ✅ Anti-leakage check À LA FIN
+    check_forbidden_future_cols(df)
+    print("       ✅ Anti-leakage check passed")
+    
+    # Écriture
+    print("\n[WRITE] Écriture Parquet partitionné...")
+    write_partitioned_parquet(df, io.matches_base_dir, ["gender", "year"])
+    
+    elapsed = time.time() - start
+    print(f"\n✅ CELLULE A TERMINÉE en {elapsed:.1f}s")
+    print(f"   Total matchs: {len(df):,}")
+    
+    return df
+
+
+# ===============================================
+# CELLULE B - ENHANCED QUALITY REPORTS (Polars)
+# ===============================================
+def enhanced_quality_report_polars(io: IO) -> Path:
+    """CELLULE B - Rapports qualité enrichis"""
+    
+    print("\n" + "="*60)
+    print("CELLULE B - ENHANCED QUALITY REPORTS (Polars)")
+    print("="*60)
+    
+    df = pl.read_parquet(io.matches_base_dir)
+    if df.is_empty():
+        print("Dataset matches_base vide — skip")
+        return io.reports_dir
+    
+    have = [c for c in STAT_COLS if c in df.columns]
+    
+    # Stats coverage par année
+    stats_coverage = (
+        df.group_by(["gender", "year"])
+        .agg([
+            pl.count().alias("n_matches"),
+            (pl.any_horizontal([pl.col(c).is_not_null() for c in have]).mean() * 100).alias("has_any_stats_%") if have else pl.lit(0.0).alias("has_any_stats_%"),
+            (pl.all_horizontal([pl.col(c).is_not_null() for c in have]).mean() * 100).alias("has_full_stats_%") if have else pl.lit(0.0).alias("has_full_stats_%"),
+            (pl.col("is_charted_ta").mean() * 100).alias("charted_%"),
+            (pl.col("duration_minutes_ta").is_not_null().mean() * 100).alias("has_duration_%")
+        ])
+        .sort(["gender", "year"])
+    )
+    
+    # Distribution rounds
+    rounds_dist = df["round_ta"].value_counts().sort("count", descending=True)
+    
+    # Écriture
+    stats_coverage.write_csv(io.reports_dir / "stats_coverage_by_year.csv")
+    rounds_dist.write_csv(io.reports_dir / "rounds_distribution.csv")
+    
+    print(f"✔ Reports → {io.reports_dir}")
+    
+    return io.reports_dir
+
+
+def assert_uniques_polars(io: IO):
+    """Vérification unicité"""
+    df = pl.read_parquet(io.matches_base_dir)
+    if df.is_empty():
+        print("Dataset vide — skip")
+        return
+    
+    dup_dedup = df.select(["gender", "match_id_ta_dedup"]).is_duplicated().sum()
+    print("✔ Uniques (gender, match_id_ta_dedup)" if dup_dedup == 0 else f"⚠ Doublons: {dup_dedup}")
+
+
+def charting_join_audit_polars(io: IO):
+    """Audit jointure charting"""
+    if not io.matches_base_dir.exists() or not io.charting_long_dir.exists():
+        print("Datasets manquants — skip")
+        return
+    
+    dfm = pl.read_parquet(io.matches_base_dir)
+    dfl = pl.read_parquet(io.charting_long_dir)
+    
+    if dfm.is_empty() or dfl.is_empty():
+        print("Datasets vides — skip")
+        return
+    
+    charted_ids = set(dfl["match_id"].unique().to_list())
+    cm = dfm.filter(pl.col("is_charted_ta") == True)
+    
+    if len(cm) > 0:
+        coverage = cm.filter(pl.col("match_id_ta_source").is_in(charted_ids)).height / len(cm)
+        print(f"✔ Coverage charting: {coverage:.1%}")
+
+
+# ===============================================
+# CELLULE C - PLAYERS_REF (Polars)
+# ===============================================
+def build_players_ref_polars(io: IO) -> Path:
+    """CELLULE C - Construction référentiel joueurs"""
+    
+    print("\n" + "="*60)
+    print("CELLULE C - PLAYERS_REF (Polars)")
+    print("="*60)
+    
+    if not io.players_master_path.exists():
+        print(f"⚠️ Fichier master introuvable: {io.players_master_path}")
+        return io.players_ref_dir
+    
+    # Lecture avec Polars
+    dfm = pl.read_csv(io.players_master_path, infer_schema_length=10000)
+    
+    # Colonnes à garder
+    keep_map = {
+        "generated_id": "player_master_id",
+        "atp_id_ref": "atp_id_ref",
+        "player_name": "player_name",
+        "name_slug": "name_slug",
+        "birth_date": "birth_date",
+        "nationality": "nationality",
+        "height_cm": "height_cm",
+        "weight_kg": "weight_kg",
+        "plays_hand": "plays_hand",
+        "plays_backhand": "plays_backhand",
+        "pro_year": "pro_year",
+        "sgl_high_rank": "sgl_high_rank",
+        "elo_rating": "elo_rating_ta",
+        "elo_rank": "elo_rank_ta",
+        "elo_hard_ta": "elo_hard_ta",
+        "elo_clay_ta": "elo_clay_ta",
+        "elo_grass_ta": "elo_grass_ta",
+        "peak_elo_ta": "peak_elo_ta",
+    }
+    
+    # Sélectionner et renommer
+    cols_present = [c for c in keep_map.keys() if c in dfm.columns]
+    dfp = dfm.select(cols_present).rename({k: v for k, v in keep_map.items() if k in cols_present})
+    
+    # Normalisation
+    if "player_name" in dfp.columns:
+        names = dfp["player_name"].to_list()
+        dfp = dfp.with_columns([
+            pl.Series("name_norm", [norm_ascii_lower(n) if n else "" for n in names])
+        ])
+    
+    # Hand mapping
+    if "plays_hand" in dfp.columns:
+        hands = dfp["plays_hand"].to_list()
+        dfp = dfp.with_columns([
+            pl.Series("plays_hand_std", [map_hand(h) for h in hands])
+        ])
+    
+    # Backhand mapping
+    if "plays_backhand" in dfp.columns:
+        bhs = dfp["plays_backhand"].to_list()
+        dfp = dfp.with_columns([
+            pl.Series("plays_backhand_std", [map_backhand(b) for b in bhs])
+        ])
+    
+    # Gender - ✅ FIX: pl.repeat au lieu de pl.lit (bug PyArrow)
+    dfp = dfp.with_columns([
+        pl.repeat("atp", n=len(dfp)).cast(pl.Utf8).alias("gender")
+    ])
+    
+    # Écriture
+    write_partitioned_parquet(dfp, io.players_ref_dir, ["gender"])
+    print(f"✔ players_ref → {io.players_ref_dir}")
+    
+    # Mapping nom → ID (uniques)
+    if "name_norm" in dfp.columns and "player_master_id" in dfp.columns:
+        map_df = dfp.select(["name_norm", "player_master_id"]).drop_nulls()
+        
+        # Garder uniquement les noms univoques
+        counts = map_df.group_by("name_norm").agg(pl.count().alias("cnt"))
+        unique_names = counts.filter(pl.col("cnt") == 1)["name_norm"].to_list()
+        map_df = map_df.filter(pl.col("name_norm").is_in(unique_names))
+        
+        map_df.write_parquet(io.aux_dir / "name_to_id_unique.parquet")
+        print(f"✔ Mapping nom→ID → {io.aux_dir}")
+    
+    # Mapping nom → ATPid
+    if "name_norm" in dfp.columns and "atp_id_ref" in dfp.columns:
+        map_atp = dfp.select(["name_norm", "atp_id_ref"]).drop_nulls()
+        map_atp = map_atp.rename({"atp_id_ref": "player_ref_id"})
+        
+        counts_atp = map_atp.group_by("name_norm").agg(pl.count().alias("cnt"))
+        unique_atp = counts_atp.filter(pl.col("cnt") == 1)["name_norm"].to_list()
+        map_atp = map_atp.filter(pl.col("name_norm").is_in(unique_atp))
+        
+        map_atp.write_parquet(io.aux_dir / "name_to_id_unique_atp.parquet")
+        print(f"✔ Mapping nom→ATPid → {io.aux_dir}")
+    
+    return io.players_ref_dir
+
+
+# ===============================================
+# CELLULE D & E - SANITY CHECKS (Polars)
+# ===============================================
+def sanity_check_polars(io: IO) -> bool:
+    """CELLULES D & E - Sanity Check SOTA 2026"""
+    
+    print("\n" + "="*60)
+    print("CELLULES D & E - SANITY CHECK SOTA 2026 (Polars)")
+    print("="*60)
+    
+    df = pl.read_parquet(io.matches_base_dir)
+    
+    errors = []
+    warnings = []
+    
+    # 1. Colonnes obligatoires
+    req = {'tourney_date_ta', 'tourney_name_ta', 'tourney_surface_ta', 'tourney_level_ta',
+           'round_ta', 'winner_id', 'winner_name', 'loser_id', 'loser_name',
+           'score_ta', 'match_status', 'match_id_ta_dedup', 'match_id_ta_source',
+           'is_charted_ta', 'gender', 'year', 'tourney_date_int', 'schema_version',
+           'round_order', 'match_sequence_key'}
+    missing = req - set(df.columns)
+    if missing:
+        errors.append(f"Colonnes manquantes: {missing}")
+    else:
+        print("✔ Toutes les colonnes obligatoires présentes")
+    
+    # 2. SOTA: round_order et match_sequence_key
+    if 'round_order' in df.columns:
+        print("✔ SOTA: 'round_order' présente")
+    else:
+        errors.append("SOTA FAIL: 'round_order' absente")
+    
+    if 'match_sequence_key' in df.columns:
+        print("✔ SOTA: 'match_sequence_key' présente")
+    else:
+        errors.append("SOTA FAIL: 'match_sequence_key' absente")
+    
+    # 3. Pourcentages en [0,1]
+    pct_cols = [c for c in df.columns if re.search(r"(_p$|_pct$)", c)]
+    pct_issues = []
+    for c in pct_cols:
+        max_val = df[c].cast(pl.Float64, strict=False).max()
+        if max_val is not None and max_val > 1.0:
+            pct_issues.append(f"{c} (max={max_val:.2f})")
+    
+    if pct_issues:
+        errors.append(f"Pourcentages NON normalisés: {pct_issues}")
+    else:
+        print("✔ SOTA: Tous les pourcentages en [0,1]")
+    
+    # 4. Winner != Loser
+    bad_pairs = df.filter(
+        pl.col("winner_id").is_not_null() &
+        pl.col("loser_id").is_not_null() &
+        (pl.col("winner_id") == pl.col("loser_id"))
+    ).height
+    
+    if bad_pairs > 0:
+        errors.append(f"winner_id == loser_id: {bad_pairs} lignes")
+    else:
+        print("✔ Aucun match winner==loser")
+    
+    # 5. Unicité
+    dup = df.select(["gender", "match_id_ta_dedup"]).is_duplicated().sum()
+    if dup > 0:
+        errors.append(f"Doublons: {dup}")
+    else:
+        print("✔ Unicité OK")
+    
+    # 6. Classification niveaux
+    level_dist = df["tourney_level_ta"].value_counts()
+    x_row = level_dist.filter(pl.col("tourney_level_ta") == "X")
+    x_count = x_row["count"][0] if len(x_row) > 0 else 0
+    x_pct = x_count / len(df) * 100
+    if x_pct > 50:
+        warnings.append(f"Trop de niveaux 'X': {x_pct:.1f}%")
+    else:
+        print(f"✔ Classification niveaux OK ({x_pct:.1f}% inconnus)")
+    
+    # Résumé
+    print("\n" + "="*60)
+    if errors:
+        print("❌ SANITY CHECK FAILED")
+        for e in errors:
+            print(f"   ERROR: {e}")
+        return False
+    else:
+        print("✅ SANITY CHECK PASSED")
+    
+    if warnings:
+        print("\n⚠️ WARNINGS:")
+        for w in warnings:
+            print(f"   {w}")
+    
+    # Stats
+    print(f"\n📊 STATS:")
+    print(f"   Total matchs: {len(df):,}")
+    print(f"   Surfaces: {dict(df['tourney_surface_ta'].value_counts().iter_rows())}")
+    
+    return True
+
+
+# ===============================================
+# CELLULE F - CHARTING AGGREGATION (Polars)
+# ===============================================
+def aggregate_charting_polars(io: IO) -> Optional[pl.DataFrame]:
+    """CELLULE F - Pré-agrégation Charting SOTA"""
+    
+    print("\n" + "="*60)
+    print("CELLULE F - CHARTING AGGREGATION (Polars)")
+    print("="*60)
+    
+    if not io.charting_long_dir.exists():
+        print("[charting_agg] charting_long introuvable — skip")
+        return None
+    
+    df = pl.read_parquet(io.charting_long_dir)
+    
+    # Overall uniquement
+    df = df.filter(pl.col("set_context").cast(pl.String).str.to_lowercase() == "overall")
+    
+    if df.is_empty():
+        print("[charting_agg] Aucune donnée 'Overall' — skip")
+        return None
+    
+    # Stats SOTA
+    df_filt = df.filter(pl.col("stat_name").is_in(KEY_STATS_CHARTING))
+    
+    if df_filt.is_empty():
+        print("[charting_agg] Aucune stat SOTA trouvée")
+        return None
+    
+    # Valeur à utiliser
+    df_filt = df_filt.with_columns([
+        pl.coalesce([pl.col("stat_pct"), pl.col("stat_value")]).alias("value")
+    ])
+    
+    # Pivot
+    pivot = df_filt.pivot(
+        values="value",
+        index=["match_id", "player_id"],
+        on="stat_name",
+        aggregate_function="first"
+    )
+    
+    # Renommer colonnes
+    rename_map = {c: f"chart_{c}" for c in pivot.columns if c not in ["match_id", "player_id"]}
+    pivot = pivot.rename(rename_map)
+    
+    # ============================
+    # ✅ FIX: Ajouter match_key (join uniforme partout)
+    # ============================
+    matches = pl.read_parquet(io.matches_base_dir)
+
+    source_to_key = (
+        matches.select(["match_id_ta_source", "match_key"])
+        .filter(pl.col("match_id_ta_source").is_not_null())
+        .unique(subset=["match_id_ta_source"], keep="first")  # ✅ FIX: éviter many-to-many
+    )
+
+    pivot = pivot.join(
+        source_to_key.rename({"match_id_ta_source": "match_id"}),
+        on="match_id",
+        how="left"
+    )
+
+    # ✅ Validation coverage (protégé contre division par 0)
+    n_total = len(pivot)
+    if n_total == 0:
+        print("   match_key coverage: 0/0 (n/a)")
+    else:
+        n_with_key = pivot.filter(pl.col("match_key").is_not_null()).height
+        n_null = n_total - n_with_key
+        print(f"   match_key coverage: {n_with_key}/{n_total} ({100*n_with_key/n_total:.1f}%)")
+        print(f"   match_key NULL: {n_null}/{n_total} ({100*n_null/n_total:.1f}%)")
+
+    assert_match_key_coverage(pivot, min_coverage=0.95, context="charting_agg")  # ou "charting_sequential"
+
+    # Sauvegarder
+    pivot.write_parquet(io.charting_agg_path)
+    
+    print(f"✔ charting_agg → {io.charting_agg_path}")
+    print(f"   Matchs: {pivot['match_id'].n_unique():,}")
+    print(f"   Features: {len([c for c in pivot.columns if c.startswith('chart_')])}")
+    
+    return pivot
+
+
+# ===============================================
+# CELLULE F-BIS - CHARTING SÉQUENTIEL (Polars)
+# ===============================================
+def build_charting_sequential_polars(io: IO) -> Optional[pl.DataFrame]:
+    """CELLULE F-bis - Charting Séquentiel pour Transformer"""
+    
+    print("\n" + "="*60)
+    print("CELLULE F-BIS - CHARTING SÉQUENTIEL (Polars)")
+    print("="*60)
+    
+    if not io.charting_long_dir.exists():
+        print("[seq] charting_long introuvable — skip")
+        return None
+    
+    df = pl.read_parquet(io.charting_long_dir)
+    print(f"[seq] Loaded: {len(df):,} rows")
+
+    # ✅ DIAGNOSTIC: Voir toutes les stats disponibles par set
+    df_sets_diag = df.with_columns([
+        pl.col("set_context").cast(pl.String).str.to_lowercase().str.strip_chars()
+        .replace_strict(SET_ORDER_MAP, default=-1).alias("set_order")
+    ]).filter(pl.col("set_order").is_between(1, 5))
+    
+    available_stats = df_sets_diag.select("stat_name").unique().sort("stat_name")
+    stats_list = available_stats["stat_name"].to_list()
+    if DEBUG:
+        print(f"[seq] Stats disponibles par set ({len(stats_list)}):")
+        print(stats_list)
+
+    
+    # ✅ GARDE-FOU: Détecter les stats demandées mais absentes
+    available_set = set(stats_list)
+    wanted = set(KEY_STATS_SEQUENTIAL_SOURCE)
+    missing_from_source = sorted(wanted - available_set)
+    if missing_from_source:
+        print(f"⚠️ KEY_STATS_SEQUENTIAL contient des stats absentes en set-level: {missing_from_source}")
+    
+    # Filtrer stats clés
+    # ✅ Filtre sur SOURCE
+    df = df.filter(pl.col("stat_name").is_in(KEY_STATS_SEQUENTIAL_SOURCE))
+    print(f"[seq] After filtering: {len(df):,} rows")
+    
+    # Extraire set_order
+    df = df.with_columns([
+        pl.col("set_context").cast(pl.String).str.to_lowercase().str.strip_chars()
+        .replace_strict(SET_ORDER_MAP, default=-1)
+        .alias("set_order")
+    ])
+    
+    # Garder sets 1-5 uniquement
+    df_sets = df.filter(pl.col("set_order").is_between(1, 5))
+    # =========================================================
+    # ✅ SOTA: bpsaved → 2 features (rate + opps)
+    # =========================================================
+    bps = df_sets.filter(pl.col("stat_name") == "bpsaved")
+    
+    if not bps.is_empty():
+        # 1) bpsaved_rate
+        bps_rate = bps.with_columns([
+            pl.lit("bpsaved_rate").alias("stat_name"),
+            pl.when(pl.col("stat_total").cast(pl.Float64, strict=False) > 0)
+              .then(
+                  pl.col("stat_count").cast(pl.Float64, strict=False)
+                  / pl.col("stat_total").cast(pl.Float64, strict=False)
+              )
+              .otherwise(None)
+              .alias("value")
+        ])
+    
+        # 2) bpsaved_opps
+        bps_opps = bps.with_columns([
+            pl.lit("bpsaved_opps").alias("stat_name"),
+            pl.col("stat_total").cast(pl.Float64, strict=False)
+              .fill_null(0.0)
+              .alias("value")
+        ])
+    
+        # Autres stats (avec stat_count dans coalesce)
+        df_sets = (
+            df_sets.filter(pl.col("stat_name") != "bpsaved")
+            .with_columns([
+                pl.coalesce([pl.col("stat_pct"), pl.col("stat_value"), pl.col("stat_count")]).alias("value")
+            ])
+        )
+    
+        df_sets = pl.concat([df_sets, bps_rate, bps_opps], how="vertical_relaxed")
+    else:
+        df_sets = df_sets.with_columns([
+            pl.coalesce([pl.col("stat_pct"), pl.col("stat_value"), pl.col("stat_count")]).alias("value")
+        ])
+    
+    # Pivot
+    pivot = df_sets.pivot(
+        values="value",
+        index=["match_id", "player_id", "set_order"],
+        on="stat_name",
+        aggregate_function="first"
+    )
+    
+    # Renommer avec préfixe 's'
+    stat_cols = [c for c in pivot.columns if c in KEY_STATS_SEQUENTIAL_MODEL]
+    rename_map = {c: f"s{c}" for c in stat_cols}
+    pivot = pivot.rename(rename_map)
+    
+    # ✅ DEBUG: Voir quelles stats sont présentes/manquantes
+    seq_cols = [f"s{k}" for k in KEY_STATS_SEQUENTIAL_MODEL if f"s{k}" in pivot.columns]
+    present = sorted([c[1:] for c in seq_cols])
+    missing = sorted(set(KEY_STATS_SEQUENTIAL_MODEL) - set(present))
+    print(f"[seq] present set-stats ({len(present)}): {present}")
+    print(f"[seq] missing set-stats ({len(missing)}): {missing}")
+
+    # ✅ Check coverage par stat
+    print("[seq] Coverage par stat:")
+    for k in KEY_STATS_SEQUENTIAL_MODEL:
+        col = f"s{k}"
+        if col in pivot.columns:
+            rate = pivot.select(pl.col(col).is_not_null().mean()).item()
+            print(f"   {k}: {100*rate:.1f}%")
+    
+    print(f"[seq] Pivot shape: {pivot.shape}")
+    print(f"[seq] Unique matches: {pivot['match_id'].n_unique():,}")
+    
+    # Trier
+    pivot = pivot.sort(["match_id", "player_id", "set_order"])
+    
+    # ✅ FIX: Colonnes séquentielles réelles (PAS set_order)
+    seq_cols = [f"s{k}" for k in KEY_STATS_SEQUENTIAL_MODEL if f"s{k}" in pivot.columns]
+    
+    # ✅ FIX: Deltas uniquement sur les vraies features
+    for col in seq_cols:
+        pivot = pivot.with_columns(
+            (
+                pl.coalesce([pl.col(col), pl.lit(0.0)])
+                - pl.coalesce([pl.col(col).shift(1).over(["match_id", "player_id"]), pl.lit(0.0)])
+            ).alias(f"d{col[1:]}")
+        )
+
+    
+    # ✅ FIX: Momentum uniquement sur deltas pct
+    momentum_cols = [
+    f"d{k}" for k in KEY_STATS_SEQUENTIAL_MODEL
+    if (("pct" in k) or k.endswith("_rate")) and f"d{k}" in pivot.columns
+]
+    if momentum_cols:
+        pivot = pivot.with_columns(
+            pl.mean_horizontal([pl.col(c) for c in momentum_cols]).alias("momentum_score")
+        )
+
+    # Récupérer year depuis match_id
+    pivot = pivot.with_columns([
+        pl.col("match_id")
+          .cast(pl.String)
+          .str.extract(r"^(\d{4})", group_index=1)
+          .cast(pl.Int16, strict=False)
+          .alias("year")
+    ])
+    
+    years = pivot.select(pl.col("year").drop_nulls().unique().sort()).to_series().to_list()
+    print(f"[seq] Years: {years[:5]}...{years[-5:] if len(years) > 10 else years}")
+    
+    # ✅ FIX: Ajouter match_key (join uniforme partout)
+    matches = pl.read_parquet(io.matches_base_dir)
+
+    source_to_key = (
+        matches.select(["match_id_ta_source", "match_key"])
+        .filter(pl.col("match_id_ta_source").is_not_null())
+        .unique(subset=["match_id_ta_source"], keep="first")
+    )
+
+    pivot = pivot.join(
+        source_to_key.rename({"match_id_ta_source": "match_id"}),
+        on="match_id",
+        how="left"
+    )
+
+    # ✅ Validation coverage
+    n_total = len(pivot)
+    if n_total == 0:
+        print("   match_key coverage: 0/0 (n/a)")
+    else:
+        n_with_key = pivot.filter(pl.col("match_key").is_not_null()).height
+        n_null = n_total - n_with_key
+        print(f"   match_key coverage: {n_with_key}/{n_total} ({100*n_with_key/n_total:.1f}%)")
+        print(f"   match_key NULL: {n_null}/{n_total} ({100*n_null/n_total:.1f}%)")
+
+    assert_match_key_coverage(pivot, min_coverage=0.95, context="charting_sequential")
+    
+    # Sauvegarder
+    write_partitioned_parquet(pivot, io.charting_sequential_dir, ["year"])
+    
+    print(f"\n✔ Charting séquentiel → {io.charting_sequential_dir}")
+    print(f"   Shape: {pivot.shape}")
+    print(f"   Matches: {pivot['match_id'].n_unique():,}")
+    
+    # Stats par set
+    for s in range(1, 6):
+        cnt = pivot.filter(pl.col("set_order") == s).height
+        print(f"   Set {s}: {cnt:,} rows")
+    
+    return pivot
+
+
+def build_transformer_tensors_polars(pivot: pl.DataFrame, io: IO, max_sets: int = 5):
+    """Prépare les tensors pour PyTorch (SOTA: mask par set + mask par feature)"""
+
+    if pivot is None or pivot.is_empty():
+        print("⚠️ Pas de données pour tensors")
+        return
+
+    # ✅ IMPORTANT: prends la liste "modèle" (tes 10 features)
+    stat_cols = [f"s{k}" for k in KEY_STATS_SEQUENTIAL_MODEL if f"s{k}" in pivot.columns]
+    n_features = len(stat_cols)
+
+    match_ids = pivot.select("match_id").unique().sort("match_id")["match_id"].to_list()
+    match_keys = (
+    pivot.select(["match_id", "match_key"])
+         .unique(subset=["match_id"])
+         .sort("match_id")["match_key"]
+         .to_list()
+)
+    # ✅ AJOUT ICI (juste après match_keys)
+    if len(match_keys) != len(match_ids):
+        raise ValueError(f"match_keys size mismatch: {len(match_keys)} vs match_ids {len(match_ids)}")
+    
+    if any(mk is None for mk in match_keys):
+        n_null = sum(mk is None for mk in match_keys)
+        print(f"⚠️ match_key NULL in tensors: {n_null}/{len(match_keys)}")
+    n_matches = len(match_ids)
+
+    X_seq = np.zeros((n_matches, max_sets, n_features), dtype=np.float32)
+
+    # mask_set = "le set existe"
+    mask_set = np.zeros((n_matches, max_sets), dtype=np.float32)
+
+    # mask_feat = "la feature existe (non-null) dans ce set"
+    mask_feat = np.zeros((n_matches, max_sets, n_features), dtype=np.float32)
+
+    match_id_to_idx = {mid: i for i, mid in enumerate(match_ids)}
+
+    # ✅ itère uniquement sur colonnes utiles (beaucoup plus rapide)
+    cols = ["match_id", "set_order"] + stat_cols
+    for row in pivot.select(cols).iter_rows(named=True):
+        mi = match_id_to_idx.get(row["match_id"])
+        if mi is None:
+            continue
+
+        si = int(row["set_order"]) - 1
+        if not (0 <= si < max_sets):
+            continue
+
+        mask_set[mi, si] = 1.0
+
+        for j, c in enumerate(stat_cols):
+            v = row.get(c)
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                continue
+            X_seq[mi, si, j] = float(v)
+            mask_feat[mi, si, j] = 1.0
+
+    out_path = io.charting_sequential_dir / "transformer_tensors.npz"
+    np.savez_compressed(
+        out_path,
+        X_seq=X_seq,
+        mask_set=mask_set,
+        mask_feat=mask_feat,
+        match_ids=np.array(match_ids, dtype=object),
+        match_key=np.array(match_keys, dtype=object),   # ✅ AJOUT ICI
+        feature_names=np.array(stat_cols, dtype=object),
+    )
+
+    print(f"\n✔ Tensors → {out_path}")
+    print(f"   X_seq: {X_seq.shape}")
+    print(f"   mask_set: {mask_set.shape}")
+    print(f"   mask_feat: {mask_feat.shape}")
+    print(f"   Avg sets/match: {mask_set.sum() / n_matches:.2f}")
+
+
+
+# ===============================================
+# BUILD CHARTING_LONG (Polars)
+# ===============================================
+def build_charting_long_polars(io: IO) -> Path:
+    """Build charting_long"""
+    
+    print("\n" + "="*60)
+    print("CHARTING_LONG (Polars)")
+    print("="*60)
+    
+    if io.charting_long_dir.exists():
+        shutil.rmtree(io.charting_long_dir)
+    
+    if not io.raw_charting_dir.exists():
+        print(f"⚠️ RAW charting introuvable: {io.raw_charting_dir}")
+        return io.charting_long_dir
+    
+    df = pl.read_parquet(io.raw_charting_dir)
+    print(f"[charting] Loaded: {len(df):,} rows")
+    
+    # Dedup
+    key_cols = ['match_id','player_id','table_title','set_context','stat_category','stat_name']
+    key_cols = [c for c in key_cols if c in df.columns]
+    df = df.unique(subset=key_cols)
+    print(f"[charting] After dedup: {len(df):,} rows")
+    
+    # Types
+    for c in ['stat_value','stat_count','stat_total','stat_pct']:
+        if c in df.columns:
+            df = df.with_columns([pl.col(c).cast(pl.Float64, strict=False)])
+    
+    # ✅ FIX: Extraire year depuis match_id (format: YYYYMMDD-... ou YYYYMMDD_...)
+    if 'year' not in df.columns or df.filter(pl.col('year').is_not_null()).height == 0:
+        df = df.with_columns([
+            pl.col("match_id")
+              .cast(pl.String)
+              .str.extract(r"^(\d{4})", group_index=1)
+              .cast(pl.Int16, strict=False)
+              .alias("year")
+        ])
+        years = df.select(pl.col("year").drop_nulls().unique().sort()).to_series().to_list()
+        print(f"[charting] Year extrait depuis match_id: {years[:5]}...{years[-5:] if len(years) > 10 else years}")
+    else:
+        df = df.with_columns([pl.col('year').cast(pl.Int16, strict=False)])
+    
+    df = df.with_columns([pl.lit(SCHEMA_VERSION).alias("schema_version")])
+    
+    # Écriture
+    write_partitioned_parquet(df, io.charting_long_dir, ["year"])
+    
+    print(f"✔ charting_long → {io.charting_long_dir}")
+    
+    return io.charting_long_dir
+
+
+# ===============================================
+# MAIN - EXÉCUTION COMPLÈTE
+# ===============================================
+def run_preprocess1_godmode(gender: str = "atp"):
+    """Exécute toutes les cellules du preprocess1 GOD MODE"""
+    
+    print("\n" + "="*70)
+    print("   TENNISTITAN 2026 - PREPROCESS 1 GOD MODE (Polars)")
+    print("="*70)
+    
+    import time
+    total_start = time.time()
+    
+    io = IO().ensure()
+    
+    # === CELLULE C (doit être avant A pour les mappings) ===
+    try:
+        build_players_ref_polars(io)
+    except Exception as e:
+        print(f"[C] Erreur: {e}")
+    
+    # === CELLULE A ===
+    df = None
+    try:
+        df = build_matches_base_polars(io, gender)
+    except Exception as e:
+        print(f"[A] Erreur: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # === CHARTING_LONG ===
+    try:
+        build_charting_long_polars(io)
+    except Exception as e:
+        print(f"[Charting] Erreur: {e}")
+    
+    # === CELLULE B ===
+    try:
+        enhanced_quality_report_polars(io)
+        assert_uniques_polars(io)
+        charting_join_audit_polars(io)
+    except Exception as e:
+        print(f"[B] Erreur: {e}")
+    
+    # === CELLULES D & E ===
+    try:
+        sanity_check_polars(io)
+    except Exception as e:
+        print(f"[D/E] Erreur: {e}")
+    
+    # === CELLULE F ===
+    try:
+        aggregate_charting_polars(io)
+    except Exception as e:
+        print(f"[F] Erreur: {e}")
+    
+    # === CELLULE F-BIS ===
+    try:
+        pivot = build_charting_sequential_polars(io)
+        if pivot is not None:
+            build_transformer_tensors_polars(pivot, io)
+    except Exception as e:
+        print(f"[F-bis] Erreur: {e}")
+    
+    # === RÉSUMÉ FINAL ===
+    total_elapsed = time.time() - total_start
+    
+    print("\n" + "="*70)
+    print("   📊 RÉSUMÉ PREPROCESS 1 GOD MODE")
+    print("="*70)
+    print(f"   ⏱️  Temps total: {total_elapsed:.1f}s")
+    
+    if df is not None:
+        print(f"   📁 Matchs: {len(df):,}")
+        if "year" in df.columns:
+            print(f"   📅 Années: {df['year'].min()} → {df['year'].max()}")
+    
+    # Vérif fichiers
+    outputs = [
+        (io.matches_base_dir, "matches_base"),
+        (io.charting_long_dir, "charting_long"),
+        (io.players_ref_dir, "players_ref"),
+        (io.charting_agg_path, "charting_agg"),
+        (io.charting_sequential_dir, "charting_sequential"),
+    ]
+    
+    print("\n   📂 Outputs:")
+    for path, name in outputs:
+        status = "✅" if path.exists() else "❌"
+        print(f"      {status} {name}")
+    
+    print("\n" + "="*70)
+    print("   🎯 PREPROCESS 1 GOD MODE COMPLETE")
+    print("="*70)
+    
+    return df
+
+
+# ===============================================
+# ENTRY POINT
+# ===============================================
+df = run_preprocess1_godmode("atp")

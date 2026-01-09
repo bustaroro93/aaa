@@ -1,0 +1,796 @@
+"""
+===============================================
+PP03B v2 - PLAYER ATTRIBUTES FEATURES (SANS CONFLITS)
+===============================================
+Version modifiée qui évite les duplications avec PP08B.
+
+FEATURES NOUVELLES CRÉÉES:
+- Backhand matchup (backhand_A/B, bh_matchup_type)
+- Rolling performance vs lefties (r20_win_rate_vs_lefty)
+- Physical matchup (height, weight, BMI)
+- Duration features (r20_avg_duration)
+
+FEATURES SKIP (déjà dans PP08B):
+- hand_A/B, is_lefty_A/B (utilisées mais pas recréées)
+- handedness_advantage_A (déjà dans PP08B)
+- age_A/B basique (déjà dans PP08B)
+
+ANTI-LEAKAGE: Toutes les features rolling utilisent shift(1)
+===============================================
+"""
+
+import polars as pl
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+import gc
+import time
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+# Input
+PLAYERS_REF_PATH = DATA_CLEAN / "players_ref"
+MATCHES_BASE_PATH = DATA_CLEAN / "matches_base"
+
+# Output
+OUTPUT_DIR = DATA_CLEAN / "features" / "player_attributes"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Parameters
+ROLLING_WINDOW = 20
+MIN_MATCHES_ROLLING = 5
+
+# ===============================================
+# HELPER FUNCTIONS
+# ===============================================
+
+def load_players_ref() -> pl.DataFrame:
+    """Charge players_ref avec les colonnes nécessaires."""
+    print("\n[1] Loading players_ref...")
+    
+    if PLAYERS_REF_PATH.is_dir():
+        df = pl.read_parquet(PLAYERS_REF_PATH)
+    else:
+        df = pl.read_parquet(PLAYERS_REF_PATH)
+    
+    print(f"  Loaded {len(df):,} players, {len(df.columns)} columns")
+    return df
+
+
+def load_matches_base() -> pl.DataFrame:
+    """Charge matches_base."""
+    print("\n[2] Loading matches_base...")
+    
+    df = pl.read_parquet(MATCHES_BASE_PATH)
+    print(f"  Loaded {len(df):,} matches")
+    return df
+
+
+def standardize_backhand(val: str) -> str:
+    """Standardise backhand en 1H/2H/U."""
+    if val is None:
+        return "U"
+    v = str(val).lower()
+    if "two" in v or "2" in v:
+        return "2H"
+    if "one" in v or "1" in v:
+        return "1H"
+    return "U"
+
+
+def standardize_hand(val: str) -> str:
+    """Standardise hand en R/L/U."""
+    if val is None:
+        return "U"
+    v = str(val).lower()
+    if "right" in v or v == "r":
+        return "R"
+    if "left" in v or v == "l":
+        return "L"
+    if "ambid" in v or v == "a":
+        return "A"
+    return "U"
+
+
+# ===============================================
+# SECTION 1: BACKHAND MATCHUP (NOUVEAU)
+# ===============================================
+
+def build_backhand_features(players: pl.DataFrame, matches: pl.DataFrame) -> pl.DataFrame:
+    """
+    Crée les features de matchup revers.
+    PP08B n'a PAS ces features → 100% NOUVEAU
+    
+    Features créées:
+    - backhand_A, backhand_B: 1H/2H/U
+    - is_1h_backhand_A, is_1h_backhand_B: 0/1
+    - bh_matchup_type: 1Hv1H, 1Hv2H, 2Hv1H, 2Hv2H
+    - bh_advantage_A: +1 si 1H vs 2H (avantage slice), -1 si inverse, 0 sinon
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 1: BACKHAND MATCHUP FEATURES (NOUVEAU)")
+    print("=" * 60)
+    
+    # Vérifier si déjà présent
+    if "backhand_A" in matches.columns:
+        print("  ⏭️ backhand_A already exists, skipping...")
+        return matches
+    
+    # Chercher colonne backhand dans players
+    bh_col = None
+    for col in ["plays_backhand_std", "plays_backhand", "backhand"]:
+        if col in players.columns:
+            bh_col = col
+            break
+    
+    if bh_col is None:
+        print("  ⚠️ No backhand column found in players_ref!")
+        return matches
+    
+    # ID column
+    id_col = "atp_id_ref" if "atp_id_ref" in players.columns else "player_master_id"
+    
+    # Standardiser backhand
+    bh_values = players[bh_col].to_list()
+    bh_std = [standardize_backhand(v) for v in bh_values]
+    
+    player_bh = pl.DataFrame({
+        "player_id": players[id_col].to_list(),
+        "backhand": bh_std
+    }).filter(pl.col("player_id").is_not_null())
+    
+    valid_bh = player_bh.filter(pl.col("backhand") != "U").height
+    print(f"  Players with backhand info: {valid_bh:,} ({100*valid_bh/len(player_bh):.1f}%)")
+    
+    # Join winner (A)
+    matches = matches.join(
+        player_bh.select([
+            pl.col("player_id"),
+            pl.col("backhand").alias("backhand_A"),
+        ]),
+        left_on="winner_id",
+        right_on="player_id",
+        how="left"
+    )
+    
+    # Join loser (B)
+    matches = matches.join(
+        player_bh.select([
+            pl.col("player_id"),
+            pl.col("backhand").alias("backhand_B"),
+        ]),
+        left_on="loser_id",
+        right_on="player_id",
+        how="left"
+    )
+    
+    # Fill null
+    matches = matches.with_columns([
+        pl.col("backhand_A").fill_null("U"),
+        pl.col("backhand_B").fill_null("U"),
+    ])
+    
+    # Créer features dérivées
+    matches = matches.with_columns([
+        # Is one-handed backhand
+        (pl.col("backhand_A") == "1H").cast(pl.Int8).alias("is_1h_backhand_A"),
+        (pl.col("backhand_B") == "1H").cast(pl.Int8).alias("is_1h_backhand_B"),
+        
+        # Backhand matchup type
+        (pl.col("backhand_A") + "v" + pl.col("backhand_B")).alias("bh_matchup_type"),
+        
+        # Backhand advantage (1H a avantage slice sur 2H en théorie)
+        pl.when((pl.col("backhand_A") == "1H") & (pl.col("backhand_B") == "2H"))
+          .then(pl.lit(1))
+          .when((pl.col("backhand_A") == "2H") & (pl.col("backhand_B") == "1H"))
+          .then(pl.lit(-1))
+          .otherwise(pl.lit(0))
+          .cast(pl.Int8)
+          .alias("bh_advantage_A"),
+    ])
+    
+    # Stats
+    print(f"\n  📊 BACKHAND MATCHUP STATS:")
+    bh_dist = matches.group_by("bh_matchup_type").len().sort("len", descending=True)
+    for row in bh_dist.head(6).iter_rows(named=True):
+        pct = 100 * row['len'] / len(matches)
+        print(f"     {row['bh_matchup_type']}: {row['len']:,} ({pct:.1f}%)")
+    
+    return matches
+
+
+# ===============================================
+# SECTION 2: ROLLING PERFORMANCE VS LEFTIES (NOUVEAU)
+# ===============================================
+
+def build_rolling_vs_lefty(matches: pl.DataFrame, players: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calcule la performance rolling contre les gauchers.
+    PP08B n'a PAS ces features rolling → NOUVEAU
+    
+    Features créées:
+    - r20_matches_vs_lefty_A/B: nombre de matchs vs gauchers (rolling 20)
+    - r20_wins_vs_lefty_A/B: victoires vs gauchers
+    - r20_win_rate_vs_lefty_A/B: taux de victoire vs gauchers
+    - diff_win_rate_vs_lefty: différence A - B
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 2: ROLLING PERFORMANCE VS LEFTIES (NOUVEAU)")
+    print("=" * 60)
+    
+    # Vérifier si déjà présent
+    if "r20_win_rate_vs_lefty_A" in matches.columns:
+        print("  ⏭️ r20_win_rate_vs_lefty_A already exists, skipping...")
+        return matches
+    
+    # On a besoin de savoir qui est gaucher
+    # Option 1: hand_A/hand_B existent déjà (de PP08B)
+    # Option 2: On doit les créer temporairement
+    
+    if "hand_A" not in matches.columns and "is_lefty_A" not in matches.columns:
+        print("  Creating temporary hand columns...")
+        
+        # Charger hand depuis players
+        hand_col = None
+        for col in ["plays_hand_std", "plays_hand", "hand"]:
+            if col in players.columns:
+                hand_col = col
+                break
+        
+        if hand_col is None:
+            print("  ⚠️ No hand column found!")
+            return matches
+        
+        id_col = "atp_id_ref" if "atp_id_ref" in players.columns else "player_master_id"
+        
+        hand_values = players[hand_col].to_list()
+        hand_std = [standardize_hand(v) for v in hand_values]
+        
+        player_hand = pl.DataFrame({
+            "player_id": players[id_col].to_list(),
+            "hand": hand_std
+        }).filter(pl.col("player_id").is_not_null())
+        
+        # Join
+        matches = matches.join(
+            player_hand.rename({"hand": "hand_A"}),
+            left_on="winner_id", right_on="player_id", how="left"
+        )
+        matches = matches.join(
+            player_hand.rename({"hand": "hand_B"}),
+            left_on="loser_id", right_on="player_id", how="left"
+        )
+        matches = matches.with_columns([
+            pl.col("hand_A").fill_null("U"),
+            pl.col("hand_B").fill_null("U"),
+        ])
+        created_hand = True
+    else:
+        created_hand = False
+    
+    # Déterminer la colonne de lefty
+    if "is_lefty_A" in matches.columns:
+        lefty_col_a = "is_lefty_A"
+        lefty_col_b = "is_lefty_B"
+    else:
+        # Créer is_lefty depuis hand
+        matches = matches.with_columns([
+            (pl.col("hand_A") == "L").cast(pl.Int8).alias("is_lefty_A_tmp"),
+            (pl.col("hand_B") == "L").cast(pl.Int8).alias("is_lefty_B_tmp"),
+        ])
+        lefty_col_a = "is_lefty_A_tmp"
+        lefty_col_b = "is_lefty_B_tmp"
+    
+    # Vérifier tourney_date_ta
+    if "tourney_date_ta" not in matches.columns:
+        print("  ⚠️ tourney_date_ta not found!")
+        return matches
+    
+    # Créer match_id si pas présent
+    if "custom_match_id" not in matches.columns:
+        matches = matches.with_columns([
+            pl.arange(0, len(matches)).cast(pl.Utf8).alias("custom_match_id")
+        ])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Player-match view
+    # ═══════════════════════════════════════════════════════════════
+    
+    # Winner perspective
+    winner = matches.select([
+        "custom_match_id", "tourney_date_ta",
+        pl.col("winner_id").alias("player_id"),
+        pl.lit(1).alias("won"),
+        pl.col(lefty_col_b).alias("opp_is_lefty"),
+    ])
+    
+    # Loser perspective
+    loser = matches.select([
+        "custom_match_id", "tourney_date_ta",
+        pl.col("loser_id").alias("player_id"),
+        pl.lit(0).alias("won"),
+        pl.col(lefty_col_a).alias("opp_is_lefty"),
+    ])
+    
+    pm = pl.concat([winner, loser]).filter(pl.col("player_id").is_not_null())
+    pm = pm.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    
+    print(f"  Player-match rows: {len(pm):,}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Rolling vs lefty (avec SHIFT(1) anti-leak)
+    # ═══════════════════════════════════════════════════════════════
+    
+    pm = pm.with_columns([
+        (pl.col("opp_is_lefty") == 1).cast(pl.Int8).alias("is_vs_lefty"),
+        (pl.col("won") * (pl.col("opp_is_lefty") == 1).cast(pl.Int8)).alias("won_vs_lefty"),
+    ])
+    
+    # Rolling counts avec shift
+    pm = pm.with_columns([
+        pl.col("is_vs_lefty")
+          .shift(1)
+          .rolling_sum(window_size=ROLLING_WINDOW, min_samples=1)  # min_samples au lieu de min_periods
+          .over("player_id")  # UN SEUL .over() à la fin
+          .fill_nan(0).fill_null(0)
+          .alias("r20_matches_vs_lefty"),
+        
+        pl.col("won_vs_lefty")
+          .shift(1)
+          .rolling_sum(window_size=ROLLING_WINDOW, min_samples=1)
+          .over("player_id")  # UN SEUL .over() à la fin
+          .fill_nan(0).fill_null(0)
+          .alias("r20_wins_vs_lefty"),
+    ])
+    
+    # Win rate vs lefty
+    pm = pm.with_columns([
+        pl.when(pl.col("r20_matches_vs_lefty") >= MIN_MATCHES_ROLLING)
+          .then(pl.col("r20_wins_vs_lefty") / pl.col("r20_matches_vs_lefty"))
+          .otherwise(None)
+          .cast(pl.Float32)
+          .alias("r20_win_rate_vs_lefty")
+    ])
+    
+    # Stats
+    valid = pm.filter(pl.col("r20_win_rate_vs_lefty").is_not_null())
+    print(f"  Valid r20_win_rate_vs_lefty: {len(valid):,} ({100*len(valid)/len(pm):.1f}%)")
+    if len(valid) > 0:
+        print(f"  Mean win rate vs lefty: {valid['r20_win_rate_vs_lefty'].mean():.3f}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Merge back to matches
+    # ═══════════════════════════════════════════════════════════════
+    
+    vs_lefty_features = pm.select([
+        "custom_match_id", "player_id",
+        "r20_matches_vs_lefty", "r20_wins_vs_lefty", "r20_win_rate_vs_lefty"
+    ])
+    
+    # Pour winner (A)
+    matches = matches.join(
+        vs_lefty_features.select([
+            pl.col("custom_match_id"),
+            pl.col("player_id").alias("winner_id"),
+            pl.col("r20_matches_vs_lefty").alias("r20_matches_vs_lefty_A"),
+            pl.col("r20_wins_vs_lefty").alias("r20_wins_vs_lefty_A"),
+            pl.col("r20_win_rate_vs_lefty").alias("r20_win_rate_vs_lefty_A"),
+        ]),
+        on=["custom_match_id", "winner_id"],
+        how="left"
+    )
+    
+    # Pour loser (B)
+    matches = matches.join(
+        vs_lefty_features.select([
+            pl.col("custom_match_id"),
+            pl.col("player_id").alias("loser_id"),
+            pl.col("r20_matches_vs_lefty").alias("r20_matches_vs_lefty_B"),
+            pl.col("r20_wins_vs_lefty").alias("r20_wins_vs_lefty_B"),
+            pl.col("r20_win_rate_vs_lefty").alias("r20_win_rate_vs_lefty_B"),
+        ]),
+        on=["custom_match_id", "loser_id"],
+        how="left"
+    )
+    
+    # Diff
+    matches = matches.with_columns([
+        (pl.col("r20_win_rate_vs_lefty_A") - pl.col("r20_win_rate_vs_lefty_B"))
+          .alias("diff_win_rate_vs_lefty")
+    ])
+    
+    # Cleanup
+    drop_cols = []
+    if created_hand:
+        drop_cols += ["hand_A", "hand_B"]
+    if "is_lefty_A_tmp" in matches.columns:
+        drop_cols += ["is_lefty_A_tmp", "is_lefty_B_tmp"]
+    
+    if drop_cols:
+        matches = matches.drop([c for c in drop_cols if c in matches.columns])
+    
+    del pm, vs_lefty_features
+    gc.collect()
+    
+    return matches
+
+
+# ===============================================
+# SECTION 3: PHYSICAL MATCHUP (NOUVEAU - PP08E)
+# ===============================================
+
+def build_physical_features(players: pl.DataFrame, matches: pl.DataFrame) -> pl.DataFrame:
+    """
+    Crée les features de matchup physique.
+    PP08B n'a PAS ces features → NOUVEAU (correspond à PP08E dans idée.txt)
+    
+    Features créées:
+    - height_A/B, weight_A/B
+    - height_diff, weight_diff
+    - bmi_A/B, bmi_diff
+    - height_advantage_A: +1 si >5cm plus grand
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 3: PHYSICAL MATCHUP (NOUVEAU - PP08E)")
+    print("=" * 60)
+    
+    # Vérifier si déjà présent
+    if "height_diff" in matches.columns:
+        print("  ⏭️ height_diff already exists, skipping...")
+        return matches
+    
+    if "height_cm" not in players.columns:
+        print("  ⚠️ height_cm not found in players_ref!")
+        return matches
+    
+    # ID column
+    id_col = "atp_id_ref" if "atp_id_ref" in players.columns else "player_master_id"
+    
+    # Créer physical attributes
+    physical_cols = [id_col, "height_cm"]
+    if "weight_kg" in players.columns:
+        physical_cols.append("weight_kg")
+    
+    physical = players.select(physical_cols).rename({id_col: "player_id"})
+    physical = physical.filter(pl.col("player_id").is_not_null())
+    
+    # Cast to float
+    physical = physical.with_columns([
+        pl.col("height_cm").cast(pl.Float32),
+    ])
+    
+    if "weight_kg" in physical.columns:
+        physical = physical.with_columns([
+            pl.col("weight_kg").cast(pl.Float32),
+        ])
+        
+        # Calculer BMI
+        physical = physical.with_columns([
+            (pl.col("weight_kg") / ((pl.col("height_cm") / 100) ** 2))
+              .clip(15, 35)
+              .cast(pl.Float32)
+              .alias("bmi")
+        ])
+    
+    # Stats
+    valid_height = physical.filter(pl.col("height_cm").is_not_null()).height
+    print(f"  Players with height: {valid_height:,} ({100*valid_height/len(physical):.1f}%)")
+    
+    # Join winner (A)
+    join_cols_a = ["player_id", pl.col("height_cm").alias("height_A")]
+    if "weight_kg" in physical.columns:
+        join_cols_a.append(pl.col("weight_kg").alias("weight_A"))
+    if "bmi" in physical.columns:
+        join_cols_a.append(pl.col("bmi").alias("bmi_A"))
+    
+    matches = matches.join(
+        physical.select(join_cols_a),
+        left_on="winner_id", right_on="player_id", how="left"
+    )
+    
+    # Join loser (B)
+    join_cols_b = ["player_id", pl.col("height_cm").alias("height_B")]
+    if "weight_kg" in physical.columns:
+        join_cols_b.append(pl.col("weight_kg").alias("weight_B"))
+    if "bmi" in physical.columns:
+        join_cols_b.append(pl.col("bmi").alias("bmi_B"))
+    
+    matches = matches.join(
+        physical.select(join_cols_b),
+        left_on="loser_id", right_on="player_id", how="left"
+    )
+    
+    # Diffs
+    diff_exprs = [
+        (pl.col("height_A") - pl.col("height_B")).cast(pl.Float32).alias("height_diff"),
+    ]
+    
+    if "weight_A" in matches.columns:
+        diff_exprs.append(
+            (pl.col("weight_A") - pl.col("weight_B")).cast(pl.Float32).alias("weight_diff")
+        )
+    
+    if "bmi_A" in matches.columns:
+        diff_exprs.append(
+            (pl.col("bmi_A") - pl.col("bmi_B")).cast(pl.Float32).alias("bmi_diff")
+        )
+    
+    matches = matches.with_columns(diff_exprs)
+    
+    # Height advantage (grand joueur = avantage au service)
+    matches = matches.with_columns([
+        pl.when(pl.col("height_diff") > 5)
+          .then(pl.lit(1))
+          .when(pl.col("height_diff") < -5)
+          .then(pl.lit(-1))
+          .otherwise(pl.lit(0))
+          .cast(pl.Int8)
+          .alias("height_advantage_A")
+    ])
+    
+    # Stats
+    valid_diff = matches.filter(pl.col("height_diff").is_not_null()).height
+    print(f"  Matches with height: {valid_diff:,} ({100*valid_diff/len(matches):.1f}%)")
+    if valid_diff > 0:
+        print(f"  Mean height diff: {matches['height_diff'].mean():.1f} cm")
+        print(f"  Mean height A: {matches.filter(pl.col('height_A').is_not_null())['height_A'].mean():.1f} cm")
+    
+    return matches
+
+
+# ===============================================
+# SECTION 4: DURATION FEATURES (NOUVEAU - PP05B)
+# ===============================================
+
+def build_duration_features(matches: pl.DataFrame) -> pl.DataFrame:
+    """
+    Crée les features de durée de match.
+    PP05 n'a PAS ces features → NOUVEAU (correspond à PP05B dans idée.txt)
+    
+    Features créées:
+    - r20_avg_duration_A/B: durée moyenne (rolling 20)
+    - r20_std_duration_A/B: écart-type durée
+    - duration_style_A/B: "grinder" vs "quick" vs "neutral"
+    - diff_avg_duration: différence A - B
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 4: DURATION FEATURES (NOUVEAU - PP05B)")
+    print("=" * 60)
+    
+    # Vérifier si déjà présent
+    if "r20_avg_duration_A" in matches.columns:
+        print("  ⏭️ r20_avg_duration_A already exists, skipping...")
+        return matches
+    
+    if "duration_minutes_ta" not in matches.columns:
+        print("  ⚠️ duration_minutes_ta not found!")
+        return matches
+    
+    # Nettoyer duration (0-400 min seulement)
+    matches = matches.with_columns([
+        pl.when(
+            (pl.col("duration_minutes_ta") > 0) & 
+            (pl.col("duration_minutes_ta") < 400)
+        )
+        .then(pl.col("duration_minutes_ta"))
+        .otherwise(None)
+        .cast(pl.Float32)
+        .alias("duration_clean")
+    ])
+    
+    valid_duration = matches.filter(pl.col("duration_clean").is_not_null()).height
+    print(f"  Valid duration: {valid_duration:,} ({100*valid_duration/len(matches):.1f}%)")
+    
+    if valid_duration < 1000:
+        print("  ⚠️ Not enough valid duration, skipping...")
+        matches = matches.drop(["duration_clean"])
+        return matches
+    
+    # Global average pour catégorisation
+    global_avg = matches.filter(pl.col("duration_clean").is_not_null())["duration_clean"].mean()
+    print(f"  Global average duration: {global_avg:.1f} min")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Player-match view
+    # ═══════════════════════════════════════════════════════════════
+    
+    if "custom_match_id" not in matches.columns:
+        matches = matches.with_columns([
+            pl.arange(0, len(matches)).cast(pl.Utf8).alias("custom_match_id")
+        ])
+    
+    # Winner
+    winner = matches.select([
+        "custom_match_id", "tourney_date_ta",
+        pl.col("winner_id").alias("player_id"),
+        pl.col("duration_clean").alias("duration"),
+    ])
+    
+    # Loser
+    loser = matches.select([
+        "custom_match_id", "tourney_date_ta",
+        pl.col("loser_id").alias("player_id"),
+        pl.col("duration_clean").alias("duration"),
+    ])
+    
+    pm = pl.concat([winner, loser]).filter(
+        pl.col("player_id").is_not_null()
+    )
+    pm = pm.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    
+    print(f"  Player-match rows: {len(pm):,}")
+    
+    # Rolling average duration (shift anti-leak)
+    pm = pm.with_columns([
+        pl.col("duration")
+          .shift(1)
+          .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_MATCHES_ROLLING)
+          .over("player_id")  # UN SEUL .over()
+          .cast(pl.Float32)
+          .alias("r20_avg_duration"),
+        
+        pl.col("duration")
+          .shift(1)
+          .rolling_std(window_size=ROLLING_WINDOW, min_samples=MIN_MATCHES_ROLLING)
+          .over("player_id")  # UN SEUL .over()
+          .cast(pl.Float32)
+          .alias("r20_std_duration"),
+    ])
+    
+    # Duration style
+    pm = pm.with_columns([
+        pl.when(pl.col("r20_avg_duration") > global_avg * 1.1)
+          .then(pl.lit("grinder"))
+          .when(pl.col("r20_avg_duration") < global_avg * 0.9)
+          .then(pl.lit("quick"))
+          .otherwise(pl.lit("neutral"))
+          .alias("duration_style")
+    ])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Merge back
+    # ═══════════════════════════════════════════════════════════════
+    
+    duration_features = pm.select([
+        "custom_match_id", "player_id",
+        "r20_avg_duration", "r20_std_duration", "duration_style"
+    ])
+    
+    # Winner (A)
+    matches = matches.join(
+        duration_features.select([
+            pl.col("custom_match_id"),
+            pl.col("player_id").alias("winner_id"),
+            pl.col("r20_avg_duration").alias("r20_avg_duration_A"),
+            pl.col("r20_std_duration").alias("r20_std_duration_A"),
+            pl.col("duration_style").alias("duration_style_A"),
+        ]),
+        on=["custom_match_id", "winner_id"],
+        how="left"
+    )
+    
+    # Loser (B)
+    matches = matches.join(
+        duration_features.select([
+            pl.col("custom_match_id"),
+            pl.col("player_id").alias("loser_id"),
+            pl.col("r20_avg_duration").alias("r20_avg_duration_B"),
+            pl.col("r20_std_duration").alias("r20_std_duration_B"),
+            pl.col("duration_style").alias("duration_style_B"),
+        ]),
+        on=["custom_match_id", "loser_id"],
+        how="left"
+    )
+    
+    # Diffs
+    matches = matches.with_columns([
+        (pl.col("r20_avg_duration_A") - pl.col("r20_avg_duration_B"))
+          .alias("diff_avg_duration"),
+    ])
+    
+    # Matchup types
+    matches = matches.with_columns([
+        ((pl.col("duration_style_A") == "grinder") & (pl.col("duration_style_B") == "grinder"))
+          .cast(pl.Int8)
+          .alias("both_grinders"),
+        ((pl.col("duration_style_A") == "quick") & (pl.col("duration_style_B") == "quick"))
+          .cast(pl.Int8)
+          .alias("both_quick"),
+        ((pl.col("duration_style_A") == "grinder") & (pl.col("duration_style_B") == "quick"))
+          .cast(pl.Int8)
+          .alias("grinder_vs_quick_A"),
+    ])
+    
+    # Stats
+    valid_rolling = matches.filter(pl.col("r20_avg_duration_A").is_not_null()).height
+    print(f"\n  Matches with r20_avg_duration: {valid_rolling:,} ({100*valid_rolling/len(matches):.1f}%)")
+    if valid_rolling > 0:
+        print(f"  Mean r20_avg_duration_A: {matches['r20_avg_duration_A'].mean():.1f} min")
+    
+    # Cleanup
+    matches = matches.drop(["duration_clean"])
+    
+    del pm, duration_features
+    gc.collect()
+    
+    return matches
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    print("\n" + "=" * 70)
+    print("   PP03B v2 - PLAYER ATTRIBUTES (SANS CONFLITS)")
+    print("=" * 70)
+    print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("   Features: Backhand, Rolling vs Lefty, Physical, Duration")
+    print("=" * 70)
+    
+    start_time = time.time()
+    
+    # Load data
+    players = load_players_ref()
+    matches = load_matches_base()
+    
+    original_cols = set(matches.columns)
+    
+    # Build features (seulement les NOUVELLES)
+    matches = build_backhand_features(players, matches)
+    matches = build_rolling_vs_lefty(matches, players)
+    matches = build_physical_features(players, matches)
+    matches = build_duration_features(matches)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # SUMMARY
+    # ═══════════════════════════════════════════════════════════════
+    
+    new_cols = set(matches.columns) - original_cols
+    
+    print("\n" + "=" * 70)
+    print("   SUMMARY")
+    print("=" * 70)
+    print(f"  Original columns: {len(original_cols)}")
+    print(f"  New columns: {len(new_cols)}")
+    print(f"  Final shape: {matches.shape}")
+    
+    print(f"\n  📊 NEW FEATURES ({len(new_cols)}):")
+    for col in sorted(new_cols):
+        if matches[col].dtype in [pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64]:
+            cov = matches[col].is_not_null().mean()
+            print(f"     ✅ {col}: {100*cov:.1f}% coverage")
+        else:
+            print(f"     ✅ {col}: (categorical)")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # SAVE
+    # ═══════════════════════════════════════════════════════════════
+    
+    output_path = OUTPUT_DIR / "player_attributes_v2_match_level.parquet"
+    
+    # Colonnes à sauvegarder
+    id_cols = ["custom_match_id", "match_id_ta_dedup", "winner_id", "loser_id"]
+    save_cols = [c for c in id_cols if c in matches.columns] + list(new_cols)
+    
+    matches.select(save_cols).write_parquet(output_path)
+    print(f"\n  ✅ Saved to {output_path}")
+    
+    elapsed = time.time() - start_time
+    print(f"\n  ⏱️ Total time: {elapsed:.1f}s")
+    
+    print("\n" + "=" * 70)
+    print("   NEXT STEPS:")
+    print("   1. Run PP03B_merge.py to integrate into ML_READY")
+    print("   2. Run PP03C for Glicko vs Opponent Hand")
+    print("=" * 70)
+    
+    return matches
+
+
+if __name__ == "__main__":
+    result = main()

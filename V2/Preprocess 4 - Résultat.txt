@@ -1,0 +1,149 @@
+======================================================================
+   PREPROCESS 04 - MERGE GOD MODE
+   TennisTitan SOTA 2026
+======================================================================
+   Timestamp: 2026-01-08 18:26:22
+   Gender: atp
+======================================================================
+
+[1/11] Chargement matches_base (backbone)...
+  Matches base: 543,927 rows
+  Matches uniques: 543,927
+
+[2/11] Chargement des feature layers...
+  ✅ ratings_glicko2: 1,044,240 rows × 165 cols
+  ✅ ratings_srvret_layer: 1,088,490 rows × 38 cols
+  ✅ h2h_decay: 1,044,240 rows × 11 cols
+  ✅ psychological_momentum: 1,087,942 rows × 21 cols
+  ✅ environmental_context: 544,245 rows × 19 cols
+  ✅ charting_style: 1,087,854 rows × 92 cols
+  ✅ charting_super: 14,369 rows × 81 cols
+  ⚠️ charting_player_rolling introuvable: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\charting_player_rolling
+  ✅ baseline_markov: 1,087,942 rows × 14 cols
+  ✅ base_stats_rolling: 1,087,942 rows × 73 cols
+  ✅ charting_sequential: 37,746 rows × 26 cols
+  ✅ odds_layer: 48,472 rows × 8 cols
+
+[3/11] Merge Environmental Context...
+  📎 env: 100.0% coverage (543,927/543,927)
+
+[4/11] Merge SRV/RET Ratings...
+  SRV/RET features: 29 colonnes à pivoter
+  📎 srvret_A: 100.0% coverage (543,927/543,927)
+  📎 srvret_B: 100.0% coverage (543,927/543,927)
+  ✅ SRV/RET mergé: +58 colonnes
+
+[5/11] Merge Glicko-2 Ratings...
+  📎 ratings_A: 96.0% coverage (522,076/543,927)
+  📎 ratings_B: 96.0% coverage (522,076/543,927)
+
+[6/11] Merge Psychological Features...
+  📎 psych_A: 100.0% coverage (543,927/543,927)
+  📎 psych_B: 100.0% coverage (543,927/543,927)
+
+[7/11] Merge Charting Style Features...
+  📎 charting_A: 100.0% coverage (543,927/543,927)
+  📎 charting_B: 100.0% coverage (543,927/543,927)
+  📎 charting_super_A: 1.3% coverage (7,119/543,927)
+  📎 charting_super_B: 1.3% coverage (6,982/543,927)
+
+[7c/11] Merge Charting Player Rolling...
+
+[7d/11] Merge Base Stats Rolling (100% coverage)...
+  Base rolling features: 68
+  📎 base_rolling_A: 99.7% coverage (542,554/543,927)
+  📎 base_rolling_B: 97.1% coverage (528,140/543,927)
+  ✅ Base Stats Rolling merged: +136 columns
+
+[8/11] Merge H2H Features...
+  📎 h2h_A: 26.5% coverage (144,159/543,927)
+  📎 h2h_B: 26.5% coverage (144,159/543,927)
+
+[9/11] Merge Baseline Markov...
+  📎 markov_A: 46.3% coverage (251,600/543,927)
+  📎 markov_B: 40.5% coverage (220,548/543,927)
+
+[10/11] Merge Charting Sequential...
+  Après agrégation: 14,147 rows
+  📎 charting_seq_A: 1.3% coverage (6,943/543,927)
+  📎 charting_seq_B: 1.3% coverage (6,815/543,927)
+
+[11/11] Merge Odds Layer...
+  📎 odds: 8.9% coverage (48,472/543,927)
+  🎰 Matchs avec cotes: 48,472/543,927 (8.9%)
+
+[POST] Création features dérivées...
+  ⏭️ glicko_prob_* skipped (will be calculated post-shuffle in PP9)
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_5548\607578.py:731: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  pl.col("round_ta").replace(ROUND_ORDER, default=0).cast(pl.Int8).alias("round_num")
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_5548\607578.py:744: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  pl.col("tourney_level_ta").replace(LEVEL_ORDER, default=1).cast(pl.Int8).alias("tourney_level_num")
+
+======================================================================
+   VALIDATION FINALE
+======================================================================
+
+  Shape finale: (543927, 1007)
+  Colonnes: 1007
+
+  Features par catégorie:
+    • SRV/RET + Markov: 58
+    • Glicko-2: 320
+    • Psychological: 36
+    • Environmental: 10
+    • Charting: 319
+    • H2H: 12
+    • Sequential: 44
+    • Meta/Derived: 72
+    • Base Stats Rolling: 136
+
+  Taux de null par catégorie:
+    • Markov: 0.0% null
+    • Glicko: 4.0% null
+    • Mental: 0.0% null
+    • Charting: 92.9% null
+
+[WRITE] Écriture du dataset unifié...
+  ✅ C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready.parquet
+     Taille: 572.8 MB
+  ✅ C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_partitioned (partitionné par année)
+  ✅ C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\metadata.json
+
+======================================================================
+   PREPROCESS 2.2 TERMINÉ!
+   Temps: 18.4s
+======================================================================
+
+======================================================================
+   SANITY CHECK - DATASET MERGÉ
+======================================================================
+
+  Shape: (543927, 1007)
+  ✅ Colonnes clés présentes
+  Features _A: 476
+  Features _B: 478
+  ✅ Target = 1 pour tous (A=winner) - OK pour shuffle
+  Années: 1990 → 2025 (36 années)
+
+  Distribution surfaces:
+    • Hard: 261,990 (48.2%)
+    • Clay: 254,544 (46.8%)
+    • Grass: 15,357 (2.8%)
+    • Carpet: 11,975 (2.2%)
+    • None: 61 (0.0%)
+
+  🎉 Sanity check passé!
+
+[SHUFFLE] Création dataset d'entraînement shufflé...
+  Paires A/B à swapper: 476
+  Distribution target après shuffle:
+    • 0: 272,399 (50.1%)
+    • 1: 271,528 (49.9%)
+  ✅ C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_shuffled.parquet
+
+✅ Preprocess 4 terminé!
+
+Prochaine étape:
+  1. Exécuter create_shuffled_training_set() pour l'entraînement

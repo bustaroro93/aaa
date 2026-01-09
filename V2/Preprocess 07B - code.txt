@@ -1,0 +1,540 @@
+"""
+===============================================
+PP07B - SET DYNAMICS FEATURES GOD SOTA 2026
+===============================================
+Analyse la performance par set pour capturer:
+- Slow starters vs Fast starters
+- Momentum shifts (qui s'améliore en fin de match)
+- Clutch performance (sets décisifs)
+- Consistency across sets
+
+Source: charting_long avec set_context (Overall, SET 1, SET 2, SET 3)
+
+Impact estimé: +0.5% AUC
+===============================================
+"""
+
+import polars as pl
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+import time
+import gc
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+# Input - Charting data
+CHARTING_LONG_PATH = DATA_CLEAN / "charting_long"
+CHARTING_PARQUET = DATA_CLEAN / "charting_long.parquet"
+
+# Output
+OUTPUT_DIR = DATA_CLEAN / "features" / "set_dynamics"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Rolling parameters
+ROLLING_WINDOW = 15  # Moins de matchs chartés disponibles
+MIN_MATCHES = 3
+
+# Stats clés par set
+KEY_STATS = [
+    "1st_pct",      # % points gagnés sur 1er service
+    "2nd_pct",      # % points gagnés sur 2e service
+    "rpw_pct",      # Return points won
+    "wnr_pct",      # Winners %
+    "ufe_pct",      # Unforced errors %
+    "bpsaved",      # Break points saved rate
+]
+
+
+# ===============================================
+# LOAD DATA
+# ===============================================
+
+def load_charting_long() -> pl.DataFrame:
+    """Charge les données charting au format long."""
+    print("\n[1] Loading charting data...")
+    
+    # Essayer plusieurs chemins
+    paths = [
+        CHARTING_LONG_PATH,
+        CHARTING_PARQUET,
+        DATA_CLEAN / "charting" / "charting_long.parquet",
+        ROOT / "charting_match_random_full.csv",
+    ]
+    
+    df = None
+    for path in paths:
+        if path.exists():
+            print(f"  Found: {path}")
+            if path.suffix == ".csv":
+                df = pl.read_csv(path)
+            else:
+                df = pl.read_parquet(path)
+            break
+    
+    if df is None:
+        print("  ❌ No charting data found!")
+        return None
+    
+    print(f"  Loaded: {len(df):,} rows")
+    print(f"  Columns: {df.columns}")
+    
+    # Vérifier set_context
+    if "set_context" in df.columns:
+        set_dist = df.group_by("set_context").len().sort("len", descending=True)
+        print(f"\n  Set contexts:")
+        for row in set_dist.iter_rows(named=True):
+            print(f"    {row['set_context']}: {row['len']:,}")
+    
+    return df
+
+
+# ===============================================
+# SECTION 1: EXTRACT SET-LEVEL STATS
+# ===============================================
+
+def extract_set_stats(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Version OPTIMISÉE - Pivot direct au lieu de joins en cascade.
+    Évite le OOM sur gros datasets.
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 1: EXTRACTING SET-LEVEL STATS (OPTIMIZED)")
+    print("=" * 60)
+    
+    # Normaliser set_context
+    df = df.with_columns([
+        pl.col("set_context")
+          .str.to_uppercase()
+          .str.replace("SET ", "SET_")
+          .str.replace(" ", "_")
+          .alias("set_norm")
+    ])
+    
+    # Filtrer AVANT toute opération lourde
+    valid_sets = ["OVERALL", "SET_1", "SET_2", "SET_3"]
+    stats_lower = [s.lower() for s in KEY_STATS]
+    
+    print(f"  Filtering for {len(KEY_STATS)} stats and {len(valid_sets)} sets...")
+    
+    filtered = df.filter(
+        (pl.col("stat_name").str.to_lowercase().is_in(stats_lower)) &
+        (pl.col("set_norm").is_in(valid_sets))
+    )
+    
+    print(f"  Filtered: {len(filtered):,} rows (from {len(df):,})")
+    
+    if len(filtered) == 0:
+        print("  ❌ No matching data!")
+        return None
+    
+    # Libérer mémoire
+    del df
+    gc.collect()
+    
+    # Créer clé combinée stat_set
+    value_col = "stat_pct" if "stat_pct" in filtered.columns else "stat_value"
+    
+    filtered = filtered.with_columns([
+        (pl.col("stat_name").str.to_lowercase() + "_" + 
+         pl.col("set_norm").str.to_lowercase())
+          .alias("stat_set_key"),
+        pl.col(value_col).cast(pl.Float32).alias("value")
+    ])
+    
+    # Garder seulement les colonnes nécessaires AVANT pivot
+    filtered = filtered.select([
+        "match_id", "player_id", "player_role", "stat_set_key", "value"
+    ])
+    
+    print(f"  Pivoting {filtered['stat_set_key'].n_unique()} unique stat-set combinations...")
+    
+    # Pivot en une seule opération
+    pivoted = filtered.pivot(
+        on="stat_set_key",
+        index=["match_id", "player_id", "player_role"],
+        values="value",
+        aggregate_function="first"
+    )
+    
+    del filtered
+    gc.collect()
+    
+    print(f"  ✅ Result: {len(pivoted):,} player-match rows")
+    print(f"  Columns ({len(pivoted.columns)}): {list(pivoted.columns)[:10]}...")
+    
+    # Afficher coverage
+    for col in pivoted.columns:
+        if col not in ["match_id", "player_id", "player_role"]:
+            cov = pivoted[col].is_not_null().mean()
+            if cov > 0.01:  # Seulement si >1% coverage
+                print(f"    {col}: {100*cov:.1f}%")
+    
+    return pivoted
+
+
+# ===============================================
+# SECTION 2: COMPUTE SET DYNAMICS FEATURES
+# ===============================================
+
+def compute_set_dynamics(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calcule les features de dynamique par set.
+    CORRIGÉ: utilise set_1, set_2, set_3 (avec underscore)
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 2: COMPUTING SET DYNAMICS FEATURES")
+    print("=" * 60)
+    
+    # Détecter les stats disponibles depuis les colonnes
+    available_cols = df.columns
+    print(f"  Available columns: {available_cols}")
+    
+    # Extraire les bases de stats (avant _overall, _set_1, etc.)
+    stat_bases = set()
+    for col in available_cols:
+        for suffix in ["_overall", "_set_1", "_set_2", "_set_3"]:
+            if col.endswith(suffix):
+                stat_bases.add(col.replace(suffix, ""))
+                break
+    
+    stat_bases = list(stat_bases)
+    print(f"  Stats detected: {stat_bases}")
+    
+    if not stat_bases:
+        print("  ⚠️ No stats found!")
+        return df
+    
+    features_to_add = []
+    
+    for stat in stat_bases:
+        # Noms avec underscore (set_1, set_2, set_3)
+        col_overall = f"{stat}_overall"
+        col_set1 = f"{stat}_set_1"
+        col_set2 = f"{stat}_set_2"
+        col_set3 = f"{stat}_set_3"
+        
+        # Vérifier disponibilité
+        has_overall = col_overall in available_cols
+        has_set1 = col_set1 in available_cols
+        has_set2 = col_set2 in available_cols
+        has_set3 = col_set3 in available_cols
+        
+        print(f"  {stat}: overall={has_overall}, set1={has_set1}, set2={has_set2}, set3={has_set3}")
+        
+        # Momentum SET1 → SET3 (positif = s'améliore)
+        if has_set1 and has_set3:
+            features_to_add.append(
+                (pl.col(col_set3) - pl.col(col_set1))
+                  .cast(pl.Float32)
+                  .alias(f"momentum_{stat}")
+            )
+        
+        # Slow starter score (SET2 + SET3) / 2 - SET1
+        if has_set1 and has_set2:
+            if has_set3:
+                features_to_add.append(
+                    ((pl.col(col_set2) + pl.col(col_set3)) / 2 - pl.col(col_set1))
+                      .cast(pl.Float32)
+                      .alias(f"slow_starter_{stat}")
+                )
+            else:
+                features_to_add.append(
+                    (pl.col(col_set2) - pl.col(col_set1))
+                      .cast(pl.Float32)
+                      .alias(f"slow_starter_{stat}")
+                )
+        
+        # Fast starter score (SET1 - moyenne autres sets)
+        if has_set1 and has_set2:
+            if has_set3:
+                features_to_add.append(
+                    (pl.col(col_set1) - (pl.col(col_set2) + pl.col(col_set3)) / 2)
+                      .cast(pl.Float32)
+                      .alias(f"fast_starter_{stat}")
+                )
+            else:
+                features_to_add.append(
+                    (pl.col(col_set1) - pl.col(col_set2))
+                      .cast(pl.Float32)
+                      .alias(f"fast_starter_{stat}")
+                )
+        
+        # Clutch (SET3 vs overall)
+        if has_set3 and has_overall:
+            features_to_add.append(
+                (pl.col(col_set3) - pl.col(col_overall))
+                  .cast(pl.Float32)
+                  .alias(f"clutch_set3_{stat}")
+            )
+    
+    print(f"\n  Adding {len(features_to_add)} individual features...")
+    
+    if features_to_add:
+        df = df.with_columns(features_to_add)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Composite scores
+    # ═══════════════════════════════════════════════════════════════
+    
+    momentum_cols = [c for c in df.columns if c.startswith("momentum_")]
+    slow_cols = [c for c in df.columns if c.startswith("slow_starter_")]
+    fast_cols = [c for c in df.columns if c.startswith("fast_starter_")]
+    clutch_cols = [c for c in df.columns if c.startswith("clutch_set3_")]
+    
+    composite_features = []
+    
+    if momentum_cols:
+        composite_features.append(
+            pl.mean_horizontal([pl.col(c) for c in momentum_cols])
+              .cast(pl.Float32)
+              .alias("momentum_composite")
+        )
+    
+    if slow_cols:
+        composite_features.append(
+            pl.mean_horizontal([pl.col(c) for c in slow_cols])
+              .cast(pl.Float32)
+              .alias("slow_starter_composite")
+        )
+    
+    if fast_cols:
+        composite_features.append(
+            pl.mean_horizontal([pl.col(c) for c in fast_cols])
+              .cast(pl.Float32)
+              .alias("fast_starter_composite")
+        )
+    
+    if clutch_cols:
+        composite_features.append(
+            pl.mean_horizontal([pl.col(c) for c in clutch_cols])
+              .cast(pl.Float32)
+              .alias("clutch_set3_composite")
+        )
+    
+    if composite_features:
+        df = df.with_columns(composite_features)
+    
+    print(f"  ✅ Total features added: {len(features_to_add) + len(composite_features)}")
+    
+    return df
+
+
+# ===============================================
+# SECTION 3: ROLLING SET DYNAMICS
+# ===============================================
+
+def build_rolling_set_dynamics(df: pl.DataFrame, matches_base: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calcule les rolling averages des set dynamics par joueur.
+    
+    ANTI-LEAKAGE: shift(1) avant rolling
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 3: ROLLING SET DYNAMICS")
+    print("=" * 60)
+    
+    # Colonnes de features à roller
+    feature_cols = [c for c in df.columns if any(c.startswith(p) for p in 
+                   ["momentum_", "slow_starter_", "fast_starter_", "clutch_set3_"])]
+    
+    if not feature_cols:
+        print("  ⚠️ No feature columns found!")
+        return df
+    
+    print(f"  Rolling {len(feature_cols)} features...")
+    
+    # Joindre avec matches_base pour avoir la date
+    if "tourney_date_ta" not in df.columns:
+        # Essayer de joindre avec matches_base
+        if matches_base is not None and "match_id" in df.columns:
+            # Créer mapping match_id -> date
+            if "match_id_ta_dedup" in matches_base.columns:
+                date_map = matches_base.select([
+                    pl.col("match_id_ta_dedup").alias("match_id"),
+                    "tourney_date_ta"
+                ]).unique()
+                df = df.join(date_map, on="match_id", how="left")
+    
+    # Trier
+    if "tourney_date_ta" in df.columns:
+        df = df.sort(["player_id", "tourney_date_ta", "match_id"])
+    else:
+        df = df.sort(["player_id", "match_id"])
+    
+    # Rolling avec shift
+    rolling_exprs = []
+    
+    for col in feature_cols:
+        # Rolling mean - UN SEUL .over() à la fin
+        rolling_exprs.append(
+            pl.col(col)
+              .shift(1)
+              .rolling_mean(window_size=ROLLING_WINDOW, min_samples=MIN_MATCHES)  # min_samples !
+              .over("player_id")  # UN SEUL .over()
+              .fill_nan(None)
+              .cast(pl.Float32)
+              .alias(f"r{ROLLING_WINDOW}_{col}")
+        )
+    
+    df = df.with_columns(rolling_exprs)
+    
+    # Stats
+    rolling_cols = [c for c in df.columns if c.startswith(f"r{ROLLING_WINDOW}_")]
+    print(f"  Added {len(rolling_cols)} rolling features")
+    
+    for col in rolling_cols[:5]:
+        cov = df[col].is_not_null().mean()
+        print(f"    {col}: {100*cov:.1f}% coverage")
+    
+    return df
+
+
+# ===============================================
+# SECTION 4: AGGREGATE TO MATCH LEVEL
+# ===============================================
+
+def aggregate_to_match_level(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Agrège les features au niveau match (A vs B).
+    CORRIGÉ: how='full' et gestion propre des colonnes
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 4: AGGREGATE TO MATCH LEVEL")
+    print("=" * 60)
+    
+    # Colonnes features (rolling ou non)
+    feature_cols = [c for c in df.columns if any(c.startswith(p) for p in 
+                   ["momentum_", "slow_starter_", "fast_starter_", "clutch_set3_",
+                    f"r{ROLLING_WINDOW}_"])]
+    
+    if not feature_cols:
+        print("  ⚠️ No feature columns to aggregate!")
+        # Retourner au moins match_id
+        return df.select(["match_id"]).unique()
+    
+    print(f"  Aggregating {len(feature_cols)} features...")
+    
+    # Séparer winners et losers
+    winners = df.filter(pl.col("player_role") == "winner").select(
+        ["match_id"] + feature_cols
+    )
+    losers = df.filter(pl.col("player_role") == "loser").select(
+        ["match_id"] + feature_cols
+    )
+    
+    # Renommer pour A (winner)
+    rename_a = {col: f"{col}_A" for col in feature_cols}
+    winners = winners.rename(rename_a)
+    
+    # Renommer pour B (loser)
+    rename_b = {col: f"{col}_B" for col in feature_cols}
+    losers = losers.rename(rename_b)
+    
+    # Merge - CORRIGÉ
+    match_df = winners.join(losers, on="match_id", how="full", coalesce=True)
+    
+    print(f"  Match-level rows: {len(match_df):,}")
+    
+    # Diffs A - B
+    diff_exprs = []
+    for col in feature_cols:
+        col_a = f"{col}_A"
+        col_b = f"{col}_B"
+        if col_a in match_df.columns and col_b in match_df.columns:
+            diff_exprs.append(
+                (pl.col(col_a) - pl.col(col_b))
+                  .cast(pl.Float32)
+                  .alias(f"diff_{col}")
+            )
+    
+    if diff_exprs:
+        match_df = match_df.with_columns(diff_exprs)
+    
+    print(f"  Final columns: {len(match_df.columns)}")
+    
+    return match_df
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    print("\n" + "=" * 70)
+    print("   PP07B - SET DYNAMICS FEATURES GOD SOTA 2026")
+    print("=" * 70)
+    print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+    
+    start_time = time.time()
+    
+    # 1. Load charting data
+    charting_df = load_charting_long()
+    
+    if charting_df is None:
+        print("\n❌ Cannot proceed without charting data!")
+        return None
+    
+    # 2. Extract set-level stats
+    set_stats = extract_set_stats(charting_df)
+    
+    if set_stats is None:
+        print("\n❌ Failed to extract set stats!")
+        return None
+    
+    del charting_df
+    gc.collect()
+    
+    # 3. Compute set dynamics features
+    set_dynamics = compute_set_dynamics(set_stats)
+    
+    # 4. Load matches_base for dates
+    matches_base = None
+    mb_path = DATA_CLEAN / "matches_base"
+    if mb_path.exists():
+        matches_base = pl.read_parquet(mb_path, columns=["match_id_ta_dedup", "tourney_date_ta", "custom_match_id"])
+    
+    # 5. Build rolling features
+    set_dynamics = build_rolling_set_dynamics(set_dynamics, matches_base)
+    
+    # 6. Aggregate to match level
+    match_level = aggregate_to_match_level(set_dynamics)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # SAVE
+    # ═══════════════════════════════════════════════════════════════
+    
+    output_path = OUTPUT_DIR / "set_dynamics_match_level.parquet"
+    match_level.write_parquet(output_path)
+    
+    print("\n" + "=" * 70)
+    print("   SUMMARY")
+    print("=" * 70)
+    print(f"  Output: {output_path}")
+    print(f"  Shape: {match_level.shape}")
+    print(f"  Time: {time.time() - start_time:.1f}s")
+    
+    # Feature list
+    feature_cols = [c for c in match_level.columns if c != "match_id"]
+    print(f"\n  📊 FEATURES ({len(feature_cols)}):")
+    for col in sorted(feature_cols)[:20]:
+        cov = match_level[col].is_not_null().mean()
+        print(f"     {col}: {100*cov:.1f}%")
+    
+    if len(feature_cols) > 20:
+        print(f"     ... and {len(feature_cols) - 20} more")
+    
+    print("\n" + "=" * 70)
+    print("   PP07B COMPLETE")
+    print("=" * 70)
+    
+    return match_level
+
+
+if __name__ == "__main__":
+    result = main()

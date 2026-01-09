@@ -1,0 +1,1351 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+   TENNISTITAN 2026 - PREPROCESS 2b: BOOKMAKER ODDS LAYER (GOD SOTA)
+================================================================================
+
+🎯 OBJECTIF: Intégrer les cotes bookmakers historiques pour Knowledge Distillation
+             Potentiel: +2-4% AUC (GAME CHANGER!)
+
+📥 INPUT:
+   - data_raw/atp_tennis.csv (fichier cotes)
+   - data_clean/matches_base/ (matchs de PP_01)
+
+📤 OUTPUT:
+   - data_clean/features/odds_layer/odds_features.parquet
+   - data_clean/features/odds_layer/matching_report.json
+
+🔧 STRATÉGIE DE MATCHING:
+   1. Normalisation des noms de joueurs (fuzzy matching)
+   2. Matching par: Date + Tournoi + Surface + Noms joueurs
+   3. Validation croisée: Score, Round
+   4. Fallback: Matching approximatif avec confiance score
+
+================================================================================
+"""
+
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import defaultdict
+import time
+import json
+import re
+import unicodedata
+import warnings
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import polars as pl
+
+# Optionnel mais recommandé pour fuzzy matching
+try:
+    from rapidfuzz import fuzz, process
+    HAS_RAPIDFUZZ = True
+except ImportError:
+    HAS_RAPIDFUZZ = False
+    print("⚠️ rapidfuzz non installé. pip install rapidfuzz pour un meilleur matching")
+
+warnings.filterwarnings('ignore')
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_RAW = ROOT / "data_raw"
+DATA_CLEAN = ROOT / "data_clean"
+FEATURES_DIR = DATA_CLEAN / "features"
+ODDS_DIR = FEATURES_DIR / "odds_layer"
+ODDS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Fichier de cotes
+ODDS_FILE = DATA_RAW / "atp_tennis.csv"
+
+# Matches de base (sortie de PP_01)
+MATCHES_BASE_DIR = DATA_CLEAN / "matches_base"
+
+# Seuils de matching
+MIN_NAME_SIMILARITY = 75  # Score minimum pour fuzzy matching
+DATE_TOLERANCE_DAYS = 2   # Tolérance de date pour le matching
+
+# ===============================================
+# SECTION A: NORMALISATION DES NOMS
+# ===============================================
+
+def normalize_name(name: str) -> str:
+    """
+    Normalise un nom de joueur pour le matching.
+    
+    Exemples:
+    - "Nishioka Y." → "nishioka y"
+    - "Yoshihito Nishioka" → "yoshihito nishioka"
+    - "Djokovic N." → "djokovic n"
+    - "Novak Djokovic" → "novak djokovic"
+    """
+    if not name or not isinstance(name, str):
+        return ""
+    
+    # Lowercase
+    name = name.lower().strip()
+    
+    # Remove accents
+    name = unicodedata.normalize('NFKD', name)
+    name = ''.join(c for c in name if not unicodedata.combining(c))
+    
+    # Remove punctuation except spaces
+    name = re.sub(r'[^\w\s]', '', name)
+    
+    # Normalize whitespace
+    name = ' '.join(name.split())
+    
+    return name
+
+def norm_surface(x: str) -> str:
+    s = normalize_name(x)
+    if s in ("hard", "h"):
+        return "hard"
+    if s in ("clay", "c"):
+        return "clay"
+    if s in ("grass", "g"):
+        return "grass"
+    if s in ("carpet", "cp", "p"):
+        return "carpet"
+    return s or "unk"
+
+def week_start_expr(date_col: str) -> pl.Expr:
+    # lundi de la semaine (0=Monday)
+    return (pl.col(date_col) - pl.duration(days=pl.col(date_col).dt.weekday()))
+
+def extract_surname(name: str) -> str:
+    """Extrait le nom de famille (généralement le premier mot long)."""
+    name = normalize_name(name)
+    parts = name.split()
+    
+    if not parts:
+        return ""
+    
+    # Chercher le mot le plus long (probablement le nom de famille)
+    surnames = [p for p in parts if len(p) > 2]
+    
+    if surnames:
+        return surnames[0]
+    return parts[0]
+
+
+def create_name_key(name: str) -> str:
+    """
+    Crée une clé de nom pour le matching rapide.
+    
+    "Nishioka Y." → "nishioka"
+    "Yoshihito Nishioka" → "nishioka"
+    """
+    return extract_surname(name)
+
+
+def match_player_names(name1: str, name2: str) -> Tuple[bool, float]:
+    """
+    Compare deux noms de joueurs avec plusieurs stratégies.
+    
+    Returns:
+        (is_match, confidence_score)
+    """
+    n1 = normalize_name(name1)
+    n2 = normalize_name(name2)
+    
+    # Exact match
+    if n1 == n2:
+        return True, 100.0
+    
+    # Surname match
+    s1 = extract_surname(name1)
+    s2 = extract_surname(name2)
+    
+    if s1 and s2 and s1 == s2:
+        return True, 95.0
+    
+    # Fuzzy matching
+    if HAS_RAPIDFUZZ:
+        # Token sort ratio (insensible à l'ordre)
+        score = fuzz.token_sort_ratio(n1, n2)
+        if score >= MIN_NAME_SIMILARITY:
+            return True, score
+        
+        # Partial ratio (pour les noms abrégés)
+        partial_score = fuzz.partial_ratio(s1, s2)
+        if partial_score >= 90:
+            return True, partial_score * 0.9
+    else:
+        # Fallback: simple surname match
+        if s1 and s2 and (s1 in s2 or s2 in s1):
+            return True, 85.0
+    
+    return False, 0.0
+
+
+# ===============================================
+# SECTION B: CHARGEMENT DES DONNÉES
+# ===============================================
+
+def load_odds_data() -> pl.DataFrame:
+    """Charge et nettoie les données de cotes."""
+    
+    print("\n" + "=" * 60)
+    print("   LOAD ODDS DATA")
+    print("=" * 60)
+    
+    if not ODDS_FILE.exists():
+        print(f"❌ Fichier de cotes non trouvé: {ODDS_FILE}")
+        print("   Vérifie que atp_tennis.csv est dans data_raw/")
+        return pl.DataFrame()
+    
+    # Charger le CSV
+    odds = pl.read_csv(
+        ODDS_FILE,
+        infer_schema_length=10000,
+        null_values=["", "NA", "N/A"],
+    )
+    
+    print(f"  📂 Fichier: {ODDS_FILE}")
+    print(f"  📊 Lignes brutes: {len(odds):,}")
+    print(f"  📋 Colonnes: {odds.columns}")
+    
+    # Vérifier les colonnes requises
+    required_cols = ["Tournament", "Date", "Player_1", "Player_2", "Odd_1", "Odd_2", "Winner"]
+    missing = [c for c in required_cols if c not in odds.columns]
+    if missing:
+        print(f"❌ Colonnes manquantes: {missing}")
+        return pl.DataFrame()
+    
+    # Nettoyage
+    odds = odds.with_columns([
+        pl.col("Date").str.strptime(pl.Date, "%Y-%m-%d", strict=False).alias("date_parsed"),
+    
+        pl.col("Tournament").str.to_lowercase().str.strip_chars().alias("tourney_norm"),
+        pl.col("Surface").map_elements(norm_surface, return_dtype=pl.String).alias("surface_norm"),
+    
+        pl.col("Odd_1").cast(pl.Float64, strict=False).alias("Odd_1"),
+        pl.col("Odd_2").cast(pl.Float64, strict=False).alias("Odd_2"),
+    ])
+    
+    # ✅ FIX: -1 / <=1 => null (missing)
+    odds = odds.with_columns([
+        pl.when(pl.col("Odd_1") <= 1.0).then(None).otherwise(pl.col("Odd_1")).alias("Odd_1"),
+        pl.when(pl.col("Odd_2") <= 1.0).then(None).otherwise(pl.col("Odd_2")).alias("Odd_2"),
+    ])
+    
+    # ✅ week_start (pour matcher avec tourney_date_ta)
+    odds = odds.with_columns([
+        week_start_expr("date_parsed").alias("week_start")
+    ])
+    
+    # Filtrer les lignes valides (après cleaning)
+    odds = odds.filter(
+        pl.col("date_parsed").is_not_null() &
+        pl.col("Odd_1").is_not_null() &
+        pl.col("Odd_2").is_not_null()
+    )
+
+    
+    # Ajouter les clés de matching
+    odds = odds.with_columns([
+        pl.col("Player_1").map_elements(create_name_key, return_dtype=pl.String).alias("p1_key"),
+        pl.col("Player_2").map_elements(create_name_key, return_dtype=pl.String).alias("p2_key"),
+        pl.col("Winner").map_elements(create_name_key, return_dtype=pl.String).alias("winner_key"),
+    ])
+    
+    # Stats
+    print(f"\n  ✅ Lignes valides: {len(odds):,}")
+    print(f"  📅 Période: {odds['date_parsed'].min()} → {odds['date_parsed'].max()}")
+    print(f"  🎾 Tournois: {odds['Tournament'].n_unique()}")
+    
+    return odds
+
+
+def load_matches_data() -> pl.DataFrame:
+    """Charge les matchs de base (sortie de PP_01)."""
+    
+    print("\n" + "=" * 60)
+    print("   LOAD MATCHES DATA")
+    print("=" * 60)
+    
+    if not MATCHES_BASE_DIR.exists():
+        print(f"❌ Dossier non trouvé: {MATCHES_BASE_DIR}")
+        return pl.DataFrame()
+    
+    # ✅ FIX: Polars lit automatiquement les dossiers partitionnés Hive-style
+    try:
+        matches = pl.read_parquet(MATCHES_BASE_DIR)
+    except Exception as e:
+        print(f"❌ Erreur lecture: {e}")
+        return pl.DataFrame()
+    
+    print(f"  📊 Matchs: {len(matches):,}")
+    
+    # Préparer les colonnes de matching
+    available_cols = matches.columns
+    
+    date_col = None
+    for col in ["tourney_date_parsed", "tourney_date_ta", "tourney_date"]:
+        if col in available_cols:
+            date_col = col
+            break
+    
+    if date_col:
+        # Parser la date si nécessaire
+        if matches[date_col].dtype == pl.String:
+            matches = matches.with_columns([
+                pl.col(date_col).str.strptime(pl.Date, "%Y%m%d", strict=False).alias("match_date")
+            ])
+        elif matches[date_col].dtype == pl.Date:
+            matches = matches.with_columns([
+                pl.col(date_col).alias("match_date")
+            ])
+        else:
+            matches = matches.with_columns([
+                pl.col(date_col).cast(pl.String).str.strptime(pl.Date, "%Y%m%d", strict=False).alias("match_date")
+            ])
+
+    # ✅ week_start DOIT être fait après le parsing, quel que soit le cas
+    matches = matches.with_columns([
+        week_start_expr("match_date").alias("week_start")
+    ])
+    # Colonnes de noms
+    winner_col = "winner_name" if "winner_name" in available_cols else None
+    loser_col = "loser_name" if "loser_name" in available_cols else None
+    
+    if winner_col and loser_col:
+        matches = matches.with_columns([
+            pl.col(winner_col).map_elements(create_name_key, return_dtype=pl.String).alias("winner_key"),
+            pl.col(loser_col).map_elements(create_name_key, return_dtype=pl.String).alias("loser_key"),
+        ])
+    
+    # Normaliser tourney/surface
+    tourney_col = "tourney_name_ta" if "tourney_name_ta" in available_cols else "tourney_name"
+    surface_col = "tourney_surface_ta" if "tourney_surface_ta" in available_cols else "surface"
+    
+    if tourney_col in available_cols:
+        matches = matches.with_columns([
+            pl.col(tourney_col).str.to_lowercase().str.strip_chars().alias("tourney_norm")
+        ])
+    
+    if surface_col in available_cols:
+        matches = matches.with_columns([
+            pl.col(surface_col).map_elements(norm_surface, return_dtype=pl.String).alias("surface_norm")
+        ])
+    
+    print(f"  📅 Période: {matches['match_date'].min()} → {matches['match_date'].max()}")
+    
+    return matches
+
+
+# ===============================================
+# SECTION C: MATCHING ALGORITHM v2 (ROBUST)
+# ===============================================
+
+def normalize_score(score: str) -> str:
+    """Normalise un score pour comparaison."""
+    if not score or not isinstance(score, str):
+        return ""
+    # Garder uniquement chiffres et tirets
+    score = re.sub(r'[^0-9\-]', '-', score)
+    # Normaliser les séparateurs
+    score = re.sub(r'-+', '-', score)
+    score = score.strip('-')
+    return score
+
+
+def extract_surname_robust(name: str) -> str:
+    """
+    Extrait le nom de famille de façon robuste.
+    
+    "Nishioka Y." → "nishioka"
+    "Yoshihito Nishioka" → "nishioka"
+    "Djokovic N." → "djokovic"
+    "Novak Djokovic" → "djokovic"
+    """
+    if not name or not isinstance(name, str):
+        return ""
+    
+    name = normalize_name(name)
+    parts = name.split()
+    
+    if not parts:
+        return ""
+    
+    # Si format "Nom X." (nom de famille en premier, initiale en dernier)
+    # Le premier mot long est le nom de famille
+    if len(parts) >= 2 and len(parts[-1]) <= 2:
+        return parts[0]
+    
+    # Si format "Prénom Nom" (prénom en premier)
+    # Le dernier mot long est le nom de famille
+    long_parts = [p for p in parts if len(p) > 2]
+    if long_parts:
+        return long_parts[-1]
+    
+    return parts[0]
+
+def name_sig(name: str) -> str:
+    """
+    Crée une signature nom_initiale pour anti-collision.
+    
+    "Dosedel S." → "dosedel_s"
+    "Novak Djokovic" → "djokovic_n"
+    """
+    n = normalize_name(name)
+    parts = n.split()
+    if not parts:
+        return ""
+    # Cas "dosedel s" => surname = dosedel, initial = s
+    if len(parts) >= 2 and len(parts[-1]) <= 2:
+        return f"{parts[0]}_{parts[-1][0]}"
+    # Cas "novak djokovic" => surname = djokovic, initial = n
+    if len(parts) >= 2:
+        return f"{parts[-1]}_{parts[0][0]}"
+    return parts[0]
+    
+def match_odds_to_matches_v2(odds: pl.DataFrame, matches: pl.DataFrame) -> pl.DataFrame:
+    """
+    Matching ROBUST v2:
+    1. Nom de famille (fuzzy)
+    2. Date ± 7 jours
+    3. Nom adversaire
+    4. Score (confirmation)
+    """
+    
+    print("\n" + "=" * 60)
+    print("   MATCHING ODDS TO MATCHES (v2 ROBUST)")
+    print("=" * 60)
+    
+    t0 = time.perf_counter()
+    
+    # Préparer les clés de matching pour odds
+    odds_records = odds.to_dicts()
+    
+    # Ajouter les noms de famille normalisés
+    for row in odds_records:
+        row["p1_surname"] = extract_surname_robust(row.get("Player_1", ""))
+        row["p2_surname"] = extract_surname_robust(row.get("Player_2", ""))
+        row["p1_sig"] = name_sig(row.get("Player_1", ""))  # ✅ Anti-collision
+        row["p2_sig"] = name_sig(row.get("Player_2", ""))  # ✅ Anti-collision
+        row["score_norm"] = normalize_score(row.get("Score", ""))
+    
+    # Préparer matches avec index par date (±7 jours)
+    matches_records = matches.to_dicts()
+    
+    # Ajouter les noms de famille normalisés
+    # Ajouter les noms de famille normalisés + signatures
+    for row in matches_records:
+        row["winner_surname"] = extract_surname_robust(row.get("winner_name", ""))
+        row["loser_surname"] = extract_surname_robust(row.get("loser_name", ""))
+        row["winner_sig"] = name_sig(row.get("winner_name", ""))  # ✅ Anti-collision
+        row["loser_sig"] = name_sig(row.get("loser_name", ""))    # ✅ Anti-collision
+        row["score_norm"] = normalize_score(row.get("score_ta", ""))
+    
+    # Index par date (avec tolérance ±7 jours)
+    DATE_TOLERANCE = 7
+    matches_by_date = defaultdict(list)
+    
+    for i, m in enumerate(matches_records):
+        d = m.get("match_date")
+        if d:
+            for delta in range(-DATE_TOLERANCE, DATE_TOLERANCE + 1):
+                matches_by_date[d + timedelta(days=delta)].append(i)
+
+    
+    # Matching
+    matched = 0
+    unmatched = 0
+    match_results = []
+    
+    print(f"  🔍 Matching {len(odds_records):,} cotes...")
+    print(f"  📅 Matching par date (±{DATE_TOLERANCE} jours)")
+
+
+    
+    for odds_idx, odds_row in enumerate(odds_records):
+        if odds_idx % 10000 == 0:
+            print(f"     Progression: {odds_idx:,}/{len(odds_records):,} (matchés: {matched:,})")
+        
+        odds_date = odds_row.get("date_parsed")
+        if not odds_date:
+            unmatched += 1
+            continue
+        
+        p1_surname = odds_row["p1_surname"]
+        p2_surname = odds_row["p2_surname"]
+        odds_score = odds_row["score_norm"]
+        
+        if not p1_surname or not p2_surname:
+            unmatched += 1
+            continue
+        
+        # Candidats par date (±7 jours)
+        odds_date = odds_row.get("date_parsed")
+        candidate_indices = set(matches_by_date.get(odds_date, []))
+        
+        if not candidate_indices:
+            unmatched += 1
+            continue
+        
+        # Chercher le meilleur match
+        best_match = None
+        best_score = 0
+        
+        for m_idx in candidate_indices:
+            match_row = matches_records[m_idx]
+            winner_surname = match_row["winner_surname"]
+            loser_surname = match_row["loser_surname"]
+            match_score = match_row["score_norm"]
+            
+            if not winner_surname or not loser_surname:
+                continue
+            
+            # Stratégie 1: P1=Winner, P2=Loser
+            if p1_surname == winner_surname and p2_surname == loser_surname:
+                score = 80
+                
+                # Bonus si score correspond
+                if odds_score and match_score and odds_score == match_score:
+                    score += 20  # → 100
+                elif odds_score and match_score and (odds_score in match_score or match_score in odds_score):
+                    score += 15  # → 95
+                
+                # ---- soft scoring (après avoir fixé score=80/50/etc) ----
+                bonus = 0
+                
+                # ✅ Surface soft scoring
+                os = odds_row.get("surface_norm")
+                ms = match_row.get("surface_norm")
+                if os and ms and os != "unk" and ms != "unk":
+                    if os == ms:
+                        bonus += 6
+                    else:
+                        bonus -= 2   # <-- petit malus seulement
+                
+                # ✅ Tourney soft scoring (exact + fuzzy)
+                ot = odds_row.get("tourney_norm")
+                mt = match_row.get("tourney_norm")
+                if ot and mt:
+                    if ot == mt:
+                        bonus += 8
+                    elif HAS_RAPIDFUZZ:
+                        tscore = fuzz.token_set_ratio(ot, mt)
+                        if tscore >= 90:
+                            bonus += 6
+                        elif tscore >= 80:
+                            bonus += 3
+                        elif tscore <= 50:
+                            bonus -= 2  # <-- petit malus seulement
+                    else:
+                        if ot in mt or mt in ot:
+                            bonus += 2
+                
+                # ✅ Sig bonus (anti-collisions) -> AVANT clamp (STRAT 1)
+                if odds_row.get("p1_sig") and match_row.get("winner_sig") and odds_row["p1_sig"] == match_row["winner_sig"]:
+                    bonus += 6
+                if odds_row.get("p2_sig") and match_row.get("loser_sig") and odds_row["p2_sig"] == match_row["loser_sig"]:
+                    bonus += 6
+
+                
+                score = score + bonus
+                score = max(0, min(100, score))
+                        
+                if score > best_score:
+                    best_score = score
+                    best_match = {
+                        "match_idx": m_idx,
+                        "odds_winner": odds_row.get("Odd_1"),
+                        "odds_loser": odds_row.get("Odd_2"),
+                        "confidence": score,
+                        "match_type": "P1=W,P2=L",
+                    }
+            
+            # Stratégie 2: P1=Loser, P2=Winner
+            if p1_surname == loser_surname and p2_surname == winner_surname:
+                score = 80
+                
+                # Bonus si score correspond
+                if odds_score and match_score and odds_score == match_score:
+                    score += 20
+                elif odds_score and match_score and (odds_score in match_score or match_score in odds_score):
+                    score += 15
+                
+                # ---- soft scoring (après avoir fixé score=80/50/etc) ----
+                bonus = 0
+                
+                # ✅ Surface soft scoring
+                os = odds_row.get("surface_norm")
+                ms = match_row.get("surface_norm")
+                if os and ms and os != "unk" and ms != "unk":
+                    if os == ms:
+                        bonus += 6
+                    else:
+                        bonus -= 2   # <-- petit malus seulement
+                
+                # ✅ Tourney soft scoring (exact + fuzzy)
+                ot = odds_row.get("tourney_norm")
+                mt = match_row.get("tourney_norm")
+                if ot and mt:
+                    if ot == mt:
+                        bonus += 8
+                    elif HAS_RAPIDFUZZ:
+                        tscore = fuzz.token_set_ratio(ot, mt)
+                        if tscore >= 90:
+                            bonus += 6
+                        elif tscore >= 80:
+                            bonus += 3
+                        elif tscore <= 50:
+                            bonus -= 2  # <-- petit malus seulement
+                    else:
+                        if ot in mt or mt in ot:
+                            bonus += 2
+                
+                # ----------------------------------------------
+
+                # ✅ Sig bonus (anti-collisions) -> AVANT clamp
+                if odds_row.get("p1_sig") and match_row.get("winner_sig"):
+                    if odds_row["p1_sig"] == match_row["winner_sig"]:
+                        bonus += 6
+                if odds_row.get("p2_sig") and match_row.get("loser_sig"):
+                    if odds_row["p2_sig"] == match_row["loser_sig"]:
+                        bonus += 6
+                
+                score = score + bonus
+                score = max(0, min(100, score))
+                        
+                if score > best_score:
+                    best_score = score
+                    best_match = {
+                        "match_idx": m_idx,
+                        "odds_winner": odds_row.get("Odd_2"),  # P2 est winner
+                        "odds_loser": odds_row.get("Odd_1"),   # P1 est loser
+                        "confidence": score,
+                        "match_type": "P1=L,P2=W",
+                    }
+            
+            # Stratégie 3: Match partiel (un seul nom match)
+            if best_score < 60:
+                partial_match = False
+                if (p1_surname == winner_surname or p2_surname == winner_surname) and \
+                   (p1_surname == loser_surname or p2_surname == loser_surname):
+                    partial_match = True
+                
+                if partial_match:
+                    score = 50
+                    if odds_score and match_score and odds_score == match_score:
+                        score = 70
+                    
+                    # ✅ Soft scoring léger pour partial
+                    bonus = 0
+                    
+                    os = odds_row.get("surface_norm")
+                    ms = match_row.get("surface_norm")
+                    if os and ms and os != "unk" and ms != "unk":
+                        bonus += 2 if os == ms else -1
+                    
+                    ot = odds_row.get("tourney_norm")
+                    mt = match_row.get("tourney_norm")
+                    if ot and mt:
+                        if ot == mt:
+                            bonus += 3
+                        elif HAS_RAPIDFUZZ:
+                            tscore = fuzz.token_set_ratio(ot, mt)
+                            if tscore >= 90:
+                                bonus += 2
+                            elif tscore <= 50:
+                                bonus -= 1
+                    
+                    # Sig bonus (léger)
+                    if odds_row.get("p1_sig") and match_row.get("winner_sig"):
+                        if odds_row["p1_sig"] == match_row["winner_sig"]:
+                            bonus += 2
+                    if odds_row.get("p2_sig") and match_row.get("loser_sig"):
+                        if odds_row["p2_sig"] == match_row["loser_sig"]:
+                            bonus += 2
+                    
+                    score = max(0, min(100, score + bonus))
+                    
+                    if score > best_score:
+                        best_score = score
+                        # Déterminer l'ordre
+                        if p1_surname == winner_surname or p2_surname == loser_surname:
+                            odds_w, odds_l = odds_row.get("Odd_1"), odds_row.get("Odd_2")
+                        else:
+                            odds_w, odds_l = odds_row.get("Odd_2"), odds_row.get("Odd_1")
+                        
+                        best_match = {
+                            "match_idx": m_idx,
+                            "odds_winner": odds_w,
+                            "odds_loser": odds_l,
+                            "confidence": score,
+                            "match_type": "partial",
+                        }
+        
+        if best_match and best_score >= 50:
+            match_results.append(best_match)
+            matched += 1
+        else:
+            unmatched += 1
+    
+    elapsed = time.perf_counter() - t0
+    
+    print(f"\n  ⏱️  Temps: {elapsed:.1f}s")
+    print(f"  ✅ Matchés: {matched:,} ({100*matched/len(odds_records):.1f}%)")
+    print(f"  ❌ Non matchés: {unmatched:,}")
+    
+    # Stats par type de match
+    if match_results:
+        types = defaultdict(int)
+        for m in match_results:
+            types[m.get("match_type", "unknown")] += 1
+        print(f"  📊 Par type: {dict(types)}")
+    
+    # Créer DataFrame
+    if match_results:
+        results_df = pl.DataFrame(match_results)
+        return results_df
+    
+    return pl.DataFrame()
+
+# ===============================================
+# SECTION D: CALCUL DES FEATURES DE COTES
+# ===============================================
+
+def compute_odds_features(matches: pl.DataFrame, match_results: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calcule les features de cotes pour chaque match.
+    
+    Features créées:
+    - odds_winner, odds_loser: Cotes brutes
+    - odds_implied_prob_winner/loser: Probabilités implicites normalisées
+    - diff_odds_implied: Différence de proba
+    - log_odds_ratio: Log ratio des cotes
+    - bookmaker_margin: Marge du bookmaker
+    - odds_value: Value = P(model) - P(odds) [après training]
+    """
+    
+    print("\n" + "=" * 60)
+    print("   COMPUTE ODDS FEATURES")
+    print("=" * 60)
+    
+    # Joindre les résultats de matching avec les matchs
+    # match_results contient match_idx → index dans matches
+    
+    # Extraire les colonnes essentielles des matchs
+    match_id_col = None
+    for col in ["custom_match_id", "match_id_ta_dedup", "match_id"]:
+        if col in matches.columns:
+            match_id_col = col
+            break
+    
+    if not match_id_col:
+        print("❌ Pas de colonne match_id trouvée")
+        return pl.DataFrame()
+    
+    # Ajouter l'index aux matchs
+    matches_with_idx = matches.with_row_index("_idx")
+    
+    # Joindre
+    merged = match_results.join(
+        matches_with_idx.select(["_idx", match_id_col]),
+        left_on="match_idx",
+        right_on="_idx",
+        how="left"
+    )
+    
+    # Calculer les features
+    merged = merged.with_columns([
+        # Probabilités implicites brutes
+        (1.0 / pl.col("odds_winner")).alias("raw_implied_winner"),
+        (1.0 / pl.col("odds_loser")).alias("raw_implied_loser"),
+    ])
+    
+    # Total pour normalisation (enlever la marge)
+    merged = merged.with_columns([
+        (pl.col("raw_implied_winner") + pl.col("raw_implied_loser")).alias("total_implied"),
+    ])
+    
+    # Features finales
+    merged = merged.with_columns([
+        # Probabilités normalisées
+        (pl.col("raw_implied_winner") / pl.col("total_implied"))
+        .cast(pl.Float32).alias("odds_implied_prob_winner"),
+        
+        (pl.col("raw_implied_loser") / pl.col("total_implied"))
+        .cast(pl.Float32).alias("odds_implied_prob_loser"),
+        
+        # Marge bookmaker (indicateur de liquidité/confiance)
+        (pl.col("total_implied") - 1.0)
+        .cast(pl.Float32).alias("bookmaker_margin"),
+        
+        # Log odds ratio
+        (pl.col("odds_loser").log() - pl.col("odds_winner").log())
+        .cast(pl.Float32).alias("log_odds_ratio"),
+        
+        # Confiance du matching
+        pl.col("confidence").cast(pl.Float32).alias("odds_match_confidence"),
+    ])
+
+    # ✅ SOTA DEDUP: keep best odds per match_id (confidence max, margin min)
+    merged = merged.with_columns([
+        (pl.col("raw_implied_winner") + pl.col("raw_implied_loser") - 1.0)
+          .cast(pl.Float32).alias("_margin_tmp")
+    ])
+    
+    merged = (
+        merged
+        .sort(
+            by=["odds_match_confidence", "_margin_tmp"],
+            descending=[True, False]  # max confidence, then min margin
+        )
+        .unique(subset=[match_id_col], keep="first")
+    )
+    
+    # Cleanup temp column
+    merged = merged.drop("_margin_tmp")
+    
+    print(f"  🔄 Après dedup SOTA: {len(merged):,} matchs uniques")
+    
+    # Sélectionner les colonnes finales
+    output_cols = [
+        match_id_col,
+        "odds_winner",
+        "odds_loser", 
+        "odds_implied_prob_winner",
+        "odds_implied_prob_loser",
+        "bookmaker_margin",
+        "log_odds_ratio",
+        "odds_match_confidence",
+    ]
+    
+    output = merged.select([c for c in output_cols if c in merged.columns])
+    
+    # Stats
+    print(f"  📊 Matchs avec cotes: {len(output):,}")
+    print(f"  📈 Odds winner mean: {output['odds_winner'].mean():.2f}")
+    print(f"  📉 Odds loser mean: {output['odds_loser'].mean():.2f}")
+    print(f"  💰 Marge bookmaker mean: {output['bookmaker_margin'].mean()*100:.1f}%")
+    
+    return output
+
+
+# ===============================================
+# SECTION E: ODDS LONG FORMAT (NASA SOTA - NO LEAK)
+# ===============================================
+
+def create_odds_long_format(odds_features: pl.DataFrame, matches: pl.DataFrame) -> pl.DataFrame:
+    """
+    Convertit les odds winner/loser en format long (match_id, player_id).
+    
+    ✅ NASA SOTA: Ce format permet de merger via player_id, SANS jamais utiliser target.
+    ✅ Fonctionne AVANT et APRÈS shuffle A/B.
+    
+    Output schema:
+        - custom_match_id
+        - player_id
+        - odds
+        - odds_implied_prob
+        - bookmaker_margin (si disponible)
+        - odds_match_confidence (si disponible)
+    """
+    
+    print("\n" + "=" * 60)
+    print("   CREATE ODDS LONG FORMAT (NASA SOTA)")
+    print("=" * 60)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FIX #1: Standardiser match_id_col - DOIT être custom_match_id
+    # ═══════════════════════════════════════════════════════════════
+    match_id_col = "custom_match_id"
+    
+    if match_id_col not in odds_features.columns:
+        raise ValueError(
+            f"❌ {match_id_col} non trouvé dans odds_features.\n"
+            f"   Colonnes disponibles: {odds_features.columns}\n"
+            f"   → Assure-toi que PP02B utilise custom_match_id partout."
+        )
+    
+    if match_id_col not in matches.columns:
+        raise ValueError(
+            f"❌ {match_id_col} non trouvé dans matches.\n"
+            f"   Colonnes disponibles: {matches.columns[:20]}...\n"
+            f"   → Assure-toi que matches_base contient custom_match_id."
+        )
+    
+    # Joindre pour récupérer winner_id / loser_id
+    merged = odds_features.join(
+        matches.select([match_id_col, "winner_id", "loser_id"]),
+        on=match_id_col,
+        how="left"
+    )
+    
+    print(f"  📊 Matchs avec odds: {len(merged):,}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FIX #4: Sélection de colonnes robuste
+    # ═══════════════════════════════════════════════════════════════
+    optional_cols = ["bookmaker_margin", "odds_match_confidence"]
+    available_optional = [c for c in optional_cols if c in merged.columns]
+    
+    print(f"  📋 Colonnes optionnelles disponibles: {available_optional}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FIX #3: Ne PAS inclure log_odds_ratio ici (sera calculé après join A/B)
+    # On garde uniquement: odds, implied_prob, et métadonnées
+    # ═══════════════════════════════════════════════════════════════
+    
+    # Colonnes de base
+    base_cols_winner = [
+        pl.col(match_id_col),
+        pl.col("winner_id").cast(pl.Utf8).alias("player_id"),
+        pl.col("odds_winner").alias("odds"),
+        pl.col("odds_implied_prob_winner").alias("odds_implied_prob"),
+    ]
+    
+    base_cols_loser = [
+        pl.col(match_id_col),
+        pl.col("loser_id").cast(pl.Utf8).alias("player_id"),
+        pl.col("odds_loser").alias("odds"),
+        pl.col("odds_implied_prob_loser").alias("odds_implied_prob"),
+    ]
+    
+    # Ajouter colonnes optionnelles si disponibles
+    for col in available_optional:
+        base_cols_winner.append(pl.col(col))
+        base_cols_loser.append(pl.col(col))
+    
+    # Format long: une ligne par (match, player)
+    winner_rows = merged.select(base_cols_winner)
+    loser_rows = merged.select(base_cols_loser)
+    
+    # Concat
+    odds_long = pl.concat([winner_rows, loser_rows])
+    
+    # Cast types
+    odds_long = odds_long.with_columns([
+        pl.col("odds").cast(pl.Float32),
+        pl.col("odds_implied_prob").cast(pl.Float32),
+    ])
+    
+    for col in available_optional:
+        odds_long = odds_long.with_columns([
+            pl.col(col).cast(pl.Float32)
+        ])
+    
+    # Supprimer les doublons éventuels
+    odds_long = odds_long.unique(subset=[match_id_col, "player_id"], keep="first")
+    
+    print(f"  ✅ Format long créé: {len(odds_long):,} rows")
+    print(f"  📊 Colonnes: {odds_long.columns}")
+    
+    return odds_long
+
+
+def attach_odds_AB_no_leak(
+    matches_df: pl.DataFrame,
+    odds_long: pl.DataFrame,
+    match_id_col: str = "custom_match_id",
+    playerA_col: str = "winner_id",
+    playerB_col: str = "loser_id",
+) -> pl.DataFrame:
+    """
+    Attache les odds A/B via player_id, SANS utiliser target.
+    
+    ✅ NASA SOTA: Fonctionne AVANT et APRÈS shuffle !
+    """
+    
+    print("\n" + "=" * 60)
+    print("   ATTACH ODDS A/B (NASA SOTA - NO LEAK)")
+    print("=" * 60)
+    
+    print(f"  📋 Match ID col: {match_id_col}")
+    print(f"  📋 Player A col: {playerA_col}")
+    print(f"  📋 Player B col: {playerB_col}")
+    
+    # Vérifications
+    if match_id_col not in matches_df.columns:
+        raise ValueError(f"❌ Colonne {match_id_col} non trouvée dans matches_df")
+    if playerA_col not in matches_df.columns:
+        raise ValueError(f"❌ Colonne {playerA_col} non trouvée dans matches_df")
+    if playerB_col not in matches_df.columns:
+        raise ValueError(f"❌ Colonne {playerB_col} non trouvée dans matches_df")
+    if match_id_col not in odds_long.columns:
+        raise ValueError(f"❌ Colonne {match_id_col} non trouvée dans odds_long")
+    
+    # Colonnes optionnelles
+    optional_cols = ["bookmaker_margin", "odds_match_confidence"]
+    available_optional = [c for c in optional_cols if c in odds_long.columns]
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FIX RETOUR 2: Cast en Float64 AVANT les joins
+    # ═══════════════════════════════════════════════════════════════
+    odds_long_typed = odds_long.with_columns([
+        pl.col("odds").cast(pl.Float64),
+        pl.col("odds_implied_prob").cast(pl.Float64),
+    ])
+    for col in available_optional:
+        odds_long_typed = odds_long_typed.with_columns([
+            pl.col(col).cast(pl.Float64)
+        ])
+    
+    # Préparer odds pour A
+    cols_A = [
+        pl.col(match_id_col),
+        pl.col("player_id").alias("_player_id_A"),
+        pl.col("odds").alias("odds_A"),
+        pl.col("odds_implied_prob").alias("odds_implied_prob_A"),
+    ]
+    for col in available_optional:
+        cols_A.append(pl.col(col))
+    
+    odds_A = odds_long_typed.select(cols_A)
+    
+    # Préparer odds pour B
+    odds_B = odds_long_typed.select([
+        pl.col(match_id_col),
+        pl.col("player_id").alias("_player_id_B"),
+        pl.col("odds").alias("odds_B"),
+        pl.col("odds_implied_prob").alias("odds_implied_prob_B"),
+    ])
+    
+    # Cast player columns to Utf8 for join
+    df = matches_df.with_columns([
+        pl.col(playerA_col).cast(pl.Utf8).alias("_join_player_A"),
+        pl.col(playerB_col).cast(pl.Utf8).alias("_join_player_B"),
+    ])
+    
+    # Join pour A
+    df = df.join(
+        odds_A,
+        left_on=[match_id_col, "_join_player_A"],
+        right_on=[match_id_col, "_player_id_A"],
+        how="left"
+    )
+    
+    # Drop colonnes temporaires
+    cols_to_drop = [c for c in df.columns if c in ["_player_id_A"]]
+    if cols_to_drop:
+        df = df.drop(cols_to_drop)
+    
+    # Join pour B
+    df = df.join(
+        odds_B,
+        left_on=[match_id_col, "_join_player_B"],
+        right_on=[match_id_col, "_player_id_B"],
+        how="left"
+    )
+    
+    # Cleanup colonnes temporaires
+    cols_to_drop = [c for c in df.columns if c in ["_join_player_A", "_join_player_B", "_player_id_B"]]
+    if cols_to_drop:
+        df = df.drop(cols_to_drop)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FIX RETOUR 1: Re-cast après join (sécurité) + when/then pour log
+    # ═══════════════════════════════════════════════════════════════
+    df = df.with_columns([
+        pl.col("odds_A").cast(pl.Float64, strict=False),
+        pl.col("odds_B").cast(pl.Float64, strict=False),
+        pl.col("odds_implied_prob_A").cast(pl.Float64, strict=False),
+        pl.col("odds_implied_prob_B").cast(pl.Float64, strict=False),
+    ])
+    
+    df = df.with_columns([
+        # Diff implied prob (A - B)
+        (pl.col("odds_implied_prob_A").fill_null(0.5) - pl.col("odds_implied_prob_B").fill_null(0.5))
+        .cast(pl.Float32)
+        .alias("diff_odds_implied_prob"),
+        
+        # Log odds ratio avec protection null/0 (RETOUR 1)
+        (
+            pl.when(
+                pl.col("odds_A").is_not_null() &
+                pl.col("odds_B").is_not_null() &
+                (pl.col("odds_A") > 0) &
+                (pl.col("odds_B") > 0)
+            )
+            .then(pl.col("odds_B").log() - pl.col("odds_A").log())
+            .otherwise(None)
+        )
+        .fill_null(0.0)
+        .cast(pl.Float32)
+        .alias("log_odds_ratio"),
+    ])
+    
+    # Cast final en Float32 (RETOUR 2)
+    float_cols = ["odds_A", "odds_B", "odds_implied_prob_A", "odds_implied_prob_B"] + available_optional
+    for col in float_cols:
+        if col in df.columns:
+            df = df.with_columns([pl.col(col).cast(pl.Float32)])
+    
+    # Stats
+    coverage_A = df.select(pl.col("odds_A").is_not_null().mean()).item()
+    coverage_B = df.select(pl.col("odds_B").is_not_null().mean()).item()
+    print(f"  ✅ Coverage odds_A: {coverage_A*100:.1f}%")
+    print(f"  ✅ Coverage odds_B: {coverage_B*100:.1f}%")
+    
+    return df
+
+
+# ===============================================
+# SECTION E.2: LEGACY WRAPPER (BLOCKED)
+# ===============================================
+
+def create_odds_features_AB(*args, **kwargs):
+    """
+    ❌ REMOVED - LABEL LEAKAGE RISK
+    
+    Cette fonction utilisait target_A_wins pour mapper les odds,
+    ce qui crée du label leakage si le dataset est shufflé A/B.
+    
+    Utiliser à la place:
+    1. create_odds_long_format() pour créer le format long
+    2. attach_odds_AB_no_leak() pour attacher aux matchs
+    """
+    # ═══════════════════════════════════════════════════════════════
+    # FIX #5: RuntimeError au lieu de DeprecationWarning
+    # ═══════════════════════════════════════════════════════════════
+    raise RuntimeError(
+        "❌ create_odds_features_AB() a été SUPPRIMÉE car elle causait du label leakage.\n"
+        "\n"
+        "   Utilise à la place:\n"
+        "   1. odds_long = create_odds_long_format(odds_features, matches)\n"
+        "   2. df = attach_odds_AB_no_leak(df, odds_long, playerA_col='winner_id', playerB_col='loser_id')\n"
+        "\n"
+        "   Pour shuffle A/B futur, utilise playerA_col='player_id_A', playerB_col='player_id_B'"
+    )
+
+
+# ===============================================
+# SECTION F: SAVE & REPORT
+# ===============================================
+
+def save_odds_layer(odds_features: pl.DataFrame, report: dict):
+    """Sauvegarde le layer de cotes et le rapport."""
+    
+    print("\n" + "=" * 60)
+    print("   SAVE ODDS LAYER")
+    print("=" * 60)
+    
+    # Sauvegarder les features
+    output_path = ODDS_DIR / "odds_features.parquet"
+    odds_features.write_parquet(output_path)
+    print(f"  ✅ Features: {output_path}")
+    
+    # Sauvegarder le rapport
+    report_path = ODDS_DIR / "matching_report.json"
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    print(f"  ✅ Rapport: {report_path}")
+    
+    # Stats finales
+    print(f"\n  📊 Total matchs avec cotes: {len(odds_features):,}")
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    """Pipeline principal PP_02b ODDS."""
+    
+    print("\n" + "=" * 70)
+    print("   🎰 TENNISTITAN - PP_02b ODDS LAYER (NASA SOTA)")
+    print("=" * 70)
+    print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+    
+    t0 = time.perf_counter()
+    
+    # 1. Charger les données
+    odds = load_odds_data()
+    if odds.is_empty():
+        print("\n❌ Pas de données de cotes. Abandon.")
+        return
+    
+    matches = load_matches_data()
+    if matches.is_empty():
+        print("\n❌ Pas de données de matchs. Abandon.")
+        return
+
+    if HAS_RAPIDFUZZ and "tourney_norm" in odds.columns and "tourney_norm" in matches.columns:
+        odds_t = odds.select(pl.col("tourney_norm").drop_nulls().unique()).to_series().to_list()
+        match_t = matches.select(pl.col("tourney_norm").drop_nulls().unique()).to_series().to_list()
+
+        alias = {}
+        for t in odds_t:
+            best = process.extractOne(t, match_t, scorer=fuzz.token_set_ratio)
+            if best and best[1] >= 80:
+                alias[t] = best[0]
+
+        odds = odds.with_columns(
+            pl.col("tourney_norm")
+              .map_elements(lambda x: alias.get(x, x), return_dtype=pl.String)
+              .alias("tourney_norm")
+        )
+    print(matches.select(["match_date","week_start"]).head(5))
+    print(odds.select(["date_parsed","week_start"]).head(5))
+
+    # 2. Matching
+    match_results = match_odds_to_matches_v2(odds, matches)
+    if match_results.is_empty():
+        print("\n❌ Aucun match trouvé. Abandon.")
+        return
+
+    # 3. Calculer features (format winner/loser)
+    odds_features = compute_odds_features(matches, match_results)
+    
+    # 4. Rapport
+    report = {
+        "created": datetime.now().isoformat(),
+        "odds_file": str(ODDS_FILE),
+        "total_odds_records": len(odds),
+        "total_matches": len(matches),
+        "matched": len(match_results),
+        "match_rate": len(match_results) / len(odds) * 100,
+        "odds_period": f"{odds['date_parsed'].min()} to {odds['date_parsed'].max()}",
+        "features_created": odds_features.columns,
+    }
+    
+    # 5. Sauvegarder format legacy (winner/loser)
+    save_odds_layer(odds_features, report)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 6. NASA SOTA: Créer et sauvegarder le format long
+    # ═══════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("   NASA SOTA: CREATING LONG FORMAT")
+    print("=" * 60)
+    
+    try:
+        odds_long = create_odds_long_format(odds_features, matches)
+        
+        # Sauvegarder le format long
+        odds_long_path = ODDS_DIR / "odds_long.parquet"
+        odds_long.write_parquet(odds_long_path, compression="zstd")
+        print(f"  ✅ Format long sauvegardé: {odds_long_path}")
+        print(f"  📊 Shape: {odds_long.shape}")
+        
+    except Exception as e:
+        print(f"  ❌ Erreur création format long: {e}")
+        import traceback
+        traceback.print_exc()
+        return odds_features
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 7. TEST: Attacher les odds A/B (vérification sanity check)
+    # ═══════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("   NASA SOTA: SANITY CHECK")
+    print("=" * 60)
+    
+    try:
+        # ✅ FIX: Filtrer sur la période des odds (2001+) pour le test
+        test_matches = matches.filter(
+            pl.col("winner_id").is_not_null() & 
+            pl.col("loser_id").is_not_null() &
+            (pl.col("match_date") >= pl.lit(datetime(2001, 1, 1)).cast(pl.Date))
+        ).select([
+            "custom_match_id", "winner_id", "loser_id"
+        ]).head(10000)
+        
+        print(f"  📊 Test matches (2001+): {len(test_matches):,}")
+        
+        test_result = attach_odds_AB_no_leak(
+            test_matches,
+            odds_long,
+            match_id_col="custom_match_id",
+            playerA_col="winner_id",
+            playerB_col="loser_id"
+        )
+        
+        # Vérification
+        valid_odds = test_result.filter(
+            pl.col("odds_A").is_not_null() & pl.col("odds_B").is_not_null()
+        )
+        
+        if len(valid_odds) > 0:
+            pct_favori = valid_odds.select(
+                (pl.col("odds_A") < pl.col("odds_B")).mean()
+            ).item()
+            
+            print(f"  📊 Matchs testés avec odds: {len(valid_odds):,}")
+            print(f"  📊 % winners favoris (odds_A < odds_B): {pct_favori*100:.1f}%")
+            
+            if 0.55 <= pct_favori <= 0.85:
+                print(f"  ✅ Ratio dans la plage attendue (55-85%)")
+            elif pct_favori < 0.5:
+                print(f"  ⚠️ WARNING: Ratio anormalement bas (<50%), vérifier le matching!")
+            else:
+                print(f"  ℹ️ Ratio élevé (>{pct_favori*100:.0f}%), normal si données récentes")
+        else:
+            print(f"  ⚠️ Aucun match avec odds valides pour le test")
+            
+    except Exception as e:
+        print(f"  ⚠️ Erreur sanity check (non bloquant): {e}")
+        import traceback
+        traceback.print_exc()
+
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 8. SOTA Verification (existant)
+    # ═══════════════════════════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("   SOTA VERIFICATION")
+    print("=" * 60)
+    
+    # Duplicates check
+    if "custom_match_id" in odds_features.columns:
+        dup_count = odds_features.select(pl.col("custom_match_id").is_duplicated().sum()).item()
+        print(f"  🔍 Duplicates sur custom_match_id: {dup_count}")
+    
+    # % winner < loser (global)
+    pct_correct = odds_features.select(
+        (pl.col("odds_winner") < pl.col("odds_loser")).mean()
+    ).item() * 100
+    print(f"  📊 % odds_winner < odds_loser (global): {pct_correct:.2f}%")
+    
+    # % winner < loser (high confidence)
+    hi_conf = odds_features.filter(pl.col("odds_match_confidence") >= 95)
+    if len(hi_conf) > 0:
+        pct_hi = hi_conf.select(
+            (pl.col("odds_winner") < pl.col("odds_loser")).mean()
+        ).item() * 100
+        print(f"  📊 % odds_winner < odds_loser (conf≥95): {pct_hi:.2f}% ({len(hi_conf):,} rows)")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # FIN
+    # ═══════════════════════════════════════════════════════════════
+    elapsed = time.perf_counter() - t0
+    
+    print("\n" + "=" * 70)
+    print("   ✅ PP_02b ODDS LAYER COMPLETE (NASA SOTA)")
+    print("=" * 70)
+    print(f"   ⏱️  Temps total: {elapsed:.1f}s")
+    print(f"   📊 Matchs avec cotes: {len(odds_features):,}")
+    print(f"   📈 Taux de matching: {report['match_rate']:.1f}%")
+    
+    print(f"""
+📁 OUTPUT FILES:
+   • odds_features.parquet  (format winner/loser - legacy)
+   • odds_long.parquet      (format player_id - NASA SOTA)
+   • matching_report.json
+
+🚀 UTILISATION:
+   # Dans PP_MERGE (design actuel winner/loser):
+   odds_long = pl.read_parquet(ODDS_DIR / "odds_long.parquet")
+   df = attach_odds_AB_no_leak(df, odds_long, 
+                                playerA_col="winner_id", 
+                                playerB_col="loser_id")
+   
+   # Après shuffle A/B (futur):
+   df = attach_odds_AB_no_leak(df, odds_long,
+                                playerA_col="player_id_A",
+                                playerB_col="player_id_B")
+""")
+    
+    return odds_features
+
+
+if __name__ == "__main__":
+    odds_features = main()

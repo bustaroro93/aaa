@@ -1,0 +1,61 @@
+======================================================================
+   PP_08C - OPPONENT-ADJUSTED STATS (GOD SOTA 2026)
+======================================================================
+   2026-01-06 22:41:09
+   Rolling window: 50 matches
+======================================================================
+
+[1/4] Loading matches...
+  Matches: 544,245
+
+[2/4] Computing opponent-adjusted stats...
+  Processed 50,000 / 544,245
+  Processed 100,000 / 544,245
+  Processed 150,000 / 544,245
+  Processed 200,000 / 544,245
+  Processed 250,000 / 544,245
+  Processed 300,000 / 544,245
+  Processed 350,000 / 544,245
+  Processed 400,000 / 544,245
+  Processed 450,000 / 544,245
+  Processed 500,000 / 544,245
+
+[3/4] Creating DataFrame...
+  Adding derived features...
+
+  📊 adj_dominance_score: min=0.000, max=1.000
+  ✅ adj_dominance in valid range [0,1]
+  Shape: (544245, 70)
+  Columns: 70
+
+  📊 Coverage Stats:
+     win_rate_vs_top10_winner: 16.3%
+     win_rate_vs_top50_winner: 27.1%
+     win_rate_vs_similar_winner: 57.4%
+
+[4/4] Saving...
+  ✅ Saved: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\opponent_adjusted\opponent_adj_features.parquet
+
+======================================================================
+   ✅ PP_08C OPPONENT-ADJUSTED STATS COMPLETE!
+======================================================================
+   ⏱️  Time: 131.0s
+   📊 Features: 70
+   📁 Output: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\opponent_adjusted\opponent_adj_features.parquet
+
+📋 FEATURES CRÉÉES:
+
+   Par niveau d'adversaire (Top10, Top20, Top50, Top100, Similar):
+   • win_rate_vs_{bucket}_winner/loser    : Win rate contre ce niveau
+   • ace_rate_vs_{bucket}_winner/loser    : Ace rate contre ce niveau
+   • hold_rate_vs_{bucket}_winner/loser   : Hold rate contre ce niveau
+   • bp_conv_vs_{bucket}_winner/loser     : BP conversion contre ce niveau
+   • n_matches_vs_{bucket}_winner/loser   : Nombre de matchs contre ce niveau
+   
+   Dérivées:
+   • diff_win_rate_vs_{bucket}            : Différence win rate
+   • adj_dominance_score_winner/loser     : Score de dominance ajusté (pondéré)
+   • diff_adj_dominance_score             : Différence dominance
+
+🔄 PROCHAINE ÉTAPE:
+   Ajouter le merge dans PP_16 (Merge GOD Features)

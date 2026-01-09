@@ -1,0 +1,1039 @@
+# ===============================================
+# PREPROCESS 4 - MERGE GOD MODE
+# TennisTitan SOTA 2026 - Polars Edition
+# ===============================================
+#
+# Unifie TOUS les layers de features en un dataset
+# prêt pour le ML/DL avec format match-level.
+#
+# Layers mergés (9 total):
+#   1. ratings_glicko2 (Glicko-2 multi-bucket)
+#   2. ratings_srvret_layer (Elo SRV/RET + Markov)
+#   3. h2h_decay (Head-to-Head decay exponentiel)
+#   4. psychological_momentum (streaks, clutch, mental)
+#   5. environmental_context (altitude, ball, court)
+#   6. charting_style (rolling stats + derived)
+#   7. charting_super (agrégations charting)
+#   8. baseline_markov (probas Markov théoriques)
+#   9. charting_sequential (séquences pour DL)
+#
+# Output: data_clean/ml_ready/matches_ml_ready.parquet
+# ===============================================
+
+from pathlib import Path
+from datetime import datetime
+import time
+import json
+import polars as pl
+import math
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+FEATURES_DIR = DATA_CLEAN / "features"
+
+# Input directories
+MB_DIR = DATA_CLEAN / "matches_base_scaled"
+if not MB_DIR.exists():
+    MB_DIR = DATA_CLEAN / "matches_base"
+
+# ✅ CHEMINS CORRIGÉS selon structure réelle
+RATINGS_DIR = FEATURES_DIR / "ratings_glicko2"           # était ratings_layer
+SRVRET_DIR = FEATURES_DIR / "ratings_srvret_layer"
+H2H_DIR = FEATURES_DIR / "h2h_decay"                     # était h2h_features  
+PSYCH_DIR = FEATURES_DIR / "psychological_momentum"
+ENV_DIR = FEATURES_DIR / "environmental_context"
+CHARTING_STYLE_DIR = FEATURES_DIR / "charting_style"
+CHARTING_SUPER_DIR = FEATURES_DIR / "charting_super"     # était charting_super_feats
+CHARTING_SEQ_DIR = FEATURES_DIR / "charting_sequential"  # bonus: séquentiel
+BASELINE_MARKOV_DIR = FEATURES_DIR / "baseline_markov"   # bonus: baseline
+BASE_ROLLING_DIR = FEATURES_DIR / "base_stats_rolling"
+ODDS_DIR = FEATURES_DIR / "odds_layer"
+
+# Output
+OUTPUT_DIR = DATA_CLEAN / "ml_ready"
+OUTPUT_FILE = OUTPUT_DIR / "matches_ml_ready.parquet"
+
+GENDER = "atp"
+START_YEAR = 1990  # Données plus fiables à partir de 1990
+
+# ===============================================
+# HELPER FUNCTIONS
+# ===============================================
+
+def load_parquet_safe(path: Path, name: str) -> pl.DataFrame | None:
+    """Charge un parquet partitionné de manière sécurisée."""
+    if not path.exists():
+        print(f"  ⚠️ {name} introuvable: {path}")
+        return None
+    try:
+        df = pl.read_parquet(f"{path}/**/*.parquet")
+        print(f"  ✅ {name}: {len(df):,} rows × {len(df.columns)} cols")
+        return df
+    except Exception as e:
+        print(f"  ❌ Erreur {name}: {e}")
+        return None
+        
+def ensure_unique_player_level(df: pl.DataFrame | None, name: str) -> pl.DataFrame | None:
+    if df is None:
+        return None
+    if "player_id" not in df.columns:
+        return df
+
+    if "custom_match_id" in df.columns:
+        keys = ["custom_match_id", "player_id"]
+    elif "match_id" in df.columns:
+        keys = ["match_id", "player_id"]
+    else:
+        print(f"  ⚠️ {name}: pas de clé match trouvée pour dédup")
+        return df
+
+    n_before = len(df)
+    df = df.unique(subset=keys, keep="last")
+    n_after = len(df)
+    if n_before != n_after:
+        print(f"  ⚠️ {name}: dédupliqué {n_before:,} → {n_after:,} (-{n_before - n_after:,})")
+    return df
+
+
+def safe_join(
+    left: pl.DataFrame, 
+    right: pl.DataFrame, 
+    on: list[str], 
+    right_name: str,
+    how: str = "left"
+) -> pl.DataFrame:
+    """Join avec diagnostic de couverture."""
+    if right is None:
+        print(f"  ⏭️ Skip {right_name} (non disponible)")
+        return left
+    
+    n_before = len(left)
+    
+    # Éviter les colonnes dupliquées
+    left_cols = set(left.columns)
+    right_cols_to_add = [c for c in right.columns if c not in left_cols or c in on]
+    right_subset = right.select(right_cols_to_add)
+    
+    # Join
+    result = left.join(right_subset, on=on, how=how)
+    
+    # Diagnostic
+    if how == "left":
+        # Vérifier combien de lignes ont des valeurs non-null du right
+        sample_col = [c for c in right.columns if c not in on]
+        if sample_col:
+            matched = result.select(pl.col(sample_col[0]).is_not_null().sum()).item()
+            coverage = 100 * matched / n_before
+            print(f"  📎 {right_name}: {coverage:.1f}% coverage ({matched:,}/{n_before:,})")
+    
+    return result
+
+
+def pivot_player_features(
+    df: pl.DataFrame,
+    player_col: str,
+    feature_cols: list[str],
+    suffix: str
+) -> pl.DataFrame:
+    """Pivote les features joueur avec un suffixe A ou B."""
+    rename_map = {col: f"{col}_{suffix}" for col in feature_cols if col in df.columns}
+    
+    cols_to_select = [c for c in [player_col] + feature_cols if c in df.columns]
+    result = df.select(cols_to_select)
+    
+    for old, new in rename_map.items():
+        result = result.rename({old: new})
+    
+    return result
+
+
+# ===============================================
+# MAIN MERGE FUNCTION
+# ===============================================
+
+def merge_all_layers(gender: str = GENDER) -> pl.DataFrame:
+    """
+    Merge tous les layers en un dataset match-level unifié.
+    
+    Format output: 1 ligne par match avec:
+    - Infos match (date, tournoi, surface, round)
+    - Features joueur A (winner) avec suffixe _A
+    - Features joueur B (loser) avec suffixe _B
+    - Target: winner = 1 (toujours, car A=winner dans les données)
+    
+    Pour l'entraînement, on shufflera A/B aléatoirement.
+    """
+    t0 = time.perf_counter()
+    
+    print("=" * 70)
+    print("   PREPROCESS 04 - MERGE GOD MODE")
+    print("   TennisTitan SOTA 2026")
+    print("=" * 70)
+    print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   Gender: {gender}")
+    print("=" * 70)
+    
+    # =========================================
+    # ÉTAPE 1: Charger matches_base (backbone)
+    # =========================================
+    print("\n[1/11] Chargement matches_base (backbone)...")
+    
+    mb = pl.read_parquet(f"{MB_DIR}/**/*.parquet")
+    mb = mb.filter(
+        (pl.col("gender") == gender) &
+        (pl.col("year") >= START_YEAR)
+    )
+    print(f"  Matches base: {len(mb):,} rows")
+    
+    # Colonnes essentielles
+    essential_cols = [
+        "custom_match_id", "match_id_ta_dedup", "match_id_ta_source",
+        "tourney_date_ta", "tourney_date_int", "year",
+        "tourney_name_ta", "tourney_slug_ta", "tourney_surface_ta",
+        "tourney_level_ta", "round_ta", "best_of_ta",
+        "winner_id", "loser_id", "winner_name", "loser_name",
+        "winner_rank_ta", "loser_rank_ta",
+        "score_ta", "match_status", "duration_minutes_ta",
+        "is_indoor", "is_charted_ta"
+    ]
+    essential_cols = [c for c in essential_cols if c in mb.columns]
+    
+    matches = mb.select(essential_cols).unique(subset=["custom_match_id"], keep="first")
+    print(f"  Matches uniques: {len(matches):,}")
+    
+    # =========================================
+    # ÉTAPE 2: Charger tous les layers
+    # =========================================
+    print("\n[2/11] Chargement des feature layers...")
+    
+    ratings = load_parquet_safe(RATINGS_DIR, "ratings_glicko2")
+    srvret = load_parquet_safe(SRVRET_DIR, "ratings_srvret_layer")
+    h2h = load_parquet_safe(H2H_DIR, "h2h_decay")
+    psych = load_parquet_safe(PSYCH_DIR, "psychological_momentum")
+    env = load_parquet_safe(ENV_DIR, "environmental_context")
+    charting_style = load_parquet_safe(CHARTING_STYLE_DIR, "charting_style")
+    charting_super = load_parquet_safe(CHARTING_SUPER_DIR, "charting_super")
+    charting_player = load_parquet_safe(FEATURES_DIR / "charting_player_rolling", "charting_player_rolling")
+    baseline_markov = load_parquet_safe(BASELINE_MARKOV_DIR, "baseline_markov")
+    base_rolling = load_parquet_safe(BASE_ROLLING_DIR, "base_stats_rolling")
+    charting_seq = load_parquet_safe(CHARTING_SEQ_DIR, "charting_sequential")
+
+    # ===============================================
+    # 🎰 ODDS LAYER (chargement seulement, merge plus tard)
+    # ===============================================
+    ODDS_PATH = ODDS_DIR / "odds_features.parquet"
+    if ODDS_PATH.exists():
+        odds = pl.read_parquet(ODDS_PATH)
+        print(f"  ✅ odds_layer: {len(odds):,} rows × {len(odds.columns)} cols")
+    else:
+        odds = None
+        print(f"  ⚠️ odds_layer introuvable: {ODDS_PATH}")
+        
+    # =========================================
+    # ÉTAPE 3: Merge Environmental (match-level)
+    # =========================================
+    print("\n[3/11] Merge Environmental Context...")
+    
+    if env is not None:
+        env_cols = [c for c in env.columns if c not in ["year", "gender"]]
+        matches = safe_join(matches, env.select(env_cols), ["custom_match_id"], "env")
+        
+    # =========================================
+    # ÉTAPE 3.5: Casts uniformes pour joins
+    # =========================================
+    matches = matches.with_columns([
+        pl.col("custom_match_id").cast(pl.Utf8),
+        pl.col("winner_id").cast(pl.Utf8),
+        pl.col("loser_id").cast(pl.Utf8),
+    ])
+    
+    # =========================================
+    # ÉTAPE 4: Merge SRV/RET Ratings (player-level → match-level) ✅ FIXED
+    # =========================================
+    print("\n[4/11] Merge SRV/RET Ratings...")
+
+    if srvret is not None:
+        # ✅ Nouveau srvret = format long (custom_match_id, player_id)
+        id_cols = {
+            "custom_match_id", "match_key",
+            "gender", "year", "tourney_date_int", "tourney_surface_ta",
+            "player_id", "opp_id", "best_of"
+        }
+
+        srvret_feat_cols = [c for c in srvret.columns if c not in id_cols]
+
+        if "player_id" in srvret.columns and srvret_feat_cols:
+            print(f"  SRV/RET features: {len(srvret_feat_cols)} colonnes à pivoter")
+            
+            # Assurer types cohérents + dedup sécurité
+            srvret = srvret.with_columns([
+                pl.col("custom_match_id").cast(pl.Utf8),
+                pl.col("player_id").cast(pl.Utf8),
+            ])
+            srvret = srvret.unique(subset=["custom_match_id", "player_id"], keep="last")
+            
+            # WINNER (A)
+            srvret_A = srvret.select(["custom_match_id", "player_id"] + srvret_feat_cols)
+            srvret_A = srvret_A.rename({"player_id": "winner_id"})
+            srvret_A = srvret_A.rename({c: f"srvret_{c}_A" for c in srvret_feat_cols})
+
+            matches = safe_join(matches, srvret_A, ["custom_match_id", "winner_id"], "srvret_A")
+
+            # LOSER (B)
+            srvret_B = srvret.select(["custom_match_id", "player_id"] + srvret_feat_cols)
+            srvret_B = srvret_B.rename({"player_id": "loser_id"})
+            srvret_B = srvret_B.rename({c: f"srvret_{c}_B" for c in srvret_feat_cols})
+
+            matches = safe_join(matches, srvret_B, ["custom_match_id", "loser_id"], "srvret_B")
+            
+            print(f"  ✅ SRV/RET mergé: +{len(srvret_feat_cols) * 2} colonnes")
+
+        else:
+            # Fallback (ancien format match-level)
+            print("  ⚠️ SRV/RET format legacy détecté")
+            srvret_cols = [c for c in srvret.columns if c not in ["year", "gender"]]
+            srvret_dedup = srvret.select(srvret_cols).unique(subset=["custom_match_id"], keep="first")
+            matches = safe_join(matches, srvret_dedup, ["custom_match_id"], "srvret")
+    
+    # =========================================
+    # ÉTAPE 5: Merge Ratings Glicko-2 (player-level → match-level)
+    # =========================================
+    print("\n[5/11] Merge Glicko-2 Ratings...")
+    
+    if ratings is not None:
+        ratings = ensure_unique_player_level(ratings, "ratings")
+        # Ratings est en format (match_id, player_id) - pivoter vers A/B
+        rating_feature_cols = [c for c in ratings.columns 
+                               if c.startswith("g2_") or c.startswith("glicko")]
+        
+        if "player_id" in ratings.columns and rating_feature_cols:
+            # Pour le winner (A)
+            ratings_A = ratings.select(["custom_match_id", "player_id"] + rating_feature_cols)
+            rename_A = {c: f"{c}_A" for c in rating_feature_cols}
+            ratings_A = ratings_A.rename(rename_A)
+            ratings_A = ratings_A.rename({"player_id": "winner_id"})
+            
+            matches = safe_join(matches, ratings_A, ["custom_match_id", "winner_id"], "ratings_A")
+            
+            # Pour le loser (B)
+            ratings_B = ratings.select(["custom_match_id", "player_id"] + rating_feature_cols)
+            rename_B = {c: f"{c}_B" for c in rating_feature_cols}
+            ratings_B = ratings_B.rename(rename_B)
+            ratings_B = ratings_B.rename({"player_id": "loser_id"})
+            
+            matches = safe_join(matches, ratings_B, ["custom_match_id", "loser_id"], "ratings_B")
+    
+    # =========================================
+    # ÉTAPE 6: Merge Psychological (player-level → match-level)
+    # =========================================
+    print("\n[6/11] Merge Psychological Features...")
+    
+    if psych is not None:
+        psych = ensure_unique_player_level(psych, "psych")
+        psych_feature_cols = [c for c in psych.columns 
+                              if c not in ["custom_match_id", "player_id", "year", "gender"]]
+        
+        if "player_id" in psych.columns and psych_feature_cols:
+            # Winner (A)
+            psych_A = psych.select(["custom_match_id", "player_id"] + psych_feature_cols)
+            rename_A = {c: f"{c}_A" for c in psych_feature_cols}
+            psych_A = psych_A.rename(rename_A).rename({"player_id": "winner_id"})
+            
+            matches = safe_join(matches, psych_A, ["custom_match_id", "winner_id"], "psych_A")
+            
+            # Loser (B)
+            psych_B = psych.select(["custom_match_id", "player_id"] + psych_feature_cols)
+            rename_B = {c: f"{c}_B" for c in psych_feature_cols}
+            psych_B = psych_B.rename(rename_B).rename({"player_id": "loser_id"})
+            
+            matches = safe_join(matches, psych_B, ["custom_match_id", "loser_id"], "psych_B")
+    
+    # =========================================
+    # ÉTAPE 7: Merge Charting Style (player-level → match-level)
+    # =========================================
+    print("\n[7/11] Merge Charting Style Features...")
+    
+    if charting_style is not None:
+        charting_style = ensure_unique_player_level(charting_style, "charting_style")
+        charting_feature_cols = [c for c in charting_style.columns 
+                                  if c.startswith(("r5_", "r10_", "r20_", "has_", "serve_", "aggression", "net_", "rally_", "depth_"))]
+        
+        if "player_id" in charting_style.columns and charting_feature_cols:
+            # Winner (A)
+            chart_A = charting_style.select(["custom_match_id", "player_id"] + charting_feature_cols)
+            rename_A = {c: f"{c}_A" for c in charting_feature_cols}
+            chart_A = chart_A.rename(rename_A).rename({"player_id": "winner_id"})
+            
+            matches = safe_join(matches, chart_A, ["custom_match_id", "winner_id"], "charting_A")
+            
+            # Loser (B)
+            chart_B = charting_style.select(["custom_match_id", "player_id"] + charting_feature_cols)
+            rename_B = {c: f"{c}_B" for c in charting_feature_cols}
+            chart_B = chart_B.rename(rename_B).rename({"player_id": "loser_id"})
+            
+            matches = safe_join(matches, chart_B, ["custom_match_id", "loser_id"], "charting_B")
+    
+    # =========================================
+    # ÉTAPE 7b: Merge Charting Super Feats
+    # =========================================
+    if charting_super is not None:
+        charting_super = ensure_unique_player_level(charting_super, "charting_super")
+        super_feature_cols = [c for c in charting_super.columns 
+                              if c not in ["custom_match_id", "match_id", "player_id", "year", "gender"]]
+        
+        if "player_id" in charting_super.columns and super_feature_cols:
+            # Winner (A)
+            super_A = charting_super.select(["custom_match_id", "player_id"] + super_feature_cols)
+            rename_A = {c: f"super_{c}_A" for c in super_feature_cols}
+            super_A = super_A.rename(rename_A).rename({"player_id": "winner_id"})
+            
+            matches = safe_join(matches, super_A, ["custom_match_id", "winner_id"], "charting_super_A")
+            
+            # Loser (B)
+            super_B = charting_super.select(["custom_match_id", "player_id"] + super_feature_cols)
+            rename_B = {c: f"super_{c}_B" for c in super_feature_cols}
+            super_B = super_B.rename(rename_B).rename({"player_id": "loser_id"})
+            
+            matches = safe_join(matches, super_B, ["custom_match_id", "loser_id"], "charting_super_B")
+
+    # =========================================
+    # ÉTAPE 7c: Merge Charting Player Rolling (NOUVEAU!)
+    # =========================================
+    print("\n[7c/11] Merge Charting Player Rolling...")
+    
+    if charting_player is not None:
+        charting_player = ensure_unique_player_level(charting_player, "charting_player")
+        chart_player_cols = [c for c in charting_player.columns 
+                             if c.startswith("r5_chart") or c.startswith("r10_chart") or c.startswith("r20_chart")]
+        
+        if "player_id" in charting_player.columns:
+            # Winner (A)
+            chart_pl_A = charting_player.select(["custom_match_id", "player_id"] + chart_player_cols)
+            rename_A = {c: f"{c}_A" for c in chart_player_cols}
+            chart_pl_A = chart_pl_A.rename(rename_A).rename({"player_id": "winner_id"})
+            matches = safe_join(matches, chart_pl_A, ["custom_match_id", "winner_id"], "charting_player_A")
+            
+            # Loser (B)
+            chart_pl_B = charting_player.select(["custom_match_id", "player_id"] + chart_player_cols)
+            rename_B = {c: f"{c}_B" for c in chart_player_cols}
+            chart_pl_B = chart_pl_B.rename(rename_B).rename({"player_id": "loser_id"})
+            matches = safe_join(matches, chart_pl_B, ["custom_match_id", "loser_id"], "charting_player_B")
+
+
+    # =========================================
+    # ÉTAPE 7d: Merge Base Stats Rolling (NEW! 100% coverage)
+    # =========================================
+    print("\n[7d/11] Merge Base Stats Rolling (100% coverage)...")
+    
+    if base_rolling is not None:
+        base_rolling    = ensure_unique_player_level(base_rolling, "base_rolling")
+        # Identifier les colonnes de features (rolling + dérivées)
+        # Utiliser un set pour éviter les doublons
+        base_rolling_cols = [c for c in base_rolling.columns 
+                            if c.startswith(("r5_", "r10_", "r20_")) 
+                            and "chart" not in c.lower()]  # Exclure charting (déjà mergé)
+        
+        # Dédupliquer (au cas où)
+        base_rolling_cols = list(dict.fromkeys(base_rolling_cols))
+        
+        print(f"  Base rolling features: {len(base_rolling_cols)}")
+        
+        if "player_id" in base_rolling.columns and base_rolling_cols:
+            # Winner (A)
+            base_A = base_rolling.select(["custom_match_id", "player_id"] + base_rolling_cols)
+            rename_A = {c: f"{c}_A" for c in base_rolling_cols}
+            base_A = base_A.rename(rename_A).rename({"player_id": "winner_id"})
+            
+            matches = safe_join(matches, base_A, ["custom_match_id", "winner_id"], "base_rolling_A")
+            
+            # Loser (B)
+            base_B = base_rolling.select(["custom_match_id", "player_id"] + base_rolling_cols)
+            rename_B = {c: f"{c}_B" for c in base_rolling_cols}
+            base_B = base_B.rename(rename_B).rename({"player_id": "loser_id"})
+            
+            matches = safe_join(matches, base_B, ["custom_match_id", "loser_id"], "base_rolling_B")
+            
+            print(f"  ✅ Base Stats Rolling merged: +{len(base_rolling_cols) * 2} columns")
+    else:
+        print("  ⚠️ base_stats_rolling not found - run Section A.5 in PP_03 first!")
+        
+    # =========================================
+    # ÉTAPE 8: Merge H2H (player-level → match-level)
+    # =========================================
+    print("\n[8/11] Merge H2H Features...")
+    
+    if h2h is not None:
+        h2h            = ensure_unique_player_level(h2h, "h2h")
+        h2h_feature_cols = [c for c in h2h.columns 
+                           if c not in ["custom_match_id", "player_id", "year", "gender"]]
+        
+        if "player_id" in h2h.columns and h2h_feature_cols:
+            # H2H est en format player-level - pivoter vers A/B
+            # Winner (A)
+            h2h_A = h2h.select(["custom_match_id", "player_id"] + h2h_feature_cols)
+            rename_A = {c: f"{c}_A" if not c.endswith("_A") else c for c in h2h_feature_cols}
+            h2h_A = h2h_A.rename(rename_A).rename({"player_id": "winner_id"})
+            
+            matches = safe_join(matches, h2h_A, ["custom_match_id", "winner_id"], "h2h_A")
+            
+            # Loser (B)
+            h2h_B = h2h.select(["custom_match_id", "player_id"] + h2h_feature_cols)
+            rename_B = {c: f"{c}_B" if not c.endswith("_B") else c for c in h2h_feature_cols}
+            h2h_B = h2h_B.rename(rename_B).rename({"player_id": "loser_id"})
+            
+            matches = safe_join(matches, h2h_B, ["custom_match_id", "loser_id"], "h2h_B")
+        else:
+            # Format match-level direct (déjà avec A/B)
+            h2h_cols = [c for c in h2h.columns if c not in ["year", "gender"]]
+            h2h_dedup = h2h.select(h2h_cols).unique(subset=["custom_match_id"], keep="first")
+            matches = safe_join(matches, h2h_dedup, ["custom_match_id"], "h2h")
+    
+    # =========================================
+    # ÉTAPE 9: Merge Baseline Markov (player-level → match-level)
+    # =========================================
+    print("\n[9/11] Merge Baseline Markov...")
+    
+    if baseline_markov is not None:
+        baseline_markov = ensure_unique_player_level(baseline_markov, "baseline_markov")
+        markov_feature_cols = [c for c in baseline_markov.columns 
+                               if c not in ["custom_match_id", "player_id", "year", "gender"]]
+        
+        if "player_id" in baseline_markov.columns and markov_feature_cols:
+            # Baseline Markov est en format player-level - pivoter vers A/B
+            # Winner (A)
+            markov_A = baseline_markov.select(["custom_match_id", "player_id"] + markov_feature_cols)
+            rename_A = {c: f"markov_{c}_A" for c in markov_feature_cols}
+            markov_A = markov_A.rename(rename_A).rename({"player_id": "winner_id"})
+            
+            matches = safe_join(matches, markov_A, ["custom_match_id", "winner_id"], "markov_A")
+            
+            # Loser (B)
+            markov_B = baseline_markov.select(["custom_match_id", "player_id"] + markov_feature_cols)
+            rename_B = {c: f"markov_{c}_B" for c in markov_feature_cols}
+            markov_B = markov_B.rename(rename_B).rename({"player_id": "loser_id"})
+            
+            matches = safe_join(matches, markov_B, ["custom_match_id", "loser_id"], "markov_B")
+        else:
+            # Format match-level direct
+            markov_cols = [c for c in baseline_markov.columns if c not in ["year", "gender"]]
+            markov_dedup = baseline_markov.select(markov_cols).unique(subset=["custom_match_id"], keep="first")
+            matches = safe_join(matches, markov_dedup, ["custom_match_id"], "baseline_markov")
+    
+    # =========================================
+    # ÉTAPE 10: Merge Charting Sequential ✅ FIXED
+    # =========================================
+    print("\n[10/11] Merge Charting Sequential...")
+    
+    if charting_seq is not None:
+        seq_id_cols = {"match_id", "player_id", "year", "set_order", "det_order"}
+        seq_feature_cols = [c for c in charting_seq.columns if c not in seq_id_cols]
+    
+        if "player_id" in charting_seq.columns and seq_feature_cols:
+            if "det_order" in charting_seq.columns:
+                charting_seq = (
+                    charting_seq.sort(["match_id", "player_id", "det_order"])
+                    .group_by(["match_id", "player_id"])
+                    .agg([pl.all().last()])
+                )
+            elif "set_order" in charting_seq.columns:
+                charting_seq = (
+                    charting_seq.sort(["match_id", "player_id", "set_order"])
+                    .group_by(["match_id", "player_id"])
+                    .agg([pl.all().last()])
+                )
+            else:
+                charting_seq = charting_seq.unique(subset=["match_id", "player_id"], keep="last")
+            
+            print(f"  Après agrégation: {len(charting_seq):,} rows")
+            
+            # Recalculer les colonnes features après agrégation
+            seq_feature_cols = [c for c in charting_seq.columns 
+                               if c not in {"match_id", "player_id", "year", "set_order", "det_order"}]
+            
+            if "match_id_ta_source" in matches.columns and seq_feature_cols:
+                # Winner (A)
+                seq_A = charting_seq.select(["match_id", "player_id"] + seq_feature_cols)
+                rename_A = {c: f"seq_{c}_A" for c in seq_feature_cols}
+                seq_A = seq_A.rename(rename_A)
+                seq_A = seq_A.rename({"match_id": "match_id_ta_source", "player_id": "winner_id"})
+                
+                matches = safe_join(matches, seq_A, ["match_id_ta_source", "winner_id"], "charting_seq_A")
+                
+                # Loser (B)
+                seq_B = charting_seq.select(["match_id", "player_id"] + seq_feature_cols)
+                rename_B = {c: f"seq_{c}_B" for c in seq_feature_cols}
+                seq_B = seq_B.rename(rename_B)
+                seq_B = seq_B.rename({"match_id": "match_id_ta_source", "player_id": "loser_id"})
+                
+                matches = safe_join(matches, seq_B, ["match_id_ta_source", "loser_id"], "charting_seq_B")
+            else:
+                print("  ⚠️ match_id_ta_source non disponible pour join charting_seq")
+        else:
+            print("  ⚠️ charting_seq format inattendu")
+    else:
+        print("  ⏭️ charting_sequential non disponible")
+
+
+    # =========================================
+    # ÉTAPE 11: Merge Odds Layer (NEW!)
+    # =========================================
+    print("\n[11/11] Merge Odds Layer...")
+    
+    if odds is not None:
+        # Colonnes à garder
+        odds_cols = [
+            "custom_match_id",
+            "odds_winner", "odds_loser",
+            "odds_implied_prob_winner", "odds_implied_prob_loser",
+            "bookmaker_margin", "log_odds_ratio"
+        ]
+        odds_cols = [c for c in odds_cols if c in odds.columns]
+        
+        odds_subset = odds.select(odds_cols)
+        
+        matches = safe_join(matches, odds_subset, ["custom_match_id"], "odds")
+        
+        # Stats
+        n_with_odds = matches["odds_implied_prob_winner"].is_not_null().sum()
+        print(f"  🎰 Matchs avec cotes: {n_with_odds:,}/{len(matches):,} ({100*n_with_odds/len(matches):.1f}%)")
+    
+    # =========================================
+    # POST-PROCESSING
+    # =========================================
+
+    print("\n[POST] Création features dérivées...")
+    
+    # Target (toujours 1 car A=winner dans les données brutes)
+    # En training, on shufflera A/B pour avoir target ∈ {0,1}
+    matches = matches.with_columns([
+        pl.lit(1).cast(pl.Int8).alias("target_A_wins")
+    ])
+
+    PI2 = math.pi ** 2
+    SCALE = 173.7178
+    
+    def glicko_expected_expr(rA: pl.Expr, rdA: pl.Expr, rB: pl.Expr, rdB: pl.Expr) -> pl.Expr:
+        """
+        P(A gagne) selon Glicko-2 (NULL-safe).
+        Retourne NULL si une des 4 valeurs est NULL.
+        """
+        muA  = (rA - 1500.0) / SCALE
+        muB  = (rB - 1500.0) / SCALE
+        phiB = rdB / SCALE
+        gB   = 1.0 / (1.0 + (3.0 * (phiB * phiB) / PI2)).sqrt()
+        return pl.when(
+            rA.is_not_null() & rdA.is_not_null() & rB.is_not_null() & rdB.is_not_null()
+        ).then(
+            1.0 / (1.0 + (-(gB * (muA - muB))).exp())
+        ).otherwise(
+            None
+        )
+    
+    # --- GLICKO PROBA GLOBAL ---
+    #needed = ["g2_global_rating_A", "g2_global_rd_A", "g2_global_rating_B", "g2_global_rd_B"]
+    #if all(c in matches.columns for c in needed):
+        #matches = matches.with_columns([
+            #glicko_expected_expr(
+                #pl.col("g2_global_rating_A").cast(pl.Float64),
+                #pl.col("g2_global_rd_A").cast(pl.Float64),
+                #pl.col("g2_global_rating_B").cast(pl.Float64),
+                #pl.col("g2_global_rd_B").cast(pl.Float64),
+            #).clip(0.02, 0.98).cast(pl.Float32).alias("glicko_prob_A")
+        #])
+        #print("  ✅ glicko_prob_A créé (global)")
+    #else:
+        #print("  ⚠️ g2_global_* manquant → glicko_prob_A non créé")
+
+    # 2) SURFACE proba (Hard/Clay/Grass/Carpet + U pour null)
+    # ---------------------------
+    #surface_map = {"Hard": "H", "Clay": "C", "Grass": "G", "Carpet": "P"}
+    
+    #def have_surface(code: str) -> bool:
+        #return all(col in matches.columns for col in [
+            #f"g2_surface_{code}_rating_A", f"g2_surface_{code}_rd_A",
+            #f"g2_surface_{code}_rating_B", f"g2_surface_{code}_rd_B",
+        #])
+    
+    #if "tourney_surface_ta" in matches.columns:
+        #expr = pl.lit(None).cast(pl.Float64)
+    
+        #for surf_name, code in surface_map.items():
+            #if have_surface(code):
+                #expr = pl.when(pl.col("tourney_surface_ta") == surf_name).then(
+                    #glicko_expected_expr(
+                        #pl.col(f"g2_surface_{code}_rating_A").cast(pl.Float64),
+                        #pl.col(f"g2_surface_{code}_rd_A").cast(pl.Float64),
+                        #pl.col(f"g2_surface_{code}_rating_B").cast(pl.Float64),
+                        #pl.col(f"g2_surface_{code}_rd_B").cast(pl.Float64),
+                    #)
+                #).otherwise(expr)
+    
+        # null surface => U
+        #if have_surface("U"):
+            #expr = pl.when(pl.col("tourney_surface_ta").is_null()).then(
+                #glicko_expected_expr(
+                    #pl.col("g2_surface_U_rating_A").cast(pl.Float64),
+                    #pl.col("g2_surface_U_rd_A").cast(pl.Float64),
+                    #pl.col("g2_surface_U_rating_B").cast(pl.Float64),
+                    #pl.col("g2_surface_U_rd_B").cast(pl.Float64),
+                #)
+            #).otherwise(expr)
+    
+        #matches = matches.with_columns([
+            #expr.clip(0.02, 0.98).cast(pl.Float32).alias("glicko_prob_surface_A")
+        #])
+        #print("  ✅ glicko_prob_surface_A créé (surface-aware)")
+    
+    # ---------------------------
+    # 3) BLEND final (utiliser partout)
+    # ---------------------------
+    #matches = matches.with_columns([
+        #pl.coalesce([
+            #pl.col("glicko_prob_surface_A"),
+            #pl.col("glicko_prob_A"),
+            #pl.lit(0.5)
+        #]).cast(pl.Float32).alias("glicko_prob_blend_A")
+    #])
+    #print("  ✅ glicko_prob_blend_A créé (surface > global > 0.5)")
+    print("  ⏭️ glicko_prob_* skipped (will be calculated post-shuffle in PP9)")
+    # Rank difference (si disponible)
+    if "winner_rank_ta" in matches.columns and "loser_rank_ta" in matches.columns:
+        matches = matches.with_columns([
+            (pl.col("loser_rank_ta") - pl.col("winner_rank_ta")).alias("rank_diff_A_minus_B"),
+            (pl.col("winner_rank_ta") / (pl.col("loser_rank_ta") + 1)).alias("rank_ratio_A_over_B"),
+        ])
+    
+    # Is upset (winner rank > loser rank)
+    if "winner_rank_ta" in matches.columns and "loser_rank_ta" in matches.columns:
+        matches = matches.with_columns([
+            (pl.col("winner_rank_ta") > pl.col("loser_rank_ta")).cast(pl.Int8).alias("is_upset")
+        ])
+    
+    # Surface one-hot
+    if "tourney_surface_ta" in matches.columns:
+        matches = matches.with_columns([
+            (pl.col("tourney_surface_ta") == "Hard").cast(pl.Int8).alias("surface_hard"),
+            (pl.col("tourney_surface_ta") == "Clay").cast(pl.Int8).alias("surface_clay"),
+            (pl.col("tourney_surface_ta") == "Grass").cast(pl.Int8).alias("surface_grass"),
+            (pl.col("tourney_surface_ta") == "Carpet").cast(pl.Int8).alias("surface_carpet"),
+        ])
+    
+    # Round encoding
+    ROUND_ORDER = {
+        "R128": 1, "R64": 2, "R32": 3, "R16": 4, 
+        "QF": 5, "SF": 6, "F": 7, "RR": 3
+    }
+    if "round_ta" in matches.columns:
+        matches = matches.with_columns([
+            pl.col("round_ta").replace(ROUND_ORDER, default=0).cast(pl.Int8).alias("round_num")
+        ])
+    
+    # Tournament level encoding
+    LEVEL_ORDER = {
+        "G": 5,  # Grand Slam
+        "M": 4,  # Masters 1000
+        "A": 3,  # ATP 500
+        "B": 2,  # ATP 250
+        "X": 1,  # Challenger/ITF
+    }
+    if "tourney_level_ta" in matches.columns:
+        matches = matches.with_columns([
+            pl.col("tourney_level_ta").replace(LEVEL_ORDER, default=1).cast(pl.Int8).alias("tourney_level_num")
+        ])
+    
+    # =========================================
+    # VALIDATION FINALE
+    # =========================================
+    print("\n" + "=" * 70)
+    print("   VALIDATION FINALE")
+    print("=" * 70)
+    
+    print(f"\n  Shape finale: {matches.shape}")
+    print(f"  Colonnes: {len(matches.columns)}")
+    
+    # Compter les types de features
+    # ✅ Comptage corrigé
+    n_srvret = len([c for c in matches.columns if c.startswith("srvret_")])
+    n_glicko = len([c for c in matches.columns if "g2_" in c or "glicko" in c])
+    n_psych = len([c for c in matches.columns if any(x in c for x in ["streak", "upset_rate", "clutch", "comeback", "mental"])])
+    n_env = len([c for c in matches.columns if any(x in c for x in ["altitude", "ball_", "court_speed", "weather", "temperature"])])
+    n_charting = len([c for c in matches.columns if "chart" in c.lower() or c.startswith("super_")])
+    n_h2h = len([c for c in matches.columns if "h2h" in c.lower()])
+    n_base_rolling = len([c for c in matches.columns 
+                          if (c.startswith(("r5_", "r10_", "r20_")) and "chart" not in c.lower())
+                          or "serve_strength" in c or "return_strength" in c])
+    n_seq = len([c for c in matches.columns if c.startswith("seq_")])
+    
+    n_meta = len(matches.columns) - n_srvret - n_glicko - n_psych - n_env - n_charting - n_h2h - n_base_rolling - n_seq
+    
+    print(f"\n  Features par catégorie:")
+    print(f"    • SRV/RET + Markov: {n_srvret}")
+    print(f"    • Glicko-2: {n_glicko}")
+    print(f"    • Psychological: {n_psych}")
+    print(f"    • Environmental: {n_env}")
+    print(f"    • Charting: {n_charting}")
+    print(f"    • H2H: {n_h2h}")
+    print(f"    • Sequential: {n_seq}")  # ✅ AJOUT
+    print(f"    • Meta/Derived: {n_meta}")  # ✅ Utiliser n_meta calculé
+    print(f"    • Base Stats Rolling: {n_base_rolling}")
+    
+    # Null rates
+    print(f"\n  Taux de null par catégorie:")
+    for prefix, name in [("p_match_markov", "Markov"), ("g2_", "Glicko"), 
+                         ("mental_toughness", "Mental"), ("r10_chart", "Charting")]:
+        cols = [c for c in matches.columns if prefix in c]
+        if cols:
+            null_rate = matches.select(pl.col(cols[0]).is_null().mean()).item()
+            print(f"    • {name}: {100*null_rate:.1f}% null")
+    
+    # =========================================
+    # ÉCRITURE
+    # =========================================
+    print("\n[WRITE] Écriture du dataset unifié...")
+    
+    # Dédupliquer avant écriture (évite les duplicats de joins)
+    n_before = len(matches)
+    matches = matches.unique(subset=["custom_match_id"], keep="first")
+    n_after = len(matches)
+    if n_before != n_after:
+        print(f"  ⚠️ Déduplication: {n_before:,} → {n_after:,} rows (-{n_before - n_after:,} duplicats)")
+    
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Écriture parquet unique (pas partitionné pour faciliter le chargement ML)
+    matches.write_parquet(OUTPUT_FILE, compression="zstd")
+    print(f"  ✅ {OUTPUT_FILE}")
+    print(f"     Taille: {OUTPUT_FILE.stat().st_size / 1024 / 1024:.1f} MB")
+    
+    # Écriture partitionnée aussi (pour exploration)
+    partitioned_dir = OUTPUT_DIR / "matches_ml_ready_partitioned"
+    if partitioned_dir.exists():
+        import shutil
+        shutil.rmtree(partitioned_dir)
+    matches.write_parquet(partitioned_dir, partition_by=["year"], compression="zstd")
+    print(f"  ✅ {partitioned_dir} (partitionné par année)")
+    
+    # Métadonnées
+    meta = {
+        "created_at": datetime.now().isoformat(),
+        "gender": gender,
+        "start_year": START_YEAR,
+        "n_matches": len(matches),
+        "n_features": len(matches.columns),
+        "features_by_category": {
+            "srvret_markov": n_srvret,
+            "glicko2": n_glicko,
+            "psychological": n_psych,
+            "environmental": n_env,
+            "charting": n_charting,
+            "h2h": n_h2h,
+        },
+        "layers_merged": [
+            "ratings_srvret_layer",
+            "ratings_glicko2" if RATINGS_DIR.exists() else None,
+            "h2h_decay" if H2H_DIR.exists() else None,
+            "psychological_momentum",
+            "environmental_context",
+            "charting_style",
+            "charting_super" if CHARTING_SUPER_DIR.exists() else None,
+            "baseline_markov" if BASELINE_MARKOV_DIR.exists() else None,
+            "charting_sequential" if CHARTING_SEQ_DIR.exists() else None,
+            "odds_layer" if ODDS_DIR.exists() else None,
+        ]
+    }
+    meta["layers_merged"] = [l for l in meta["layers_merged"] if l]
+    
+    meta_file = OUTPUT_DIR / "metadata.json"
+    meta_file.write_text(json.dumps(meta, indent=2))
+    print(f"  ✅ {meta_file}")
+    
+    elapsed = time.perf_counter() - t0
+    
+    print("\n" + "=" * 70)
+    print(f"   PREPROCESS 2.2 TERMINÉ!")
+    print(f"   Temps: {elapsed:.1f}s")
+    print("=" * 70)
+    
+    return matches
+
+
+# ===============================================
+# SANITY CHECK
+# ===============================================
+
+def sanity_check_merged():
+    """Vérifie le dataset mergé."""
+    print("\n" + "=" * 70)
+    print("   SANITY CHECK - DATASET MERGÉ")
+    print("=" * 70)
+    
+    if not OUTPUT_FILE.exists():
+        print("  ❌ Dataset non trouvé!")
+        return False
+    
+    df = pl.read_parquet(OUTPUT_FILE)
+    print(f"\n  Shape: {df.shape}")
+    
+    # Vérifier colonnes clés
+    required = ["custom_match_id", "winner_id", "loser_id", "target_A_wins"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        print(f"  ❌ Colonnes manquantes: {missing}")
+        return False
+    print(f"  ✅ Colonnes clés présentes")
+    
+    # Vérifier features A/B appariées
+    cols_A = [c for c in df.columns if c.endswith("_A")]
+    cols_B = [c for c in df.columns if c.endswith("_B")]
+    print(f"  Features _A: {len(cols_A)}")
+    print(f"  Features _B: {len(cols_B)}")
+    
+    # Vérifier pas de leakage (target toujours 1)
+    target_unique = df.select("target_A_wins").unique().to_series().to_list()
+    if target_unique == [1]:
+        print(f"  ✅ Target = 1 pour tous (A=winner) - OK pour shuffle")
+    else:
+        print(f"  ⚠️ Target values: {target_unique}")
+    
+    # Années couvertes
+    years = df.select("year").unique().sort("year").to_series().to_list()
+    print(f"  Années: {min(years)} → {max(years)} ({len(years)} années)")
+    
+    # Distribution surface
+    if "tourney_surface_ta" in df.columns:
+        print(f"\n  Distribution surfaces:")
+        surface_dist = df.group_by("tourney_surface_ta").len().sort("len", descending=True)
+        for row in surface_dist.iter_rows():
+            print(f"    • {row[0]}: {row[1]:,} ({100*row[1]/len(df):.1f}%)")
+    
+    print("\n  🎉 Sanity check passé!")
+    return True
+
+
+# ===============================================
+# UTILITY: Créer version shufflée pour training
+# ===============================================
+
+def create_shuffled_training_set(seed: int = 42):
+    """
+    Crée une version où A/B sont shufflés aléatoirement.
+    Ainsi target ∈ {0, 1} de manière équilibrée.
+    """
+    import numpy as np
+    
+    print("\n[SHUFFLE] Création dataset d'entraînement shufflé...")
+    
+    df = pl.read_parquet(OUTPUT_FILE)
+    n = len(df)
+    
+    np.random.seed(seed)
+    swap_mask = np.random.rand(n) > 0.5
+    
+    # Identifier colonnes A et B
+    cols_A = [c for c in df.columns if c.endswith("_A")]
+    cols_B = [c for c in df.columns if c.endswith("_B")]
+    
+    # Créer mapping de swap
+    swap_pairs = []
+    for col_a in cols_A:
+        base = col_a[:-2]  # Remove "_A"
+        col_b = f"{base}_B"
+        if col_b in cols_B:
+            swap_pairs.append((col_a, col_b))
+    
+    print(f"  Paires A/B à swapper: {len(swap_pairs)}")
+    
+    # Ajouter colonne de swap
+    df = df.with_columns([
+        pl.Series("_swap", swap_mask)
+    ])
+    
+    # Swapper les colonnes
+    for col_a, col_b in swap_pairs:
+        df = df.with_columns([
+            pl.when(pl.col("_swap"))
+              .then(pl.col(col_b))
+              .otherwise(pl.col(col_a))
+              .alias(col_a),
+            pl.when(pl.col("_swap"))
+              .then(pl.col(col_a))
+              .otherwise(pl.col(col_b))
+              .alias(col_b),
+        ])
+    
+    # Swapper winner/loser IDs
+    df = df.with_columns([
+        pl.when(pl.col("_swap"))
+          .then(pl.col("loser_id"))
+          .otherwise(pl.col("winner_id"))
+          .alias("player_A_id"),
+        pl.when(pl.col("_swap"))
+          .then(pl.col("winner_id"))
+          .otherwise(pl.col("loser_id"))
+          .alias("player_B_id"),
+    ])
+    
+    # Swapper ranks
+    if "winner_rank_ta" in df.columns:
+        df = df.with_columns([
+            pl.when(pl.col("_swap"))
+              .then(pl.col("loser_rank_ta"))
+              .otherwise(pl.col("winner_rank_ta"))
+              .alias("rank_A"),
+            pl.when(pl.col("_swap"))
+              .then(pl.col("winner_rank_ta"))
+              .otherwise(pl.col("loser_rank_ta"))
+              .alias("rank_B"),
+        ])
+    
+    # Target: 1 si A gagne (après swap), 0 sinon
+    df = df.with_columns([
+        pl.when(pl.col("_swap"))
+          .then(pl.lit(0))
+          .otherwise(pl.lit(1))
+          .cast(pl.Int8)
+          .alias("target")
+    ])
+    
+    # Cleanup
+    df = df.drop(["_swap", "target_A_wins"])
+    
+    # Stats
+    target_dist = df.select("target").to_series().value_counts()
+    print(f"  Distribution target après shuffle:")
+    for row in target_dist.iter_rows():
+        print(f"    • {row[0]}: {row[1]:,} ({100*row[1]/n:.1f}%)")
+    
+    # Écriture
+    shuffled_file = OUTPUT_DIR / "matches_ml_ready_shuffled.parquet"
+    df.write_parquet(shuffled_file, compression="zstd")
+    print(f"  ✅ {shuffled_file}")
+    
+    return df
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    # Merge
+    df = merge_all_layers(GENDER)
+    
+    # Sanity check
+    sanity_check_merged()
+    
+    # Optionnel: créer version shufflée
+    create_shuffled_training_set(seed=42)
+    
+    print("\n✅ Preprocess 4 terminé!")
+    print(f"\nProchaine étape:")
+    print(f"  1. Exécuter create_shuffled_training_set() pour l'entraînement")
+
+
+
+if __name__ == "__main__":
+    main()

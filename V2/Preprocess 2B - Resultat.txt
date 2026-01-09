@@ -1,0 +1,143 @@
+=====================================================================
+   🎰 TENNISTITAN - PP_02b ODDS LAYER (NASA SOTA)
+======================================================================
+   2026-01-08 18:01:16
+======================================================================
+
+============================================================
+   LOAD ODDS DATA
+============================================================
+  📂 Fichier: C:\Users\Administrateur\Tennis POLAR v3\data_raw\atp_tennis.csv
+  📊 Lignes brutes: 66,681
+  📋 Colonnes: ['Tournament', 'Date', 'Series', 'Court', 'Surface', 'Round', 'Best of', 'Player_1', 'Player_2', 'Winner', 'Rank_1', 'Rank_2', 'Pts_1', 'Pts_2', 'Odd_1', 'Odd_2', 'Score']
+
+  ✅ Lignes valides: 62,809
+  📅 Période: 2001-01-01 → 2025-11-16
+  🎾 Tournois: 254
+
+============================================================
+   LOAD MATCHES DATA
+============================================================
+  📊 Matchs: 544,245
+  📅 Période: 1942-08-01 → 2025-09-01
+shape: (5, 2)
+┌────────────┬────────────┐
+│ match_date ┆ week_start │
+│ ---        ┆ ---        │
+│ date       ┆ date       │
+╞════════════╪════════════╡
+│ 1942-08-01 ┆ 1942-07-26 │
+│ 1942-08-01 ┆ 1942-07-26 │
+│ 1942-08-01 ┆ 1942-07-26 │
+│ 1942-08-01 ┆ 1942-07-26 │
+│ 1942-08-01 ┆ 1942-07-26 │
+└────────────┴────────────┘
+shape: (5, 2)
+┌─────────────┬────────────┐
+│ date_parsed ┆ week_start │
+│ ---         ┆ ---        │
+│ date        ┆ date       │
+╞═════════════╪════════════╡
+│ 2001-01-01  ┆ 2000-12-31 │
+│ 2001-01-01  ┆ 2000-12-31 │
+│ 2001-01-01  ┆ 2000-12-31 │
+│ 2001-01-01  ┆ 2000-12-31 │
+│ 2001-01-01  ┆ 2000-12-31 │
+└─────────────┴────────────┘
+
+============================================================
+   MATCHING ODDS TO MATCHES (v2 ROBUST)
+============================================================
+  🔍 Matching 62,809 cotes...
+  📅 Matching par date (±7 jours)
+     Progression: 0/62,809 (matchés: 0)
+     Progression: 10,000/62,809 (matchés: 5,129)
+     Progression: 20,000/62,809 (matchés: 13,208)
+     Progression: 30,000/62,809 (matchés: 21,941)
+     Progression: 40,000/62,809 (matchés: 30,395)
+     Progression: 50,000/62,809 (matchés: 38,988)
+     Progression: 60,000/62,809 (matchés: 46,993)
+
+  ⏱️  Temps: 32.2s
+  ✅ Matchés: 48,674 (77.5%)
+  ❌ Non matchés: 14,135
+  📊 Par type: {'P1=W,P2=L': 24582, 'P1=L,P2=W': 24073, 'partial': 19}
+
+============================================================
+   COMPUTE ODDS FEATURES
+============================================================
+  🔄 Après dedup SOTA: 48,472 matchs uniques
+  📊 Matchs avec cotes: 48,472
+  📈 Odds winner mean: 1.82
+  📉 Odds loser mean: 3.44
+  💰 Marge bookmaker mean: 6.7%
+
+============================================================
+   SAVE ODDS LAYER
+============================================================
+  ✅ Features: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\odds_layer\odds_features.parquet
+  ✅ Rapport: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\odds_layer\matching_report.json
+
+  📊 Total matchs avec cotes: 48,472
+
+============================================================
+   NASA SOTA: CREATING LONG FORMAT
+============================================================
+
+============================================================
+   CREATE ODDS LONG FORMAT (NASA SOTA)
+============================================================
+  📊 Matchs avec odds: 48,472
+  📋 Colonnes optionnelles disponibles: ['bookmaker_margin', 'odds_match_confidence']
+  ✅ Format long créé: 96,944 rows
+  📊 Colonnes: ['custom_match_id', 'player_id', 'odds', 'odds_implied_prob', 'bookmaker_margin', 'odds_match_confidence']
+  ✅ Format long sauvegardé: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\odds_layer\odds_long.parquet
+  📊 Shape: (96944, 6)
+
+============================================================
+   NASA SOTA: SANITY CHECK
+============================================================
+  📊 Test matches (2001+): 10,000
+
+============================================================
+   ATTACH ODDS A/B (NASA SOTA - NO LEAK)
+============================================================
+  📋 Match ID col: custom_match_id
+  📋 Player A col: winner_id
+  📋 Player B col: loser_id
+  ✅ Coverage odds_A: 18.9%
+  ✅ Coverage odds_B: 18.9%
+  📊 Matchs testés avec odds: 1,891
+  📊 % winners favoris (odds_A < odds_B): 66.5%
+  ✅ Ratio dans la plage attendue (55-85%)
+
+============================================================
+   SOTA VERIFICATION
+============================================================
+  🔍 Duplicates sur custom_match_id: 0
+  📊 % odds_winner < odds_loser (global): 68.46%
+  📊 % odds_winner < odds_loser (conf≥95): 68.69% (24,421 rows)
+
+======================================================================
+   ✅ PP_02b ODDS LAYER COMPLETE (NASA SOTA)
+======================================================================
+   ⏱️  Temps total: 39.5s
+   📊 Matchs avec cotes: 48,472
+   📈 Taux de matching: 77.5%
+
+📁 OUTPUT FILES:
+   • odds_features.parquet  (format winner/loser - legacy)
+   • odds_long.parquet      (format player_id - NASA SOTA)
+   • matching_report.json
+
+🚀 UTILISATION:
+   # Dans PP_MERGE (design actuel winner/loser):
+   odds_long = pl.read_parquet(ODDS_DIR / "odds_long.parquet")
+   df = attach_odds_AB_no_leak(df, odds_long, 
+                                playerA_col="winner_id", 
+                                playerB_col="loser_id")
+   
+   # Après shuffle A/B (futur):
+   df = attach_odds_AB_no_leak(df, odds_long,
+                                playerA_col="player_id_A",
+                                playerB_col="player_id_B")

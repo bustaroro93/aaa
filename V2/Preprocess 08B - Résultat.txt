@@ -1,0 +1,83 @@
+=====================================================================
+   PP_08B - ULTIMATE GOD SOTA FEATURES 2026 v5
+   TennisTitan - Markov _B fix + NaN handling
+======================================================================
+   Timestamp: 2026-01-08 18:42:10
+======================================================================
+
+[0/8] Loading best SOTA file...
+  ✅ Using: matches_ml_ready_SOTA_v4.parquet
+  Shape: (543927, 1337)
+
+[1/8] Adding SRGS features (NASA PRIOR-ONLY)...
+  ✅ Using PRIOR: p_srv_pt_prior_A
+  ✅ Using PRIOR: p_srv_pt_prior_B
+  ✅ SRGS features added (NASA ANTI-LEAK)
+
+[2/8] Adding Full Markov Chain features (v5 avec _B)...
+     p_srv_pt_A: mean=0.6501, min=0.5000, max=0.7475
+  ✅ Markov features added (v5 avec versions _A ET _B)
+     p_match_A: mean=0.5001, std=0.0159
+     p_match_B: mean=0.4999, std=0.0159
+
+[3/8] Adding Intra-Tournament Momentum features...
+  rounds_played_approx: ❌ (will create)
+  cumulative_fatigue: ❌ (will create)
+  round_ta: ✅
+  ✅ round_difficulty created (when/then natif)
+  ✅ rounds_played_approx created
+  ✅ cumulative_fatigue_index created
+
+[4/8] Adding Form Slope features...
+  ✅ form_slope_A from super_tb_serve_win_rate_r5_A, super_tb_serve_win_rate_r20_A
+  ✅ form_slope_B from super_tb_serve_win_rate_r5_B, super_tb_serve_win_rate_r20_B
+
+[5/8] Adding Handedness matchup features...
+  📁 Loading handedness from atp_master_players.csv...
+     Loaded 8023 players
+     Handedness: 7513 Right, 510 Left (6.4% lefties)
+     ID columns: winner=winner_id, loser=loser_id
+     After merge: 63109 lefties in A, 57041 in B
+  ✅ Handedness features added
+
+[6/8] Adding Age-Peak features (NASA-safe STRICT)...
+  🔍 age_A column: None
+  🔍 age_B column: None
+  ⚠️ age_at_match_A/B not found - defaulting to null
+
+[7/8] Adding Pressure Differential features...
+  ✅ clutch_differential_A added
+  ✅ clutch_differential_B added
+
+[8/8] Adding Round features...
+  ✅ Round features added
+
+======================================================================
+   ✅ PP_08 v5 COMPLETE!
+======================================================================
+   Input: matches_ml_ready_SOTA_v4.parquet (1337 cols)
+   Output: matches_ml_ready_SOTA_v5.parquet (1386 cols)
+   New features: +49
+   ⏱️  Time: 10.7s
+
+📊 GOD SOTA FEATURES ADDED:
+   ✅ SRGS: 3 features
+   ✅ Markov: 40 features
+   ✅ Momentum: 45 features
+   ✅ Form Slope: 3 features
+   ✅ Handedness: 1 features
+   ✅ Age-Peak: 10 features
+   ✅ Clutch: 18 features
+   ✅ Round: 4 features
+
+📋 MARKOV PAIRING CHECK:
+   _A features: 14 → ['markov_p_point_srv_A', 'markov_p_point_srv_vs_opp_A', 'markov_p_point_srv_blend_A', 'markov_p_hold_A', 'markov_p_break_A', 'markov_p_set_tb12_A', 'markov_p_match_bo3_A', 'markov_p_match_bo5_A', 'markov_p_match_markov_A', 'markov_match_key_A', 'markov_p_set_A', 'markov_p_match_A', 'markov_edge_A', 'markov_fair_odds_A']
+   _B features: 14 → ['markov_p_point_srv_B', 'markov_p_point_srv_vs_opp_B', 'markov_p_point_srv_blend_B', 'markov_p_hold_B', 'markov_p_break_B', 'markov_p_set_tb12_B', 'markov_p_match_bo3_B', 'markov_p_match_bo5_B', 'markov_p_match_markov_B', 'markov_match_key_B', 'markov_p_set_B', 'markov_p_match_B', 'markov_edge_B', 'markov_fair_odds_B']
+   ✅ Markov features properly paired!
+
+📋 CORRECTIONS v5:
+   ✅ Markov: Ajout des versions _B (p_set_B, p_match_B, edge_B)
+   ✅ fill_nan() + fill_null() partout
+   ✅ when/then natif
+   ✅ Détection dynamique IDs
+

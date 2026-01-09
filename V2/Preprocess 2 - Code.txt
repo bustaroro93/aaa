@@ -1,0 +1,1979 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+   TENNISTITAN 2026 - PREPROCESS 2 GOD MODE (Polars)
+================================================================================
+Migration complète du pipeline preprocess2 de Pandas vers Polars.
+
+Cellules migrées:
+  - A (0)   : pct_normalize          → matches_base_scaled
+  - B (0.1) : fix_2ndwon             → fix colonnes 2ndWon_p
+  - C (S)   : surface_speed_index    → aux_data/surface_speed_index.parquet
+  - D (A)   : ratings_glicko2        → features/ratings_glicko2/
+  - E (B)   : charting_super         → features/charting_super/
+  - F (C)   : h2h_decay              → features/h2h_decay/
+  - G (D)   : baseline_markov        → features/baseline_markov/
+  - H/I     : sanity_checks          → validation SOTA
+
+Notes:
+  - Glicko2 et H2H restent partiellement en Python (algorithmes séquentiels stateful)
+  - I/O et transformations vectorisables en Polars natif
+  - Anti-leakage: shift(1) AVANT rolling, tri par match_sequence_key
+
+Usage:
+    python preprocess2_GODMODE_COMPLET.py
+    
+Ou en import:
+    from preprocess2_GODMODE_COMPLET import run_preprocess2_godmode
+    run_preprocess2_godmode("atp")
+
+================================================================================
+"""
+
+from __future__ import annotations
+
+import math
+import shutil
+import time
+import datetime as dt
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Iterable
+
+import numpy as np
+import pandas as pd
+import polars as pl
+
+# ============================================================================
+# CONSTANTES GLOBALES
+# ============================================================================
+
+ROOT = Path.cwd()
+
+# Colonnes % à normaliser (0-100 → 0-1)
+PCT_WHITELIST = [
+    'w_s_ace_p', 'w_s_df_p', 'w_s_1stIn_p', 'w_s_1stWon_p', 'w_s_2ndWon_p',
+    'w_ret_1stWon_p', 'w_ret_2ndWon_p', 'w_tpw_p', 'w_rpw_p', 'w_bp_conv_p',
+    'l_s_ace_p', 'l_s_df_p', 'l_s_1stIn_p', 'l_s_1stWon_p', 'l_s_2ndWon_p',
+    'l_ret_1stWon_p', 'l_ret_2ndWon_p', 'l_tpw_p', 'l_rpw_p', 'l_bp_conv_p'
+]
+
+# Colonnes problématiques (recalculées en cellule B)
+PROBLEMATIC_2ND = {'w_s_2ndWon_p', 'l_s_2ndWon_p', 'w_ret_2ndWon_p', 'l_ret_2ndWon_p'}
+
+# Glicko-2 constants
+G2_INIT_RATING = 1500.0
+G2_INIT_RD = 350.0
+G2_INIT_SIGMA = 0.06
+G2_TAU = 0.5
+G2_EPS = 1e-6
+
+# H2H decay constants
+LAMBDA_DAYS_GLOBAL = 420.0    # ~14 mois
+LAMBDA_DAYS_SURFACE = 540.0   # plus long pour surface
+
+# Rolling windows
+ROLLS = (5, 10, 20)
+
+# Filtres
+START_YEAR = 1980
+VALID_STATUS = {"COMPLETED"}
+
+# Round order pour tri
+ROUND_ORDER = {
+    "Q": 0, "Q1": 0, "Q2": 0, "Q3": 0,
+    "RR": 16, "R128": 20, "R64": 30, "R56": 35, "R48": 37,
+    "R32": 40, "R28": 45, "R24": 47, "R16": 50, "QF": 60, "SF": 70, "F": 80, "3RD": 7
+}
+
+
+# ============================================================================
+# CLASSE IO (Gestion des chemins)
+# ============================================================================
+
+class IO:
+    """Gestion centralisée des chemins I/O."""
+    
+    def __init__(self, root: Path = ROOT):
+        self.root = root
+        self.data_clean = root / "data_clean"
+        
+        # Inputs
+        self.matches_base = self.data_clean / "matches_base"
+        self.matches_base_scaled = self.data_clean / "matches_base_scaled"
+        self.charting_long = self.data_clean / "charting_long"
+        self.players_ref = self.data_clean / "players_ref"
+        
+        # Outputs
+        self.aux_data = self.data_clean / "aux_data"
+        self.features = self.data_clean / "features"
+        self.reports = self.data_clean / "_reports"
+        
+        # Feature directories
+        self.glicko2_dir = self.features / "ratings_glicko2"
+        self.charting_super_dir = self.features / "charting_super"
+        self.h2h_dir = self.features / "h2h_decay"
+        self.markov_dir = self.features / "baseline_markov"
+        
+    def ensure_dirs(self):
+        """Crée les répertoires de sortie."""
+        for d in [self.aux_data, self.features, self.reports,
+                  self.glicko2_dir, self.charting_super_dir, 
+                  self.h2h_dir, self.markov_dir]:
+            d.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================================
+# HELPERS POLARS
+# ============================================================================
+
+def read_parquet_dir_polars(path: Path, gender: Optional[str] = None) -> pl.LazyFrame:
+    """Lit un répertoire Parquet partitionné avec filtre optionnel sur gender."""
+    lf = pl.scan_parquet(str(path / "**/*.parquet"), hive_partitioning=True)
+    if gender and "gender" in lf.collect_schema().names():
+        lf = lf.filter(pl.col("gender") == gender)
+    return lf
+
+
+def write_parquet_partitioned_polars(
+    df: pl.DataFrame,
+    out_dir: Path,
+    partition_cols: List[str] = ["gender", "year"]
+) -> None:
+    """Écrit un DataFrame Polars en Parquet partitionné - VERSION POLARS NATIVE."""
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # ✅ FIX: Nettoyer les colonnes de partition (artefacts JSON)
+    for col in partition_cols:
+        if col in df.columns:
+            if col == "gender":
+                df = df.with_columns([
+                    pl.col(col).cast(pl.Utf8).str.replace_all(r'[\[\]\n\s"]', '').alias(col)
+                ])
+            elif col == "year":
+                df = df.with_columns([
+                    pl.col(col).cast(pl.Int32)
+                ])
+    
+    # Debug - ✅ FIX: Safe si df vide
+    if len(df) > 0:
+        for col in partition_cols:
+            if col in df.columns:
+                first_val = df[col][0]
+                print(f"[partition] {col} = {repr(first_val)}")
+    else:
+        print("[partition] ⚠️ DataFrame vide, skip debug")
+    
+    # ✅ Polars native (PAS PyArrow!)
+    df.write_parquet(
+        out_dir,
+        partition_by=partition_cols,
+        compression="zstd"
+    )
+
+
+def normalize_surface(s: str) -> str:
+    """Normalise les noms de surface."""
+    if s is None:
+        return "U"
+    s = str(s).strip().lower()
+    if s in {"h", "hard"}:
+        return "H"
+    if s in {"c", "clay"}:
+        return "C"
+    if s in {"g", "grass"}:
+        return "G"
+    if s in {"carpet", "cp", "p"}:
+        return "P"
+    return "U"
+
+
+def normalize_hand(x) -> str:
+    """Normalise la main (R/L/U)."""
+    if x is None:
+        return "U"
+    s = str(x).strip().upper()
+    if s == "R" or s.startswith("RIGHT"):
+        return "R"
+    if s == "L" or s.startswith("LEFT"):
+        return "L"
+    return "U"
+
+
+# ============================================================================
+# CELLULE A (0): PCT NORMALIZE
+# ============================================================================
+
+def pct_normalize_polars(io: IO, gender: str) -> pl.DataFrame:
+    """
+    Normalise les colonnes % de 0-100 vers 0-1.
+    ✅ FIX: Convertit NaN → null pour cohérence.
+    """
+    print("=" * 60)
+    print("CELLULE A - PCT NORMALIZE (Polars)")
+    print("=" * 60)
+    
+    lf = read_parquet_dir_polars(io.matches_base, gender)
+    df = lf.collect()
+    print(f"[pct-normalize] loaded matches_base: {len(df):,} rows")
+    
+    present_cols = [c for c in PCT_WHITELIST if c in df.columns]
+    if not present_cols:
+        print("[pct-normalize] No whitelist columns found — just copying.")
+        write_parquet_partitioned_polars(df, io.matches_base_scaled)
+        return df
+    
+    # ✅ FIX 1: Convertir NaN → null pour toutes les colonnes %
+    nan_converted = 0
+    for c in present_cols:
+        # ✅ Cast AVANT is_nan()
+        df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False).alias(c))
+        n_nan_before = df.select(pl.col(c).is_nan().sum()).item()
+        nan_converted += n_nan_before
+        
+        df = df.with_columns([
+            pl.when(pl.col(c).is_nan())
+              .then(None)
+              .otherwise(pl.col(c))
+              .alias(c)
+        ])
+    
+    print(f"[pct-normalize] {nan_converted:,} NaN convertis en null")
+    
+    # Vérifier si scaling nécessaire
+    scaled_cols = []
+    for c in present_cols:
+        max_val = df.select(pl.col(c).drop_nulls().max()).item()
+        
+        if max_val is not None and max_val > 1.0:
+            df = df.with_columns([
+                (pl.col(c) / 100.0).clip(0, 1).alias(c)
+            ])
+            scaled_cols.append(c)
+        else:
+            df = df.with_columns([
+                pl.col(c).clip(0, 1).alias(c)
+            ])
+    
+    df = df.with_columns([
+        pl.lit(1 if scaled_cols else 0).alias("schema_pct_scaled"),
+        pl.lit(",".join(scaled_cols) if scaled_cols else "").alias("schema_pct_scaled_cols")
+    ])
+    
+    print(f"[pct-normalize] {len(scaled_cols)} colonnes scalées 0-100→0-1")
+    print(f"[pct-normalize] scaled columns: {scaled_cols}")
+    
+    write_parquet_partitioned_polars(df, io.matches_base_scaled)
+    print(f"✔ matches_base_scaled → {io.matches_base_scaled}")
+    
+    return df
+
+
+# ============================================================================
+# CELLULE B (0.1): FIX 2NDWON_P
+# ============================================================================
+
+def fix_2ndwon_polars(io: IO, gender: str) -> pl.DataFrame:
+    """
+    Recalcule *_2ndWon_p à partir des données brutes.
+    GOD SOTA: recalc strict + fallback nettoyé + flags de fiabilité.
+    """
+    print("=" * 60)
+    print("CELLULE B - FIX 2NDWON_P (Polars)")
+    print("=" * 60)
+
+    lf = read_parquet_dir_polars(io.matches_base_scaled, gender)
+    df = lf.collect()
+    print(f"[2ndWon_fix] loaded: {len(df):,} rows")
+
+    num_cols = ["w_svpt", "w_1stIn", "w_2ndWon", "l_svpt", "l_1stIn", "l_2ndWon"]
+    for c in num_cols:
+        if c in df.columns:
+            df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False).alias(c))
+
+    # NaN -> null sur inputs
+    for c in num_cols:
+        if c in df.columns:
+            df = df.with_columns(
+                pl.when(pl.col(c).is_nan()).then(None).otherwise(pl.col(c)).alias(c)
+            )
+
+    # denom
+    df = df.with_columns([
+        (pl.col("w_svpt") - pl.col("w_1stIn")).alias("w_2nd_played"),
+        (pl.col("l_svpt") - pl.col("l_1stIn")).alias("l_2nd_played"),
+    ])
+
+    out_cols = ["w_s_2ndWon_p", "l_s_2ndWon_p", "w_ret_2ndWon_p", "l_ret_2ndWon_p"]
+
+    # save old if exists
+    for c in out_cols:
+        if c in df.columns:
+            df = df.with_columns(pl.col(c).alias(f"{c}_old"))
+
+    # recalc strict
+    df = df.with_columns([
+        pl.when(pl.col("w_2nd_played") > 0)
+          .then(pl.col("w_2ndWon") / pl.col("w_2nd_played"))
+          .otherwise(None)
+          .clip(lower_bound=0, upper_bound=1)
+          .cast(pl.Float32)
+          .alias("w_s_2ndWon_p_recalc"),
+
+        pl.when(pl.col("l_2nd_played") > 0)
+          .then(pl.col("l_2ndWon") / pl.col("l_2nd_played"))
+          .otherwise(None)
+          .clip(lower_bound=0, upper_bound=1)
+          .cast(pl.Float32)
+          .alias("l_s_2ndWon_p_recalc"),
+
+        pl.when(pl.col("l_2nd_played") > 0)
+          .then((pl.col("l_2nd_played") - pl.col("l_2ndWon")) / pl.col("l_2nd_played"))
+          .otherwise(None)
+          .clip(lower_bound=0, upper_bound=1)
+          .cast(pl.Float32)
+          .alias("w_ret_2ndWon_p_recalc"),
+
+        pl.when(pl.col("w_2nd_played") > 0)
+          .then((pl.col("w_2nd_played") - pl.col("w_2ndWon")) / pl.col("w_2nd_played"))
+          .otherwise(None)
+          .clip(lower_bound=0, upper_bound=1)
+          .cast(pl.Float32)
+          .alias("l_ret_2ndWon_p_recalc"),
+    ])
+
+    # clean old -> old_clean (only if old exists)
+    for c in out_cols:
+        old = f"{c}_old"
+        if old in df.columns:
+            x = pl.col(old).cast(pl.Float64, strict=False)
+            df = df.with_columns(
+                pl.when(x.is_nan() | x.is_infinite())
+                  .then(None)
+                  .otherwise(x)
+                  .clip(lower_bound=0, upper_bound=1)
+                  .cast(pl.Float32)
+                  .alias(f"{c}_old_clean")
+            )
+
+    # coalesce + flags
+    for c in out_cols:
+        rec = f"{c}_recalc"
+        oldc = f"{c}_old_clean"
+
+        if oldc in df.columns:
+            df = df.with_columns(
+                pl.coalesce([pl.col(rec), pl.col(oldc)]).alias(c)
+            )
+            df = df.with_columns([
+                pl.col(rec).is_not_null().cast(pl.Int8).alias(f"{c}_is_recalc"),
+                (pl.col(rec).is_null() & pl.col(oldc).is_not_null()).cast(pl.Int8).alias(f"{c}_is_fallback"),
+            ])
+        else:
+            df = df.with_columns(pl.col(rec).alias(c))
+            df = df.with_columns([
+                pl.col(rec).is_not_null().cast(pl.Int8).alias(f"{c}_is_recalc"),
+                pl.lit(0).cast(pl.Int8).alias(f"{c}_is_fallback"),
+            ])
+
+    # final safety: NaN/inf -> null on outputs
+    for c in out_cols:
+        if c in df.columns:
+            y = pl.col(c).cast(pl.Float64, strict=False)
+            df = df.with_columns(
+                pl.when(y.is_nan() | y.is_infinite()).then(None).otherwise(y).cast(pl.Float32).alias(c)
+            )
+
+    # cleanup (NE PAS drop les flags *_is_recalc !)
+    
+    recalc_cols = [f"{c}_recalc" for c in out_cols if f"{c}_recalc" in df.columns]
+    old_cols = [f"{c}_old" for c in out_cols if f"{c}_old" in df.columns]
+    old_clean_cols = [f"{c}_old_clean" for c in out_cols if f"{c}_old_clean" in df.columns]
+    
+    drop_tmp = recalc_cols + old_cols + old_clean_cols + ["w_2nd_played", "l_2nd_played"]
+    drop_tmp = [x for x in drop_tmp if x in df.columns]
+    
+    df = df.drop(drop_tmp)
+
+    # trace (print safe)
+    def fmt(x):
+        return "null" if x is None else f"{float(x):.3f}"
+
+    for c in out_cols:
+        if c in df.columns:
+            stats = df.select([
+                pl.col(c).is_not_null().sum().alias("non_null"),
+                pl.col(c).min().alias("min"),
+                pl.col(c).median().alias("p50"),
+                pl.col(c).max().alias("max"),
+            ]).row(0)
+
+            rec_rate = df.select(pl.col(f"{c}_is_recalc").mean()).item()
+            fb_rate  = df.select(pl.col(f"{c}_is_fallback").mean()).item()
+
+            print(f"{c}: non-null={stats[0]:,} | min={fmt(stats[1])} | p50={fmt(stats[2])} | max={fmt(stats[3])}")
+            print(f"         -> recalc={rec_rate:.1%} | fallback={fb_rate:.1%}")
+
+    write_parquet_partitioned_polars(df, io.matches_base_scaled)
+    print(f"✔ 2ndWon_p fixed → {io.matches_base_scaled}")
+    return df
+
+# ============================================================================
+# CELLULE C (S): SURFACE SPEED INDEX
+# ============================================================================
+
+def surface_speed_index_polars(io: IO, gender: str) -> pl.DataFrame:
+    """
+    Calcule le Surface Speed Index (SSI) basé sur le taux d'aces.
+    Time-aware: utilise uniquement le passé strict (year < y).
+    """
+    print("=" * 60)
+    print("CELLULE C - SURFACE SPEED INDEX (Polars)")
+    print("=" * 60)
+    
+    # Lecture
+    mb_dir = io.matches_base_scaled if io.matches_base_scaled.exists() else io.matches_base
+    lf = read_parquet_dir_polars(mb_dir, gender)
+    
+    df = lf.select([
+        "tourney_name_ta", "tourney_surface_ta", "is_indoor",
+        "tourney_date_ta", "w_s_ace_p", "l_s_ace_p"
+    ]).collect()
+    
+    # Parse date et year
+    df = df.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date).alias("tourney_date_ta"),
+    ])
+    df = df.with_columns([
+        pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year")
+    ])
+    
+    # Indoor flag
+    df = df.with_columns([
+        pl.when(pl.col("is_indoor").is_null())
+          .then(pl.lit("UNK"))
+          .when(pl.col("is_indoor").cast(pl.String).str.to_lowercase().is_in(["1", "true", "t", "yes", "y"]))
+          .then(pl.lit("IND"))
+          .when(pl.col("is_indoor").cast(pl.String).str.to_lowercase().is_in(["0", "false", "f", "no", "n"]))
+          .then(pl.lit("OUT"))
+          .otherwise(pl.lit("UNK"))
+          .alias("indoor_flag")
+    ])
+    
+    # Ace rate par match
+    df = df.with_columns([
+        ((pl.col("w_s_ace_p").fill_null(0) + pl.col("l_s_ace_p").fill_null(0)) / 2)
+          .alias("ace_rate_match")
+    ])
+    
+    # Filtrer les matchs avec ace_rate valide
+    df = df.filter(pl.col("ace_rate_match").is_not_null())
+    
+    # Aggregation annuelle par tournoi
+    grp = df.group_by(["tourney_name_ta", "tourney_surface_ta", "indoor_flag", "year"]).agg([
+        pl.col("ace_rate_match").mean().alias("ace_rate_match")
+    ])
+    
+    # Surface normalisée
+    grp = grp.with_columns([
+        pl.col("tourney_surface_ta").fill_null("NA").alias("surface")
+    ])
+    
+    # Z-score par (surface, indoor, year)
+    # ✅ FIX: Protéger contre std=0
+    std_col = pl.col("ace_rate_match").std().over(["surface", "indoor_flag", "year"])
+    
+    grp = grp.with_columns([
+        ((pl.col("ace_rate_match") - pl.col("ace_rate_match").mean().over(["surface", "indoor_flag", "year"])) /
+         pl.when(std_col <= 1e-12).then(1.0).otherwise(std_col))
+          .alias("ssi_year_z")
+    ])
+    
+    # Lissage temporel - STRICTEMENT PASSÉ (year < y)
+    # Polars ne supporte pas facilement ce type de calcul -> conversion vers Python
+    LAMBDA_YEARS = 3.0
+    
+    grp_pd = grp.to_pandas()
+    out_rows = []
+    
+    for _, g in grp_pd.groupby(["tourney_name_ta", "surface", "indoor_flag"], dropna=False):
+        g = g.sort_values("year").copy()
+        ssi_values = []
+        
+        for idx, row in g.iterrows():
+            y = int(row["year"])
+            past = g[g["year"] < y]  # STRICTEMENT PASSÉ
+            
+            if len(past) == 0:
+                ssi_values.append(0.0)  # Neutre si pas d'historique
+            else:
+                w = np.exp(-(y - past["year"].astype(int)) / LAMBDA_YEARS)
+                val = np.average(past["ssi_year_z"], weights=w)
+                ssi_values.append(val)
+        
+        g["surface_speed_index"] = ssi_values
+        out_rows.append(g)
+    
+    # ✅ FIX: Supprimé np.concatenate inutile
+    if len(out_rows) > 0:
+        import pandas as pd
+        ssi_pd = pd.concat(out_rows, ignore_index=True)
+        ssi = pl.from_pandas(ssi_pd[["tourney_name_ta", "surface", "indoor_flag", "year", 
+                                      "ace_rate_match", "ssi_year_z", "surface_speed_index"]])
+    else:
+        ssi = pl.DataFrame()
+    
+    # Écriture
+    out_path = io.aux_data / "surface_speed_index.parquet"
+    ssi.write_parquet(out_path, compression="zstd")
+    
+    print(f"✔ surface_speed_index (SOTA Time-Correct) → {out_path}")
+    print(f"  Lignes: {len(ssi):,}")
+    
+    # ✅ FIX: Safe si ssi vide
+    if len(ssi) > 0:
+        print(f"  Tournois uniques: {ssi.select(pl.col('tourney_name_ta').n_unique()).item()}")
+        print(f"  Années couvertes: {ssi['year'].min()} - {ssi['year'].max()}")
+    else:
+        print("  Tournois uniques: n/a (ssi vide)")
+        print("  Années couvertes: n/a (ssi vide)")
+    
+    return ssi
+
+
+# ============================================================================
+# CELLULE D (A): GLICKO-2 RATINGS
+# ============================================================================
+
+class Glicko2System:
+    """Implémentation Glicko-2 pour calcul des ratings."""
+    
+    def __init__(self, tau=G2_TAU, eps=G2_EPS):
+        self.tau = tau
+        self.eps = eps
+        self._PI2 = math.pi ** 2
+    
+    @staticmethod
+    def _to_mu_phi(rating: float, rd: float) -> Tuple[float, float]:
+        return (rating - 1500.0) / 173.7178, rd / 173.7178
+    
+    @staticmethod
+    def _to_rating_rd(mu: float, phi: float) -> Tuple[float, float]:
+        return 173.7178 * mu + 1500.0, 173.7178 * phi
+    
+    def _g(self, phi: float) -> float:
+        return 1.0 / math.sqrt(1.0 + (3.0 * (phi ** 2) / self._PI2))
+    
+    def update(self, rating: float, rd: float, sigma: float,
+               opponents: List[Tuple[float, float]],
+               outcomes: List[float]) -> Tuple[Tuple[float, float], float]:
+        mu, phi = self._to_mu_phi(rating, rd)
+        
+        if not opponents:
+            phi = min(math.sqrt(phi ** 2 + sigma ** 2), 350.0 / 173.7178)
+            return self._to_rating_rd(mu, phi), sigma
+        
+        v_inv = 0.0
+        delta = 0.0
+        
+        for (r_j, rd_j), s_j in zip(opponents, outcomes):
+            mu_j, phi_j = self._to_mu_phi(r_j, rd_j)
+            g = self._g(phi_j)
+            E = 1.0 / (1.0 + math.exp(-g * (mu - mu_j)))
+            v_inv += (g ** 2) * E * (1.0 - E)
+            delta += g * (s_j - E)
+        
+        v = 1.0 / v_inv
+        a = math.log(sigma ** 2)
+        A = a
+        
+        def f(x):
+            ex = math.exp(x)
+            num = ex * (delta ** 2 - phi ** 2 - v - ex)
+            den = 2.0 * (phi ** 2 + v + ex) ** 2
+            return (num / den) - ((x - a) / (self.tau ** 2))
+        
+        if delta ** 2 > (phi ** 2 + v):
+            B = math.log(delta ** 2 - phi ** 2 - v)
+        else:
+            k = 1
+            while f(a - k * self.tau) < 0:
+                k += 1
+            B = a - k * self.tau
+        
+        fA, fB = f(A), f(B)
+        while abs(B - A) > self.eps:
+            C = A + (A - B) * fA / (fB - fA)
+            fC = f(C)
+            if fC * fB < 0:
+                A, fA = B, fB
+            else:
+                fA /= 2.0
+            B, fB = C, fC
+        
+        sigma_prime = math.exp(A / 2.0)
+        phi_star = math.sqrt(phi ** 2 + sigma_prime ** 2)
+        phi_prime = 1.0 / math.sqrt((1.0 / (phi_star ** 2)) + (1.0 / v))
+        mu_prime = mu + (phi_prime ** 2) * delta
+        
+        rating_prime, rd_prime = self._to_rating_rd(mu_prime, phi_prime)
+        return (rating_prime, rd_prime), sigma_prime
+
+
+@dataclass
+class RatingState:
+    """État d'un joueur pour un bucket de rating."""
+    rating: float = G2_INIT_RATING
+    rd: float = G2_INIT_RD
+    sigma: float = G2_INIT_SIGMA
+    n_matches: int = 0
+    history: deque = field(default_factory=lambda: deque(maxlen=512))
+
+
+def _confidence_from(rd: float, sigma: float) -> Tuple[float, float]:
+    """Calcule confidence depuis RD et sigma."""
+    phi = rd / 173.7178
+    conf_phi = 1.0 / (1.0 + phi)
+    conf_blend = 1.0 / (1.0 + math.sqrt(phi * phi + (sigma / max(G2_INIT_SIGMA, 1e-6)) ** 2))
+    return conf_phi, conf_blend
+
+
+def _rating_at_or_before(state: RatingState, cutoff_date) -> float:
+    """Dernier rating avant cutoff_date."""
+    for d, r in reversed(state.history):
+        if d <= cutoff_date:
+            return r
+    return float("nan")
+
+
+def glicko2_builder_polars(io: IO, gender: str) -> pl.DataFrame:
+    """
+    Construit les features Glicko-2 multi-buckets.
+    Algorithme séquentiel -> Python, I/O -> Polars.
+    """
+    print("=" * 60)
+    print("CELLULE D - GLICKO-2 RATINGS (Polars I/O)")
+    print("=" * 60)
+    
+    # Lecture avec Polars
+    mb_dir = io.matches_base_scaled if io.matches_base_scaled.exists() else io.matches_base
+    lf = read_parquet_dir_polars(mb_dir, gender)
+    
+    df = lf.filter(pl.col("match_status").is_in(list(VALID_STATUS))).collect()
+    
+    # ✅ FIX: Safety alias custom_match_id <-> match_key
+    if "custom_match_id" not in df.columns and "match_key" in df.columns:
+        df = df.with_columns(pl.col("match_key").alias("custom_match_id"))
+        
+    # Filtres et préparation
+    df = df.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date),
+    ])
+    df = df.filter(pl.col("tourney_date_ta").dt.year() >= START_YEAR)
+    df = df.with_columns([
+        pl.col("tourney_date_ta").dt.year().cast(pl.Int32).alias("year")
+    ])
+    
+    # Normalisation surface
+    df = df.with_columns([
+        pl.col("tourney_surface_ta").fill_null("U")
+          .map_elements(normalize_surface, return_dtype=pl.String)
+          .alias("surface_norm")
+    ])
+    
+    # Indoor
+    df = df.with_columns([
+        pl.when(pl.col("is_indoor").is_null())
+          .then(None)
+          .when(pl.col("is_indoor").cast(pl.String).str.to_lowercase().is_in(["1", "true"]))
+          .then(pl.lit(True))
+          .when(pl.col("is_indoor").cast(pl.String).str.to_lowercase().is_in(["0", "false"]))
+          .then(pl.lit(False))
+          .otherwise(None)
+          .alias("indoor_norm")
+    ])
+    
+    # Level
+    df = df.with_columns([
+        pl.col("tourney_level_ta").fill_null("").str.to_uppercase().alias("level_norm")
+    ])
+    
+    # Filtrer matchs avec IDs valides
+    df = df.filter(pl.col("winner_id").is_not_null() & pl.col("loser_id").is_not_null())
+    
+    # Tri SOTA
+    if "match_sequence_key" in df.columns:
+        df = df.sort(["match_sequence_key", "custom_match_id"])
+        print("[sort] SOTA: match_sequence_key")
+    else:
+        df = df.sort(["tourney_date_ta", "custom_match_id"])
+        print("[sort] Fallback: tourney_date_ta")
+    
+    # Charger handedness depuis players_ref si disponible
+    hand_map = {}
+    if io.players_ref.exists():
+        try:
+            pref = pl.scan_parquet(str(io.players_ref / "**/*.parquet"), hive_partitioning=True)
+            if "gender" in pref.collect_schema().names():
+                pref = pref.filter(pl.col("gender") == gender)
+            pref_df = pref.select(["player_master_id", "plays_hand"]).collect()
+            for row in pref_df.iter_rows(named=True):
+                pid = str(row["player_master_id"])
+                hand_map[pid] = normalize_hand(row.get("plays_hand"))
+        except Exception as e:
+            print(f"[warn] Could not load players_ref for handedness: {e}")
+    
+    # Conversion vers Python pour algorithme séquentiel
+    matches_pd = df.to_pandas()
+    matches_pd["w_hand"] = matches_pd["winner_id"].astype(str).map(lambda x: hand_map.get(x, "U"))
+    matches_pd["l_hand"] = matches_pd["loser_id"].astype(str).map(lambda x: hand_map.get(x, "U"))
+    
+    print(f"[glicko2] Processing {len(matches_pd):,} matches...")
+    
+    # Glicko-2 séquentiel
+    gsys = Glicko2System()
+    store: Dict[str, Dict[str, RatingState]] = {}
+    
+    def get_state(pid: str, bucket: str) -> RatingState:
+        return store.setdefault(pid, {}).setdefault(bucket, RatingState())
+    
+    rows = []
+    n_matches = len(matches_pd)
+    print_every = 50000  # ← Print tous les 50k matchs
+    
+    for idx, r in matches_pd.iterrows():
+        w_id, l_id = str(r["winner_id"]), str(r["loser_id"])
+        year = int(r["year"])
+        match_date = r["tourney_date_ta"]
+        # ✅ FIX: Robuste pour datetime.date ET np.datetime64
+        if isinstance(match_date, np.datetime64):
+            cutoff_30d = match_date - np.timedelta64(30, "D")
+        else:
+            cutoff_30d = match_date - dt.timedelta(days=30)
+        
+        # Buckets
+        surf = r["surface_norm"]
+        indoor = r["indoor_norm"]
+        lvl = r["level_norm"]
+        w_hand, l_hand = r["w_hand"], r["l_hand"]
+        
+        indoor_key = f"indoor:{1 if indoor is True else (0 if indoor is False else 'U')}"
+        
+        buckets_w = ["global", f"surface:{surf}", indoor_key, f"level:{lvl}", f"vs_lefty:{l_hand}"]
+        buckets_l = ["global", f"surface:{surf}", indoor_key, f"level:{lvl}", f"vs_lefty:{w_hand}"]
+        
+        # Features AVANT match (winner)
+        w_feats = {"player_id": w_id, "custom_match_id": r["custom_match_id"], "year": year, "gender": gender}
+        for b in buckets_w:
+            st = get_state(w_id, b)
+            prefix = b.replace(":", "_")
+            w_feats[f"g2_{prefix}_rating"] = st.rating
+            w_feats[f"g2_{prefix}_rd"] = st.rd
+            w_feats[f"g2_{prefix}_sigma"] = st.sigma
+            w_feats[f"g2_{prefix}_uncertainty"] = st.rd / (st.sigma + 1e-12)
+            conf_phi, conf_blend = _confidence_from(st.rd, st.sigma)
+            w_feats[f"g2_{prefix}_confidence"] = conf_phi
+            w_feats[f"g2_{prefix}_confidence_blend"] = conf_blend
+            w_feats[f"g2_{prefix}_n_matches"] = st.n_matches
+            r_30 = _rating_at_or_before(st, cutoff_30d)
+            w_feats[f"g2_{prefix}_momentum_30d"] = (st.rating - r_30) if not np.isnan(r_30) else np.nan
+        
+        # Features AVANT match (loser)
+        l_feats = {"player_id": l_id, "custom_match_id": r["custom_match_id"], "year": year, "gender": gender}
+        for b in buckets_l:
+            st = get_state(l_id, b)
+            prefix = b.replace(":", "_")
+            l_feats[f"g2_{prefix}_rating"] = st.rating
+            l_feats[f"g2_{prefix}_rd"] = st.rd
+            l_feats[f"g2_{prefix}_sigma"] = st.sigma
+            l_feats[f"g2_{prefix}_uncertainty"] = st.rd / (st.sigma + 1e-12)
+            conf_phi, conf_blend = _confidence_from(st.rd, st.sigma)
+            l_feats[f"g2_{prefix}_confidence"] = conf_phi
+            l_feats[f"g2_{prefix}_confidence_blend"] = conf_blend
+            l_feats[f"g2_{prefix}_n_matches"] = st.n_matches
+            r_30 = _rating_at_or_before(st, cutoff_30d)
+            l_feats[f"g2_{prefix}_momentum_30d"] = (st.rating - r_30) if not np.isnan(r_30) else np.nan
+        
+        rows.append(w_feats)
+        rows.append(l_feats)
+        
+        # Update APRÈS match
+        for b_w, b_l in zip(buckets_w, buckets_l):
+            w_state = get_state(w_id, b_w)
+            l_state = get_state(l_id, b_l)
+            
+            (w_new_rating, w_new_rd), w_new_sigma = gsys.update(
+                w_state.rating, w_state.rd, w_state.sigma,
+                [(l_state.rating, l_state.rd)], [1.0]
+            )
+            (l_new_rating, l_new_rd), l_new_sigma = gsys.update(
+                l_state.rating, l_state.rd, l_state.sigma,
+                [(w_state.rating, w_state.rd)], [0.0]
+            )
+            
+            w_state.rating, w_state.rd, w_state.sigma = w_new_rating, w_new_rd, w_new_sigma
+            l_state.rating, l_state.rd, l_state.sigma = l_new_rating, l_new_rd, l_new_sigma
+            w_state.n_matches += 1
+            l_state.n_matches += 1
+            w_state.history.append((match_date, w_state.rating))
+            l_state.history.append((match_date, l_state.rating))
+        
+        # Progress tous les 50k matchs
+        if (idx + 1) % print_every == 0:
+            print(f"  [glicko2] {idx + 1:,} / {n_matches:,} matchs traités ({100*(idx+1)/n_matches:.1f}%)")
+    
+    # Conversion vers Polars
+    import pandas as pd
+    out_pd = pd.DataFrame(rows)
+    out = pl.from_pandas(out_pd)
+    
+    # Dédup
+    before = len(out)
+    out = out.unique(subset=["custom_match_id", "player_id"], keep="last")
+    after = len(out)
+    print(f"✔ glicko2 post-clean: dup enlevés={before - after}")
+    
+    # ✅ Ajouter match_key pour cohérence avec PP_01
+    out = out.with_columns(pl.col("custom_match_id").alias("match_key"))
+    out = out.unique(subset=["match_key", "player_id"], keep="last")
+    
+    # Écriture
+    if io.glicko2_dir.exists():
+        shutil.rmtree(io.glicko2_dir)
+    io.glicko2_dir.mkdir(parents=True, exist_ok=True)
+    write_parquet_partitioned_polars(out, io.glicko2_dir)
+    
+    print(f"✔ glicko2 features → {io.glicko2_dir}")
+    print(f"  Lignes: {len(out):,}")
+    
+    return out
+
+
+# ============================================================================
+# CELLULE E (B): CHARTING SUPER FEATURES - VERSION COMPLÈTE SOTA
+# ============================================================================
+
+def _safe_ratio(num: float, den: float) -> float:
+    """Division safe avec gestion NaN."""
+    if num is None or den is None or np.isnan(num) or np.isnan(den) or den == 0:
+        return np.nan
+    return num / den
+
+
+def _entropy(probs: List[float]) -> float:
+    """Calcule l'entropie de Shannon pour une distribution."""
+    probs = [p for p in probs if p is not None and not np.isnan(p) and p > 0]
+    if not probs:
+        return np.nan
+    return -sum(p * math.log(p) for p in probs)
+
+
+def aggregate_charting_per_match_polars(chart_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Agrège les données charting par (match_id, player_id) avec features SOTA complètes:
+    - Serve direction (T/W/B pcts + entropy)
+    - Rally bins (0-4, 5-8, 9+) + avg_rally_len
+    - Net play (freq, win_pct)
+    - Clutch stats (bp_ace_rate, tb_serve_win_rate, deuce_win_rate)
+    - Intra-match volatility (variance hold% par set)
+    - Flags de disponibilité (has_*)
+    """
+    import pandas as pd
+    
+    # Conversion vers Pandas pour logique complexe (filtres regex multiples)
+    chart_pd = chart_df.to_pandas()
+    
+    # Normaliser colonnes en lowercase
+    for c in ["stat_category", "stat_name", "point_context", "table_title", "set_context"]:
+        if c not in chart_pd.columns:
+            chart_pd[c] = ""
+        chart_pd[c] = chart_pd[c].astype(str).str.lower()
+    
+    feats = []
+    
+    for (mid, pid), d in chart_pd.groupby(["match_id", "player_id"], sort=False):
+        row = {
+            "match_id": mid,
+            "player_id": pid,
+            # Serve direction
+            "serve_T_pct": np.nan, "serve_W_pct": np.nan, "serve_B_pct": np.nan,
+            "serve_dir_entropy": np.nan,
+            # Rally bins
+            "pct_rallies_0_4": np.nan, "pct_rallies_5_8": np.nan, "pct_rallies_9p": np.nan,
+            "avg_rally_len": np.nan,
+            # Net play
+            "net_points_freq": np.nan, "net_points_won_pct": np.nan,
+            # Clutch
+            "bp_ace_rate": np.nan, "tb_serve_win_rate": np.nan, "deuce_win_rate": np.nan,
+            # Volatility
+            "set1_to_set2_delta_srv": np.nan, "set1_to_set2_delta_ret": np.nan,
+            "variance_hold_set_to_set": np.nan,
+            # Flags
+            "has_charting_any": 0,
+            "has_serve_dir": 0,
+            "has_rally_bins": 0,
+            "has_net": 0,
+            "has_clutch": 0,
+            "has_volatility": 0,
+        }
+        
+        # ========== A) SERVE DIRECTION (T/W/B + Entropy) ==========
+        df_sd = d[
+            d["stat_name"].str.contains("serve|1st|2nd", regex=True) &
+            (d["stat_name"].str.contains("dir|t_pct|wide|body|_t$", regex=True) |
+             d["stat_category"].str.contains("direction", regex=True))
+        ]
+        
+        # Extraire counts par direction depuis stat_pct ou stat_count
+        def get_dir_pct(keywords: List[str]) -> float:
+            mask = False
+            for k in keywords:
+                mask = mask | df_sd["stat_name"].str.contains(k, regex=True)
+            sub = df_sd[mask]
+            if sub.empty:
+                return np.nan
+            # Priorité stat_pct, sinon stat_count
+            val = sub["stat_pct"].mean() if "stat_pct" in sub.columns and sub["stat_pct"].notna().any() else np.nan
+            if np.isnan(val) and "stat_count" in sub.columns:
+                val = sub["stat_count"].sum()
+            return val
+        
+        t_pct = get_dir_pct(["_t$", "_t_pct", "dc_t", "ad_t", "t_pct"])
+        w_pct = get_dir_pct(["wide", "_w$", "_w_pct"])
+        b_pct = get_dir_pct(["body", "_b$", "_b_pct"])
+        
+        # Normaliser si on a des counts (somme = 100 ou proportions)
+        total = np.nansum([t_pct, w_pct, b_pct])
+        if total and total > 0:
+            if total > 3:  # Probablement des pourcentages
+                row["serve_T_pct"] = t_pct / 100 if not np.isnan(t_pct) else np.nan
+                row["serve_W_pct"] = w_pct / 100 if not np.isnan(w_pct) else np.nan
+                row["serve_B_pct"] = b_pct / 100 if not np.isnan(b_pct) else np.nan
+            else:  # Déjà des proportions
+                row["serve_T_pct"] = t_pct if not np.isnan(t_pct) else np.nan
+                row["serve_W_pct"] = w_pct if not np.isnan(w_pct) else np.nan
+                row["serve_B_pct"] = b_pct if not np.isnan(b_pct) else np.nan
+            
+            # Entropie -∑ p log p
+            probs = [row["serve_T_pct"], row["serve_W_pct"], row["serve_B_pct"]]
+            row["serve_dir_entropy"] = _entropy(probs)
+            row["has_serve_dir"] = 1
+        
+        # ========== B) RALLY BINS (0-4, 5-8, 9+) ==========
+        # Chercher dans stat_name les patterns rally
+        df_rally = d[d["stat_name"].str.contains("rally|shot|plus", regex=True)]
+        
+        # Méthode 1: colonnes avgrally / rallylen directes
+        avgrally = d[d["stat_name"].str.contains("avgrally|avg_rally|rallylen", regex=True)]
+        if not avgrally.empty and "stat_pct" in avgrally.columns:
+            avg_val = avgrally["stat_pct"].mean()
+            if not np.isnan(avg_val):
+                row["avg_rally_len"] = avg_val
+                row["has_rally_bins"] = 1
+        
+        # Méthode 2: bins depuis stat_name (1_plus, 2_plus, etc.)
+        def get_rally_bin_count(patterns: List[str]) -> float:
+            mask = False
+            for p in patterns:
+                mask = mask | df_rally["stat_name"].str.contains(p, regex=True)
+            sub = df_rally[mask]
+            if sub.empty:
+                return np.nan
+            return sub["stat_count"].sum() if "stat_count" in sub.columns else np.nan
+        
+        # Approximation des bins via les stats cumulatives
+        r_0_4 = get_rally_bin_count(["lte3|0_3|0_4|1_plus|2_plus|3_plus|4_plus"])
+        r_5_8 = get_rally_bin_count(["5_plus|6_plus|7_plus|8_plus|4_6|5_8"])
+        r_9p = get_rally_bin_count(["9_plus|10_plus|9p|10p|7p"])
+        
+        total_rally = np.nansum([r_0_4, r_5_8, r_9p])
+        if total_rally and total_rally > 0:
+            row["pct_rallies_0_4"] = r_0_4 / total_rally if not np.isnan(r_0_4) else np.nan
+            row["pct_rallies_5_8"] = r_5_8 / total_rally if not np.isnan(r_5_8) else np.nan
+            row["pct_rallies_9p"] = r_9p / total_rally if not np.isnan(r_9p) else np.nan
+            row["has_rally_bins"] = 1
+        
+        # ========== C) NET PLAY ==========
+        df_net = d[
+            (d["stat_category"].str.contains("net", regex=True)) |
+            (d["stat_name"].str.contains("net|volley|approach", regex=True))
+        ]
+        
+        if not df_net.empty:
+            # Net frequency = net_points / total_points
+            net_pts = df_net[df_net["stat_name"].str.contains("net_pct|net_points|approach", regex=True)]
+            if not net_pts.empty and "stat_pct" in net_pts.columns:
+                row["net_points_freq"] = net_pts["stat_pct"].mean() / 100 if net_pts["stat_pct"].mean() > 1 else net_pts["stat_pct"].mean()
+            
+            # Net win pct
+            net_won = df_net[df_net["stat_name"].str.contains("won|success|wnr_at_net", regex=True)]
+            if not net_won.empty and "stat_pct" in net_won.columns:
+                val = net_won["stat_pct"].mean()
+                row["net_points_won_pct"] = val / 100 if val > 1 else val
+            
+            if not np.isnan(row["net_points_freq"]) or not np.isnan(row["net_points_won_pct"]):
+                row["has_net"] = 1
+        
+        # ========== D) CLUTCH STATS ==========
+        # BP ace rate
+        df_bp = d[
+            (d["point_context"].str.contains("bp|breakpoint", regex=True)) |
+            (d["set_context"].str.contains("bp|breakpoint", regex=True)) |
+            (d["stat_name"].str.contains("bp|breakpoint", regex=True))
+        ]
+        if not df_bp.empty:
+            bp_ace = df_bp[df_bp["stat_name"].str.contains("ace", regex=True)]
+            bp_pts = df_bp[df_bp["stat_name"].str.contains("pts|points|count", regex=True)]
+            if not bp_ace.empty and not bp_pts.empty:
+                ace_sum = bp_ace["stat_count"].sum() if "stat_count" in bp_ace.columns else np.nan
+                pts_sum = bp_pts["stat_count"].sum() if "stat_count" in bp_pts.columns else np.nan
+                row["bp_ace_rate"] = _safe_ratio(ace_sum, pts_sum)
+        
+        # Tiebreak serve win rate
+        df_tb = d[
+            (d["point_context"].str.contains("tb|tiebreak", regex=True)) |
+            (d["set_context"].str.contains("tb|tiebreak", regex=True)) |
+            (d["stat_name"].str.contains("tb|tiebreak", regex=True))
+        ]
+        if not df_tb.empty:
+            tb_srv_won = df_tb[df_tb["stat_name"].str.contains("serve.*won|srv.*won|1st_pct|2nd_pct", regex=True)]
+            if not tb_srv_won.empty and "stat_pct" in tb_srv_won.columns:
+                val = tb_srv_won["stat_pct"].mean()
+                row["tb_serve_win_rate"] = val / 100 if val > 1 else val
+        
+        # Deuce win rate
+        df_deu = d[
+            (d["point_context"].str.contains("deuce", regex=True)) |
+            (d["set_context"].str.contains("deuce", regex=True)) |
+            (d["stat_name"].str.contains("deuce", regex=True))
+        ]
+        if not df_deu.empty:
+            deu_won = df_deu[df_deu["stat_name"].str.contains("won|win", regex=True)]
+            if not deu_won.empty and "stat_pct" in deu_won.columns:
+                val = deu_won["stat_pct"].mean()
+                row["deuce_win_rate"] = val / 100 if val > 1 else val
+        
+        if any(not np.isnan(row[k]) for k in ["bp_ace_rate", "tb_serve_win_rate", "deuce_win_rate"]):
+            row["has_clutch"] = 1
+        
+        # ========== E) INTRA-MATCH VOLATILITY ==========
+        # Stats par set pour calculer variance hold%
+        if "set_context" in d.columns:
+            # Filtrer les lignes avec un set identifiable (SET 1, SET 2, etc.)
+            d_sets = d[d["set_context"].str.match(r"^set\s*\d", case=False)]
+            
+            if not d_sets.empty:
+                # Extraire numéro de set
+                d_sets = d_sets.copy()
+                d_sets["set_no"] = d_sets["set_context"].str.extract(r"(\d+)").astype(float)
+                
+                # Hold% proxy: serve points won / serve points
+                by_set = d_sets.groupby("set_no")
+                
+                srv_won_by_set = {}
+                srv_pts_by_set = {}
+                ret_won_by_set = {}
+                ret_pts_by_set = {}
+                
+                for set_no, g_set in by_set:
+                    # Serve won
+                    srv_won = g_set[g_set["stat_name"].str.contains("1st_pct|2nd_pct|serve.*won", regex=True)]
+                    if not srv_won.empty and "stat_pct" in srv_won.columns:
+                        srv_won_by_set[set_no] = srv_won["stat_pct"].mean()
+                    
+                    # Return won
+                    ret_won = g_set[g_set["stat_name"].str.contains("rpw|return.*won|ret.*won", regex=True)]
+                    if not ret_won.empty and "stat_pct" in ret_won.columns:
+                        ret_won_by_set[set_no] = ret_won["stat_pct"].mean()
+                
+                # Variance hold% across sets
+                if len(srv_won_by_set) >= 2:
+                    hold_vals = list(srv_won_by_set.values())
+                    row["variance_hold_set_to_set"] = float(np.var(hold_vals, ddof=0))
+                    row["has_volatility"] = 1
+                
+                # Set1 vs Set2 delta (serve & return)
+                if 1.0 in srv_won_by_set and 2.0 in srv_won_by_set:
+                    row["set1_to_set2_delta_srv"] = srv_won_by_set[2.0] - srv_won_by_set[1.0]
+                if 1.0 in ret_won_by_set and 2.0 in ret_won_by_set:
+                    row["set1_to_set2_delta_ret"] = ret_won_by_set[2.0] - ret_won_by_set[1.0]
+        
+        # ========== F) FLAG GLOBAL ==========
+        if any([row["has_serve_dir"], row["has_rally_bins"], row["has_net"],
+                row["has_clutch"], row["has_volatility"]]):
+            row["has_charting_any"] = 1
+        
+        feats.append(row)
+    
+    return pl.from_pandas(pd.DataFrame(feats)) if feats else pl.DataFrame()
+
+
+def charting_super_features_polars(io: IO, gender: str) -> pl.DataFrame:
+    """
+    Construit les features charting SOTA complètes avec rolling time-aware.
+    
+    Features générées:
+    - Serve direction: T/W/B pcts + entropy
+    - Rally bins: 0-4, 5-8, 9+ proportions + avg_rally_len
+    - Net play: freq, win_pct
+    - Clutch: bp_ace_rate, tb_serve_win_rate, deuce_win_rate
+    - Volatility: variance_hold_set_to_set, set1_to_set2_delta_*
+    - Flags: has_charting_any, has_serve_dir, has_rally_bins, has_net, has_clutch, has_volatility
+    """
+    print("=" * 60)
+    print("CELLULE E - CHARTING SUPER FEATURES SOTA (Polars)")
+    print("=" * 60)
+    
+    # Vérifier existence charting_long
+    if not io.charting_long.exists():
+        print("[charting] charting_long absent — skip")
+        return pl.DataFrame()
+    
+    # Lecture matches_base pour dates
+    # ========== LECTURE MATCHES_BASE POUR MAPPING CHARTING → match_key ==========
+    mb_dir = io.matches_base_scaled if io.matches_base_scaled.exists() else io.matches_base
+    
+    mb = read_parquet_dir_polars(mb_dir, gender).select([
+        "match_key",                  # ✅ clé officielle (PP_01)
+        "match_id_ta_source",         # ✅ correspond au charting_long.match_id
+        "tourney_date_ta",
+        "winner_id", "loser_id"
+    ]).collect()
+    
+    mb = mb.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date),
+        pl.col("match_id_ta_source").cast(pl.Utf8),
+        pl.col("winner_id").cast(pl.Utf8),
+        pl.col("loser_id").cast(pl.Utf8),
+    ])
+    
+    # Participations (2 lignes par match) — match_id = match_id_ta_source
+    part_w = mb.select([
+        pl.col("match_id_ta_source").alias("match_id"),
+        pl.col("match_key"),
+        pl.col("tourney_date_ta"),
+        pl.col("winner_id").alias("player_id"),
+    ])
+    part_l = mb.select([
+        pl.col("match_id_ta_source").alias("match_id"),
+        pl.col("match_key"),
+        pl.col("tourney_date_ta"),
+        pl.col("loser_id").alias("player_id"),
+    ])
+    part = pl.concat([part_w, part_l]).drop_nulls(["match_id", "player_id", "match_key"])
+    
+    # Lecture charting_long
+    chart = pl.scan_parquet(str(io.charting_long / "**/*.parquet"), hive_partitioning=True)
+    chart = chart.collect()
+    
+    # Colonnes lowercase
+    chart = chart.rename({c: c.lower() for c in chart.columns})
+    
+    print(f"[charting] Loaded: {len(chart):,} rows")
+    
+    # ========== AGGREGATION COMPLÈTE PAR MATCH ==========
+    print("[charting] Aggregating features per match (SOTA)...")
+    import pandas as pd
+    per_match = aggregate_charting_per_match_polars(chart)
+    
+    if per_match.is_empty():
+        print("[charting] No charting data aggregated")
+        return pl.DataFrame()
+    
+    print(f"[charting] Per-match features: {len(per_match):,} rows")
+    
+    # ========== JOIN AVEC DATES ==========
+    per_match = per_match.with_columns([
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("match_id").cast(pl.Utf8),   # ✅ très important
+    ])
+    
+    
+    # Filtrer les matchs trouvés
+    chart_agg = per_match.join(part, on=["match_id","player_id"], how="left") \
+    .filter(pl.col("match_key").is_not_null())
+
+    # ✅ Option compat si du downstream attend custom_match_id
+    chart_agg = chart_agg.with_columns(
+        pl.col("match_key").alias("custom_match_id")
+    )
+    # ========== TRI TEMPOREL ==========
+    chart_agg = chart_agg.sort(["player_id", "tourney_date_ta", "match_key"])
+    
+    # ========== ROLLING AVEC SHIFT(1) ANTI-LEAKAGE ==========
+    # Features numériques à enrouler
+    feature_cols = [
+        "serve_T_pct", "serve_W_pct", "serve_B_pct", "serve_dir_entropy",
+        "pct_rallies_0_4", "pct_rallies_5_8", "pct_rallies_9p", "avg_rally_len",
+        "net_points_freq", "net_points_won_pct",
+        "bp_ace_rate", "tb_serve_win_rate", "deuce_win_rate",
+        "set1_to_set2_delta_srv", "set1_to_set2_delta_ret", "variance_hold_set_to_set"
+    ]
+    
+    # Flags (à cumuler)
+    flag_cols = ["has_charting_any", "has_serve_dir", "has_rally_bins", 
+                 "has_net", "has_clutch", "has_volatility"]
+    
+    # Shift(1) d'abord pour toutes les colonnes
+    for c in feature_cols:
+        if c in chart_agg.columns:
+            chart_agg = chart_agg.with_columns([
+                pl.col(c).shift(1).over("player_id").alias(f"{c}_shifted")
+            ])
+    
+    for c in flag_cols:
+        if c in chart_agg.columns:
+            chart_agg = chart_agg.with_columns([
+                pl.col(c).shift(1).over("player_id").alias(f"{c}_shifted")
+            ])
+    
+    # Rolling sur les colonnes shiftées
+    for N in ROLLS:
+        for c in feature_cols:
+            src = f"{c}_shifted"
+            if src in chart_agg.columns:
+                chart_agg = chart_agg.with_columns([
+                    pl.col(src)
+                      .rolling_mean(window_size=N, min_samples=1)
+                      .over("player_id")
+                      .alias(f"{c}_r{N}")
+                ])
+    
+    # Flags historiques: cumsum > 0 (le joueur a eu des données charting dans le passé)
+    for f in flag_cols:
+        src = f"{f}_shifted"
+        if src in chart_agg.columns:
+            chart_agg = chart_agg.with_columns([
+                (pl.col(src).cum_sum().over("player_id") > 0)
+                  .cast(pl.Int8)
+                  .alias(f"{f}_hist")
+            ])
+    
+    # ========== CLEANUP ==========
+    # Drop colonnes intermédiaires
+    cols_to_drop = [f"{c}_shifted" for c in feature_cols + flag_cols if f"{c}_shifted" in chart_agg.columns]
+    cols_to_drop.append("match_id")
+    cols_to_drop = [c for c in cols_to_drop if c in chart_agg.columns]
+    chart_agg = chart_agg.drop(cols_to_drop)
+    
+    # Year et gender pour partitionnement
+    chart_agg = chart_agg.with_columns([
+        pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year"),
+        pl.lit(gender).alias("gender")
+    ])
+    
+    # ========== DÉDUP ==========
+    before = len(chart_agg)
+    chart_agg = chart_agg.unique(subset=["match_key", "player_id"], keep="last")
+    after = len(chart_agg)
+    print(f"[charting] doublons supprimés: {before - after}")
+    
+    # Drop tourney_date_ta avant écriture
+    chart_agg = chart_agg.drop(["tourney_date_ta"])
+    
+    # ========== ÉCRITURE ==========
+    if io.charting_super_dir.exists():
+        shutil.rmtree(io.charting_super_dir)
+    io.charting_super_dir.mkdir(parents=True, exist_ok=True)
+    write_parquet_partitioned_polars(chart_agg, io.charting_super_dir)
+    
+    # Stats finales
+    n_features = len([c for c in chart_agg.columns if c.endswith(tuple([f"_r{n}" for n in ROLLS]))])
+    n_flags = len([c for c in chart_agg.columns if c.endswith("_hist")])
+    
+    print(f"✔ charting_super SOTA → {io.charting_super_dir}")
+    print(f"  Lignes: {len(chart_agg):,}")
+    print(f"  Features rolling: {n_features}")
+    print(f"  Flags historiques: {n_flags}")
+    
+    return chart_agg
+
+
+# ============================================================================
+# CELLULE F (C): H2H DECAY
+# ============================================================================
+
+@dataclass
+class Meeting:
+    """Un match H2H passé."""
+    date: object  # datetime
+    surface: str
+    winner_id: str
+
+
+def h2h_decay_builder_polars(io: IO, gender: str) -> pl.DataFrame:
+    """
+    Construit les features H2H avec decay exponentiel.
+    Algorithme séquentiel -> Python, I/O -> Polars.
+    """
+    print("=" * 60)
+    print("CELLULE F - H2H DECAY (Polars I/O)")
+    print("=" * 60)
+    
+    # Lecture
+    mb_dir = io.matches_base_scaled if io.matches_base_scaled.exists() else io.matches_base
+    lf = read_parquet_dir_polars(mb_dir, gender)
+    
+    # ✅ FIX: Schema-safe select (évite crash si colonne absente)
+    schema = lf.collect_schema().names()
+    select_cols = [c for c in [
+        "match_sequence_key",
+        "custom_match_id",
+        "match_key",
+        "match_id_ta_dedup",
+        "tourney_date_ta",
+        "winner_id",
+        "loser_id",
+        "tourney_surface_ta",
+    ] if c in schema]
+    
+    df = lf.filter(pl.col("match_status").is_in(list(VALID_STATUS))).select(select_cols).collect()
+    
+    # ✅ FIX: Safety alias custom_match_id <-> match_key
+    if "custom_match_id" not in df.columns and "match_key" in df.columns:
+        df = df.with_columns(pl.col("match_key").alias("custom_match_id"))
+        
+    df = df.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date)
+    ])
+    df = df.filter(pl.col("tourney_date_ta").dt.year() >= START_YEAR)
+    df = df.with_columns([
+        pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year"),
+        pl.col("tourney_surface_ta").fill_null("U")
+          .map_elements(normalize_surface, return_dtype=pl.String)
+          .alias("surface_norm")
+    ])
+    df = df.filter(pl.col("winner_id").is_not_null() & pl.col("loser_id").is_not_null())
+    
+    # Tri
+    if "match_sequence_key" in df.columns:
+        df = df.sort(["match_sequence_key", "custom_match_id"])
+    else:
+        df = df.sort(["tourney_date_ta", "custom_match_id"])
+    
+    # Conversion vers Python
+    matches_pd = df.to_pandas()
+    
+    print(f"[h2h] Processing {len(matches_pd):,} matches...")
+    
+    # Store H2H
+    H2HStore = Dict[Tuple[str, str], List[Meeting]]
+    store: H2HStore = {}
+    
+    def pair_key(a: str, b: str) -> Tuple[str, str]:
+        return (a, b) if a <= b else (b, a)
+    
+    def past_meetings(pid: str, oid: str, date) -> List[Meeting]:
+        key = pair_key(pid, oid)
+        arr = store.get(key, [])
+        return [m for m in arr if m.date < date]
+    
+    def h2h_rate_for(pid: str, oid: str, date, surface: str) -> Tuple:
+        meetings = past_meetings(pid, oid, date)
+        if not meetings:
+            return (np.nan, np.nan, 0.0, np.nan, np.nan, 0.0)
+        
+        # Global
+        w_sum, sw = 0.0, 0.0
+        for m in meetings:
+            delta = (date - m.date).days
+            w = np.exp(-delta / LAMBDA_DAYS_GLOBAL)
+            if w > 0:
+                w_sum += w
+                sw += w * (1.0 if m.winner_id == pid else 0.0)
+        
+        if w_sum > 0:
+            p_g = sw / w_sum
+            var_g = p_g * (1 - p_g) / w_sum
+            n_eff_g = w_sum
+        else:
+            p_g, var_g, n_eff_g = np.nan, np.nan, 0.0
+        
+        # Surface
+        w_sum_s, sw_s = 0.0, 0.0
+        for m in meetings:
+            if m.surface != surface:
+                continue
+            delta = (date - m.date).days
+            w = np.exp(-delta / LAMBDA_DAYS_SURFACE)
+            if w > 0:
+                w_sum_s += w
+                sw_s += w * (1.0 if m.winner_id == pid else 0.0)
+        
+        if w_sum_s > 0:
+            p_s = sw_s / w_sum_s
+            var_s = p_s * (1 - p_s) / w_sum_s
+            n_eff_s = w_sum_s
+        else:
+            p_s, var_s, n_eff_s = np.nan, np.nan, 0.0
+        
+        return (p_g, var_g, n_eff_g, p_s, var_s, n_eff_s)
+    
+    rows = []
+    n_matches = len(matches_pd)
+    print_every = 50000
+    
+    for match_idx, (idx, r) in enumerate(matches_pd.iterrows()):
+        w_id, l_id = str(r["winner_id"]), str(r["loser_id"])
+        date = r["tourney_date_ta"]
+        surface = r["surface_norm"]
+        year = int(r["year"])
+        mid = r["custom_match_id"]
+        
+        # Features AVANT
+        for pid, oid in [(w_id, l_id), (l_id, w_id)]:
+            p_g, var_g, n_g, p_s, var_s, n_s = h2h_rate_for(pid, oid, date, surface)
+            rows.append({
+                "custom_match_id": mid,
+                "player_id": pid,
+                "h2h_global_rate": p_g,
+                "h2h_global_var": var_g,
+                "h2h_global_n_eff": n_g,
+                "h2h_surface_rate": p_s,
+                "h2h_surface_var": var_s,
+                "h2h_surface_n_eff": n_s,
+                "year": year,
+                "gender": gender,
+            })
+        
+        # Update APRÈS
+        key = pair_key(w_id, l_id)
+        store.setdefault(key, []).append(Meeting(date=date, surface=surface, winner_id=w_id))
+        
+        # Progress tous les 50k matchs
+        if (match_idx + 1) % print_every == 0:
+            print(f"  [h2h] {match_idx + 1:,} / {n_matches:,} matchs traités ({100*(match_idx+1)/n_matches:.1f}%)")
+    
+    # Conversion
+    import pandas as pd
+    out_pd = pd.DataFrame(rows)
+    out = pl.from_pandas(out_pd)
+    
+    # Dédup
+    before = len(out)
+    out = out.unique(subset=["custom_match_id", "player_id"], keep="last")
+    after = len(out)
+    print(f"[h2h] doublons supprimés: {before - after}")
+    
+    # ✅ Ajouter match_key pour cohérence avec PP_01
+    out = out.with_columns(pl.col("custom_match_id").alias("match_key"))
+    out = out.unique(subset=["match_key", "player_id"], keep="last")
+    
+    # Clamps
+    for c in ["h2h_global_n_eff", "h2h_surface_n_eff"]:
+        out = out.with_columns([
+            pl.col(c).clip(lower_bound=0).alias(c)
+        ])
+    
+    # Écriture
+    if io.h2h_dir.exists():
+        shutil.rmtree(io.h2h_dir)
+    io.h2h_dir.mkdir(parents=True, exist_ok=True)
+    write_parquet_partitioned_polars(out, io.h2h_dir)
+    
+    print(f"✔ h2h_decay → {io.h2h_dir}")
+    print(f"  Lignes: {len(out):,}")
+    
+    return out
+
+
+# ============================================================================
+# CELLULE G (D): BASELINE MARKOV
+# ============================================================================
+
+def prob_hold_from_point(p: float) -> float:
+    """P(hold) depuis P(point au service) via Barnett-Clarke."""
+    if p is None or np.isnan(p) or p < 0 or p > 1:
+        return np.nan
+    q = 1 - p
+    pre = p ** 4 * (1 + 4 * q + 10 * q ** 2)
+    p_deuce = 20 * (p ** 3) * (q ** 3)
+    denom = 1 - 2 * p * q
+    if denom <= 0:
+        return np.nan
+    deuce_win = (p ** 2) / denom
+    return pre + p_deuce * deuce_win
+
+
+def prob_set_from_hold(p_hold_srv: float, p_hold_ret: float) -> Tuple[float, float]:
+    """P(set) depuis P(hold) via DP."""
+    if any(x is None or np.isnan(x) for x in [p_hold_srv, p_hold_ret]):
+        return np.nan, np.nan
+    
+    P = np.zeros((7, 7))
+    P[0, 0] = 1.0
+    for i in range(6):
+        for j in range(6):
+            if P[i, j] == 0:
+                continue
+            k = i + j
+            A_serves = (k % 2 == 0)
+            if A_serves:
+                P[i + 1, j] += P[i, j] * p_hold_srv
+                P[i, j + 1] += P[i, j] * (1 - p_hold_srv)
+            else:
+                P[i + 1, j] += P[i, j] * (1 - p_hold_ret)
+                P[i, j + 1] += P[i, j] * p_hold_ret
+    
+    p_set_tb12 = float(P[6, :6].sum())
+    p_66 = float(P[6, 6])
+    p_tb = float(np.clip(0.5 + 0.25 * (p_hold_srv - (1 - p_hold_ret)), 0.05, 0.95))
+    p_set_tb12 += p_66 * p_tb
+    
+    # Advantage set (simplifié)
+    p_set_adv = p_set_tb12  # Approximation
+    
+    return p_set_tb12, p_set_adv
+
+
+def prob_match_from_set(p_set: float, best_of: int = 3) -> float:
+    """P(match) depuis P(set)."""
+    if p_set is None or np.isnan(p_set):
+        return np.nan
+    if best_of == 3:
+        return p_set ** 2 * (3 - 2 * p_set)
+    elif best_of == 5:
+        return p_set ** 3 * (10 - 15 * p_set + 6 * p_set ** 2)
+    return np.nan
+
+
+def baseline_markov_builder_polars(io: IO, gender: str) -> pl.DataFrame:
+    """
+    Construit les features Markov (P hold/break/set/match).
+    """
+    print("=" * 60)
+    print("CELLULE G - BASELINE MARKOV (Polars)")
+    print("=" * 60)
+    
+    # Lecture
+    mb_dir = io.matches_base_scaled if io.matches_base_scaled.exists() else io.matches_base
+    lf = read_parquet_dir_polars(mb_dir, gender)
+    
+    need = ["custom_match_id", "match_id_ta_dedup", "tourney_date_ta", "best_of_ta",
+            "winner_id", "loser_id",
+            "w_s_1stIn_p", "w_s_1stWon_p", "w_s_2ndWon_p",
+            "l_s_1stIn_p", "l_s_1stWon_p", "l_s_2ndWon_p",
+            "w_rpw_p", "l_rpw_p"]
+    
+    df = lf.select([c for c in need if c in lf.collect_schema().names()]).collect()
+
+    # ✅ FIX: Safety alias custom_match_id <-> match_key
+    if "custom_match_id" not in df.columns and "match_key" in df.columns:
+        df = df.with_columns(pl.col("match_key").alias("custom_match_id"))
+        
+    df = df.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date)
+    ])
+    df = df.filter(pl.col("tourney_date_ta").dt.year() >= START_YEAR)
+    df = df.with_columns([
+        pl.col("tourney_date_ta").dt.year().cast(pl.Int16).alias("year"),
+        pl.col("best_of_ta").cast(pl.Int16).fill_null(3).alias("best_of")
+    ])
+    
+    # P(srv) = P(1stIn) * P(1stWon) + (1 - P(1stIn)) * P(2ndWon)
+    df = df.with_columns([
+        (pl.col("w_s_1stIn_p") * pl.col("w_s_1stWon_p") + 
+         (1 - pl.col("w_s_1stIn_p")) * pl.col("w_s_2ndWon_p")).alias("w_p_srv"),
+        (pl.col("l_s_1stIn_p") * pl.col("l_s_1stWon_p") + 
+         (1 - pl.col("l_s_1stIn_p")) * pl.col("l_s_2ndWon_p")).alias("l_p_srv"),
+    ])
+    
+    # Vue long (2 lignes par match)
+    part_w = df.select([
+        pl.col("custom_match_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("best_of"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("loser_id").alias("opp_id"),
+        pl.col("w_p_srv").alias("p_srv_match"),
+        pl.col("l_rpw_p").alias("rpw_opp"),
+    ])
+    part_l = df.select([
+        pl.col("custom_match_id"),
+        pl.col("tourney_date_ta"),
+        pl.col("year"),
+        pl.col("best_of"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("winner_id").alias("opp_id"),
+        pl.col("l_p_srv").alias("p_srv_match"),
+        pl.col("w_rpw_p").alias("rpw_opp"),
+    ])
+    
+    long = pl.concat([part_w, part_l])
+    long = long.with_columns([
+        pl.col("player_id").cast(pl.String)
+    ])
+    
+    # Tri
+    long = long.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    
+    # Shift(1) pour time-freeze
+    long = long.with_columns([
+        pl.col("p_srv_match").shift(1).over("player_id").alias("p_srv_shifted"),
+        pl.col("rpw_opp").shift(1).over("player_id").alias("rpw_shifted"),
+    ])
+    
+    # Rolling
+    for N in ROLLS:
+        long = long.with_columns([
+            pl.col("p_srv_shifted").rolling_mean(window_size=N, min_samples=1).over("player_id").alias(f"p_srv_r{N}"),
+            pl.col("rpw_shifted").rolling_mean(window_size=N, min_samples=1).over("player_id").alias(f"rpw_r{N}"),
+        ])
+    
+    # Blend (0.6 * r5 + 0.3 * r10 + 0.1 * r20)
+    long = long.with_columns([
+        (0.6 * pl.col("p_srv_r5") + 0.3 * pl.col("p_srv_r10") + 0.1 * pl.col("p_srv_r20")).alias("p_point_srv"),
+        (0.6 * (1 - pl.col("rpw_r5")) + 0.3 * (1 - pl.col("rpw_r10")) + 0.1 * (1 - pl.col("rpw_r20"))).alias("p_point_srv_vs_opp"),
+    ])
+    
+    long = long.with_columns([
+        (0.6 * pl.col("p_point_srv") + 0.4 * pl.col("p_point_srv_vs_opp")).alias("p_point_srv_blend")
+    ])
+    
+    # Clamp
+    for c in ["p_point_srv", "p_point_srv_vs_opp", "p_point_srv_blend"]:
+        long = long.with_columns([
+            pl.col(c).clip(0, 1).alias(c)
+        ])
+    
+    # Calcul Markov via Python (vectorisation limitée pour les fonctions non-linéaires)
+    long_pd = long.to_pandas()
+    
+    print(f"[markov] Computing Markov probabilities for {len(long_pd):,} rows...")
+    
+    long_pd["p_hold"] = long_pd["p_point_srv_blend"].apply(prob_hold_from_point)
+    
+    # P_break = 1 - P_hold(adversaire) -> besoin de join
+    # Simplifié: on calcule par match
+    
+    rows = []
+    for mid, g in long_pd.groupby("custom_match_id", sort=False):
+        if len(g) != 2:
+            continue
+        g = g.sort_values("player_id")
+        A, B = g.iloc[0], g.iloc[1]
+        
+        pA_hold = A["p_hold"]
+        pB_hold = B["p_hold"]
+        
+        pA_set, _ = prob_set_from_hold(pA_hold, pB_hold)
+        pB_set, _ = prob_set_from_hold(pB_hold, pA_hold)
+        
+        bo = int(A["best_of"]) if not np.isnan(A["best_of"]) else 3
+        
+        for row, p_hold, p_set, opp_hold in [(A, pA_hold, pA_set, pB_hold), (B, pB_hold, pB_set, pA_hold)]:
+            rows.append({
+                "custom_match_id": mid,
+                "player_id": str(row["player_id"]),
+                "gender": gender,
+                "year": int(row["year"]),
+                "p_point_srv": row["p_point_srv"],
+                "p_point_srv_vs_opp": row["p_point_srv_vs_opp"],
+                "p_point_srv_blend": row["p_point_srv_blend"],
+                "p_hold": p_hold,
+                "p_break": 1 - opp_hold if not np.isnan(opp_hold) else np.nan,
+                "p_set_tb12": p_set,
+                "p_match_bo3": prob_match_from_set(p_set, 3),
+                "p_match_bo5": prob_match_from_set(p_set, 5),
+                "p_match_markov": prob_match_from_set(p_set, bo),
+            })
+    
+    import pandas as pd
+    out_pd = pd.DataFrame(rows)
+    out = pl.from_pandas(out_pd)
+    
+    # Dédup
+    before = len(out)
+    out = out.unique(subset=["custom_match_id", "player_id"], keep="last")
+    after = len(out)
+    print(f"[markov] doublons supprimés: {before - after}")
+    
+    # ✅ Ajouter match_key pour cohérence avec PP_01
+    out = out.with_columns(pl.col("custom_match_id").alias("match_key"))
+    out = out.unique(subset=["match_key", "player_id"], keep="last")
+    
+    # Écriture
+    if io.markov_dir.exists():
+        shutil.rmtree(io.markov_dir)
+    io.markov_dir.mkdir(parents=True, exist_ok=True)
+    write_parquet_partitioned_polars(out, io.markov_dir)
+    
+    print(f"✔ baseline_markov → {io.markov_dir}")
+    print(f"  Lignes: {len(out):,}")
+    
+    return out
+
+
+# ============================================================================
+# CELLULES H/I: SANITY CHECKS
+# ============================================================================
+
+def sanity_check_preprocess2_polars(io: IO, gender: str) -> bool:
+    """
+    Validation SOTA 2026 post-preprocess2.
+    """
+    print("=" * 60)
+    print("SANITY CHECK PREPROCESS2 (Polars)")
+    print("=" * 60)
+    
+    errors = []
+    
+    # 1) matches_base_scaled
+    if io.matches_base_scaled.exists():
+        mb = read_parquet_dir_polars(io.matches_base_scaled, gender).collect()
+        # === SOTA CHECK: 2ndWon_p no-NaN + fallback monitoring ===
+        cols_2nd = ["w_s_2ndWon_p", "l_s_2ndWon_p", "w_ret_2ndWon_p", "l_ret_2ndWon_p"]
+
+        for c in cols_2nd:
+            if c not in mb.columns:
+                continue
+
+            # Cast float safe - ✅ FIX: fill_null pour éviter ignorer nulls
+            nan_cnt = mb.select(pl.col(c).cast(pl.Float64, strict=False).is_nan().fill_null(False).sum()).item()
+            inf_cnt = mb.select(pl.col(c).cast(pl.Float64, strict=False).is_infinite().fill_null(False).sum()).item()
+            null_cnt = mb.select(pl.col(c).is_null().sum()).item()
+            non_null_cnt = mb.select(pl.col(c).is_not_null().sum()).item()
+
+            # Valeurs hors [0,1]
+            out_cnt = mb.select(
+                ((pl.col(c).is_not_null()) & ((pl.col(c) < -1e-6) | (pl.col(c) > 1 + 1e-6))).sum()
+            ).item()
+
+            print(f"[2ndWon_p] {c}: non_null={non_null_cnt:,} | null={null_cnt:,} | nan={nan_cnt} | inf={inf_cnt} | out01={out_cnt}")
+
+            # Hard fail
+            if nan_cnt > 0:
+                errors.append(f"[scaled] {c} contient {nan_cnt} NaN (poison)")
+            if inf_cnt > 0:
+                errors.append(f"[scaled] {c} contient {inf_cnt} inf (poison)")
+            if out_cnt > 0:
+                errors.append(f"[scaled] {c} hors [0,1]: {out_cnt} rows")
+
+            # Check flags recalc/fallback
+            rec_f = f"{c}_is_recalc"
+            fb_f = f"{c}_is_fallback"
+            if rec_f in mb.columns and fb_f in mb.columns:
+                rec_rate = mb.select(pl.col(rec_f).mean()).item()
+                fb_rate = mb.select(pl.col(fb_f).mean()).item()
+
+                # Binarité
+                bad_rec = mb.select((~pl.col(rec_f).is_in([0, 1])).sum()).item()
+                bad_fb = mb.select((~pl.col(fb_f).is_in([0, 1])).sum()).item()
+                if bad_rec > 0:
+                    errors.append(f"[scaled] {rec_f} non binaire: {bad_rec} rows")
+                if bad_fb > 0:
+                    errors.append(f"[scaled] {fb_f} non binaire: {bad_fb} rows")
+
+                # Cohérence flags
+                mismatch = mb.select(
+                    ((pl.col(c).is_not_null()) != ((pl.col(rec_f) == 1) | (pl.col(fb_f) == 1))).sum()
+                ).item()
+                if mismatch > 0:
+                    errors.append(f"[scaled] flags incohérents pour {c}: {mismatch} rows")
+
+                print(f"           -> recalc={rec_rate:.1%} | fallback={fb_rate:.1%}")
+    
+    # 2) Glicko2
+    if io.glicko2_dir.exists():
+        g2 = read_parquet_dir_polars(io.glicko2_dir, gender).collect()
+        
+        # Doublons
+        dup = g2.select(pl.struct(["custom_match_id", "player_id"]).is_duplicated().sum()).item()
+        if dup > 0:
+            errors.append(f"[glicko2] {dup} doublons")
+        
+        # RD bounds
+        rd_invalid = g2.filter(
+            (pl.col("g2_global_rd") < 40) | (pl.col("g2_global_rd") > 450)
+        )
+        if len(rd_invalid) > 0:
+            errors.append(f"[glicko2] RD hors [40,450]: {len(rd_invalid)} rows")
+        
+        if not errors:
+            print(f"✔ glicko2: {len(g2):,} rows, pas de doublons, RD OK")
+    
+    # 3) Charting Super - VALIDATION COMPLÈTE SOTA
+    if io.charting_super_dir.exists():
+        ch = read_parquet_dir_polars(io.charting_super_dir, gender).collect()
+        
+        # Doublons
+        dup = ch.select(pl.struct(["match_key", "player_id"]).is_duplicated().sum()).item()
+        if dup > 0:
+            errors.append(f"[charting] {dup} doublons")
+        
+        # Flags binaires
+        flag_cols = [c for c in ch.columns if c.endswith("_hist")]
+        for f in flag_cols:
+            unique_vals = ch.select(pl.col(f).drop_nulls().unique()).to_series().to_list()
+            if not set(unique_vals) <= {0, 1}:
+                errors.append(f"[charting] {f} non binaire: {unique_vals}")
+        
+        # Features rolling dans [0,1] (sauf entropy et avg_rally_len)
+        roll_cols = [c for c in ch.columns if c.endswith(tuple([f"_r{n}" for n in ROLLS]))]
+        for c in roll_cols:
+            if "entropy" in c or "avg_rally" in c or "delta" in c or "variance" in c:
+                continue  # Ces features peuvent être hors [0,1]
+            invalid = ch.filter(
+                (pl.col(c).is_not_null()) & 
+                ((pl.col(c) < -0.01) | (pl.col(c) > 1.01))
+            )
+            if len(invalid) > 0:
+                errors.append(f"[charting] {c} hors [0,1]: {len(invalid)} rows")
+        
+        # Vérifier présence des features SOTA
+        expected_features = ["serve_T_pct", "serve_dir_entropy", "pct_rallies_0_4", 
+                           "net_points_freq", "bp_ace_rate", "variance_hold_set_to_set"]
+        for feat in expected_features:
+            matching = [c for c in ch.columns if feat in c]
+            if not matching:
+                print(f"  ⚠️  Feature {feat} absente (données charting limitées?)")
+        
+        if not errors:
+            print(f"✔ charting_super: {len(ch):,} rows, flags={len(flag_cols)}, rolling={len(roll_cols)}")
+    
+    # 4) H2H
+    if io.h2h_dir.exists():
+        h2 = read_parquet_dir_polars(io.h2h_dir, gender).collect()
+        
+        dup = h2.select(pl.struct(["custom_match_id", "player_id"]).is_duplicated().sum()).item()
+        if dup > 0:
+            errors.append(f"[h2h] {dup} doublons")
+        
+        # Rate bounds
+        for c in ["h2h_global_rate", "h2h_surface_rate"]:
+            invalid = h2.filter(
+                (pl.col(c).is_not_null()) & 
+                ((pl.col(c) < 0) | (pl.col(c) > 1))
+            )
+            if len(invalid) > 0:
+                errors.append(f"[h2h] {c} hors [0,1]: {len(invalid)} rows")
+        
+        # Logique: si n_eff=0 => rate doit être NaN
+        mask_n0 = h2.filter(
+            (pl.col("h2h_global_n_eff") == 0) & 
+            (pl.col("h2h_global_rate").is_not_null())
+        )
+        if len(mask_n0) > 0:
+            errors.append(f"[h2h] n_eff=0 mais rate non-NaN: {len(mask_n0)} rows")
+        
+        if not errors:
+            print(f"✔ h2h: {len(h2):,} rows, pas de doublons, rates OK")
+    
+    # 5) Markov
+    if io.markov_dir.exists():
+        mk = read_parquet_dir_polars(io.markov_dir, gender).collect()
+        
+        dup = mk.select(pl.struct(["custom_match_id", "player_id"]).is_duplicated().sum()).item()
+        if dup > 0:
+            errors.append(f"[markov] {dup} doublons")
+        
+        prob_cols = ["p_hold", "p_break", "p_set_tb12", "p_match_bo3", "p_match_bo5", "p_match_markov"]
+        for c in prob_cols:
+            if c in mk.columns:
+                invalid = mk.filter(
+                    (pl.col(c).is_not_null()) & 
+                    ((pl.col(c) < 0) | (pl.col(c) > 1))
+                )
+                if len(invalid) > 0:
+                    errors.append(f"[markov] {c} hors [0,1]: {len(invalid)} rows")
+        
+        # Time-freeze check: premier match par joueur devrait avoir NaN
+        first_by_player = (
+            mk.sort(["player_id", "year"])
+              .group_by("player_id")
+              .head(1)
+        )
+        nan_share = first_by_player.select(pl.col("p_point_srv").is_null().mean()).item()
+        if nan_share < 0.8:
+            print(f"  ⚠️  [markov] Time-freeze: seulement {nan_share:.1%} NaN sur premiers matchs (attendu >80%)")
+        else:
+            print(f"✔ markov time-freeze: {nan_share:.1%} NaN sur premiers matchs")
+        
+        if not errors:
+            print(f"✔ markov: {len(mk):,} rows, pas de doublons, probs OK")
+    
+    # 6) Surface Speed Index
+    ssi_path = io.aux_data / "surface_speed_index.parquet"
+    if ssi_path.exists():
+        ssi = pl.read_parquet(ssi_path)
+        print(f"✔ SSI: {len(ssi):,} rows")
+    
+    # Résultat
+    if errors:
+        print("\n❌ ERREURS DÉTECTÉES:")
+        for e in errors:
+            print(f"  • {e}")
+        return False
+    
+    print("\n✅ SANITY CHECK PASSED")
+    return True
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+def run_preprocess2_godmode(gender: str = "atp", root: Path = ROOT) -> None:
+    """
+    Exécute le pipeline preprocess2 complet en mode GOD MODE.
+    """
+    print("=" * 70)
+    print("   TENNISTITAN 2026 - PREPROCESS 2 GOD MODE (Polars)")
+    print("=" * 70)
+    
+    start = time.time()
+    io = IO(root)
+    io.ensure_dirs()
+    
+    # Cellule A: PCT Normalize
+    pct_normalize_polars(io, gender)
+    
+    # Cellule B: Fix 2ndWon
+    fix_2ndwon_polars(io, gender)
+    
+    # Cellule C: Surface Speed Index
+    surface_speed_index_polars(io, gender)
+    
+    # Cellule D: Glicko-2
+    glicko2_builder_polars(io, gender)
+    
+    # Cellule E: Charting Super
+    charting_super_features_polars(io, gender)
+    
+    # Cellule F: H2H Decay
+    h2h_decay_builder_polars(io, gender)
+    
+    # Cellule G: Baseline Markov
+    baseline_markov_builder_polars(io, gender)
+    
+    # Sanity check
+    print()
+    ok = sanity_check_preprocess2_polars(io, gender)
+    
+    elapsed = time.time() - start
+    
+    print()
+    print("=" * 70)
+    print("   📊 RÉSUMÉ PREPROCESS 2 GOD MODE")
+    print("=" * 70)
+    print(f"   ⏱️  Temps total: {elapsed:.1f}s")
+    print()
+    print(f"   📂 Outputs:")
+    print(f"      {'✅' if io.matches_base_scaled.exists() else '❌'} matches_base_scaled")
+    print(f"      {'✅' if io.glicko2_dir.exists() else '❌'} ratings_glicko2")
+    print(f"      {'✅' if io.charting_super_dir.exists() else '❌'} charting_super")
+    print(f"      {'✅' if io.h2h_dir.exists() else '❌'} h2h_decay")
+    print(f"      {'✅' if io.markov_dir.exists() else '❌'} baseline_markov")
+    print(f"      {'✅' if (io.aux_data / 'surface_speed_index.parquet').exists() else '❌'} surface_speed_index")
+    print()
+    print("=" * 70)
+    print("   🎯 PREPROCESS 2 GOD MODE COMPLETE")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    run_preprocess2_godmode("atp")

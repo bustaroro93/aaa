@@ -1,0 +1,33 @@
+======================================================================
+   PP03B MERGE v2
+======================================================================
+
+[1] Loading ML_READY: C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_SOTA_v6.parquet
+    Shape: (543927, 1455)
+
+[2] Loading PP03B: C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\player_attributes\player_attributes_v2_match_level.parquet
+    Shape: (544245, 37)
+
+[3] Join key: custom_match_id
+  ✅ New columns: 33
+
+[4] After merge: 1488 cols (+33)
+
+[5] Coverage:
+    r20_win_rate_vs_lefty_A: 7.6%
+    backhand_B: 100.0%
+    r20_win_rate_vs_lefty_B: 6.8%
+    weight_B: 72.9%
+    r20_std_duration_A: 46.9%
+    height_B: 72.2%
+    height_diff: 59.5%
+    r20_avg_duration_A: 46.9%
+    r20_matches_vs_lefty_A: 100.0%
+    backhand_A: 100.0%
+
+[6] Saving: C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_SOTA_v7.parquet
+
+✅ Complete in 32.7s
+   Shape: (543927, 1488)
+
+   ➡️  Update PP09/PP10 to use matches_ml_ready_SOTA_v7.parquet

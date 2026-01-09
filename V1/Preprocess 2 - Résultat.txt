@@ -1,0 +1,133 @@
+======================================================================
+   TENNISTITAN 2026 - PREPROCESS 2 GOD MODE (Polars)
+======================================================================
+============================================================
+CELLULE A - PCT NORMALIZE (Polars)
+============================================================
+[pct-normalize] loaded matches_base: 544,245 rows
+[pct-normalize] 7,207,608 NaN convertis en null
+[pct-normalize] 0 colonnes scalées 0-100→0-1
+[pct-normalize] scaled columns: []
+[partition] gender = 'atp'
+[partition] year = 1942
+✔ matches_base_scaled → C:\Users\Administrateur\Tennis POLAR v3\data_clean\matches_base_scaled
+============================================================
+CELLULE B - FIX 2NDWON_P (Polars)
+============================================================
+[2ndWon_fix] loaded: 544,245 rows
+w_s_2ndWon_p: non-null=186,125 | min=0.000 | p50=0.556 | max=1.000
+         -> recalc=34.2% | fallback=0.0%
+l_s_2ndWon_p: non-null=178,283 | min=0.000 | p50=0.447 | max=1.000
+         -> recalc=32.7% | fallback=0.0%
+w_ret_2ndWon_p: non-null=207,940 | min=0.000 | p50=0.556 | max=1.000
+         -> recalc=32.7% | fallback=5.5%
+l_ret_2ndWon_p: non-null=207,948 | min=0.000 | p50=0.444 | max=1.000
+         -> recalc=34.2% | fallback=4.0%
+[partition] gender = 'atp'
+[partition] year = 1942
+✔ 2ndWon_p fixed → C:\Users\Administrateur\Tennis POLAR v3\data_clean\matches_base_scaled
+============================================================
+CELLULE C - SURFACE SPEED INDEX (Polars)
+============================================================
+✔ surface_speed_index (SOTA Time-Correct) → C:\Users\Administrateur\Tennis POLAR v3\data_clean\aux_data\surface_speed_index.parquet
+  Lignes: 21,992
+  Tournois uniques: 5800
+  Années couvertes: 1942 - 2025
+============================================================
+CELLULE D - GLICKO-2 RATINGS (Polars I/O)
+============================================================
+[sort] SOTA: match_sequence_key
+[glicko2] Processing 522,120 matches...
+  [glicko2] 50,000 / 522,120 matchs traités (9.6%)
+  [glicko2] 100,000 / 522,120 matchs traités (19.2%)
+  [glicko2] 150,000 / 522,120 matchs traités (28.7%)
+  [glicko2] 200,000 / 522,120 matchs traités (38.3%)
+  [glicko2] 250,000 / 522,120 matchs traités (47.9%)
+  [glicko2] 300,000 / 522,120 matchs traités (57.5%)
+  [glicko2] 350,000 / 522,120 matchs traités (67.0%)
+  [glicko2] 400,000 / 522,120 matchs traités (76.6%)
+  [glicko2] 450,000 / 522,120 matchs traités (86.2%)
+  [glicko2] 500,000 / 522,120 matchs traités (95.8%)
+✔ glicko2 post-clean: dup enlevés=0
+[partition] gender = 'atp'
+[partition] year = 2006
+✔ glicko2 features → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\ratings_glicko2
+  Lignes: 1,044,240
+============================================================
+CELLULE E - CHARTING SUPER FEATURES SOTA (Polars)
+============================================================
+[charting] Loaded: 13,278,337 rows
+[charting] Aggregating features per match (SOTA)...
+[charting] Per-match features: 14,369 rows
+[charting] doublons supprimés: 0
+[partition] gender = 'atp'
+[partition] year = 2020
+✔ charting_super SOTA → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\charting_super
+  Lignes: 14,369
+  Features rolling: 48
+  Flags historiques: 6
+============================================================
+CELLULE F - H2H DECAY (Polars I/O)
+============================================================
+[h2h] Processing 522,120 matches...
+  [h2h] 50,000 / 522,120 matchs traités (9.6%)
+  [h2h] 100,000 / 522,120 matchs traités (19.2%)
+  [h2h] 150,000 / 522,120 matchs traités (28.7%)
+  [h2h] 200,000 / 522,120 matchs traités (38.3%)
+  [h2h] 250,000 / 522,120 matchs traités (47.9%)
+  [h2h] 300,000 / 522,120 matchs traités (57.5%)
+  [h2h] 350,000 / 522,120 matchs traités (67.0%)
+  [h2h] 400,000 / 522,120 matchs traités (76.6%)
+  [h2h] 450,000 / 522,120 matchs traités (86.2%)
+  [h2h] 500,000 / 522,120 matchs traités (95.8%)
+[h2h] doublons supprimés: 0
+[partition] gender = 'atp'
+[partition] year = 2013
+✔ h2h_decay → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\h2h_decay
+  Lignes: 1,044,240
+============================================================
+CELLULE G - BASELINE MARKOV (Polars)
+============================================================
+[markov] Computing Markov probabilities for 1,087,942 rows...
+[markov] doublons supprimés: 0
+[partition] gender = 'atp'
+[partition] year = 2018
+✔ baseline_markov → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\baseline_markov
+  Lignes: 1,087,942
+
+============================================================
+SANITY CHECK PREPROCESS2 (Polars)
+============================================================
+[2ndWon_p] w_s_2ndWon_p: non_null=186,125 | null=358,120 | nan=0 | inf=0 | out01=0
+           -> recalc=34.2% | fallback=0.0%
+[2ndWon_p] l_s_2ndWon_p: non_null=178,283 | null=365,962 | nan=0 | inf=0 | out01=0
+           -> recalc=32.7% | fallback=0.0%
+[2ndWon_p] w_ret_2ndWon_p: non_null=207,940 | null=336,305 | nan=0 | inf=0 | out01=0
+           -> recalc=32.7% | fallback=5.5%
+[2ndWon_p] l_ret_2ndWon_p: non_null=207,948 | null=336,297 | nan=0 | inf=0 | out01=0
+           -> recalc=34.2% | fallback=4.0%
+✔ glicko2: 1,044,240 rows, pas de doublons, RD OK
+✔ charting_super: 14,369 rows, flags=6, rolling=48
+✔ h2h: 1,044,240 rows, pas de doublons, rates OK
+✔ markov time-freeze: 98.7% NaN sur premiers matchs
+✔ markov: 1,087,942 rows, pas de doublons, probs OK
+✔ SSI: 21,992 rows
+
+✅ SANITY CHECK PASSED
+
+======================================================================
+   📊 RÉSUMÉ PREPROCESS 2 GOD MODE
+======================================================================
+   ⏱️  Temps total: 646.4s
+
+   📂 Outputs:
+      ✅ matches_base_scaled
+      ✅ ratings_glicko2
+      ✅ charting_super
+      ✅ h2h_decay
+      ✅ baseline_markov
+      ✅ surface_speed_index
+
+======================================================================
+   🎯 PREPROCESS 2 GOD MODE COMPLETE
+======================================================================

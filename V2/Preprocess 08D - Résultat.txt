@@ -1,0 +1,62 @@
+======================================================================
+   PP_08D - MERGE OPPONENT-ADJUSTED + RENAME A/B
+======================================================================
+   2026-01-08 18:45:26
+======================================================================
+
+[1/4] Loading datasets...
+  SOTA: (543927, 1386)
+  Opponent-adjusted: (544245, 70)
+
+[2/4] Checking join key...
+  SOTA matches: 543,927
+  Opp-adj matches: 544,245
+  Overlap: 543,927 (100.0%)
+
+[3/4] Renaming winner/loser → A/B...
+  Winner columns: 31
+  Loser columns: 31
+
+  📋 Rename examples:
+     win_rate_vs_top10_winner → win_rate_vs_top10_A
+     ace_rate_vs_top10_winner → ace_rate_vs_top10_A
+     hold_rate_vs_top10_winner → hold_rate_vs_top10_A
+     bp_conv_vs_top10_winner → bp_conv_vs_top10_A
+     n_matches_vs_top10_winner → n_matches_vs_top10_A
+
+[4/4] Checking collisions and merging...
+  ✅ No column collisions detected
+  Before merge: 1386 columns
+  After merge: 1455 columns
+  New features: +69
+
+  📊 Coverage of new features:
+     win_rate_vs_top10_A: 16.3%
+     win_rate_vs_top50_A: 27.1%
+     win_rate_vs_similar_A: 57.5%
+     adj_dominance_score_A: 100.0%
+     diff_adj_dominance_score: 100.0%
+
+======================================================================
+   ✅ PP_08D MERGE COMPLETE!
+======================================================================
+   Input SOTA: matches_ml_ready_SOTA_v5.parquet
+   Input Opp-Adj: opponent_adj_features.parquet
+   Output: matches_ml_ready_SOTA_v6.parquet
+   New features: +69
+   ⏱️  Time: 12.5s
+
+📋 WHAT HAPPENED:
+   ✅ Loaded SOTA_v5 + opponent_adj_features
+   ✅ Renamed *_winner → *_A, *_loser → *_B
+   ✅ Merged on custom_match_id
+   ✅ Saved as SOTA_v6
+
+🔄 NEXT STEPS:
+   1. Update PP_09 to load SOTA_v6 instead of SOTA_v5
+   2. Run PP_09 (will now include opponent-adjusted features)
+   3. Run PP_10
+
+⚠️ IMPORTANT:
+   The diff_* columns (e.g., diff_adj_dominance_score) represent A-B.
+   PP09 will auto-invert them during shuffle (like other diff* columns).

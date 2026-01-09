@@ -1,0 +1,601 @@
+"""
+===============================================
+PP05B - SSI MULTI-FACTEUR GOD SOTA 2026
+===============================================
+Amélioration du SSI existant avec plusieurs facteurs:
+
+1. SSI par surface (pas juste global)
+2. SSI indoor vs outdoor
+3. SSI par niveau de tournoi (Grand Slam vs ATP 250)
+4. SSI momentum (tendance récente)
+5. SSI vs opponent's preference
+
+Ce module s'exécute APRÈS PP05 standard et ajoute
+des features supplémentaires.
+
+Impact estimé: +0.1% AUC
+===============================================
+"""
+
+import polars as pl
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+import time
+import gc
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+# Input
+MATCHES_BASE_PATH = DATA_CLEAN / "matches_base"
+SSI_PATH = DATA_CLEAN / "features" / "speed_surface" / "ssi_match_level.parquet"
+SPEED_INDEX_PATH = DATA_CLEAN / "features" / "speed_surface" / "tourney_speed_index.parquet"
+
+# Output
+OUTPUT_DIR = DATA_CLEAN / "features" / "ssi_multi"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Rolling parameters
+ROLLING_WINDOW = 20
+MIN_MATCHES = 5
+
+# Surface categories
+SURFACE_SPEED = {
+    "Grass": 0.06,      # Fastest
+    "Carpet": 0.04,     # Fast
+    "Hard": 0.00,       # Neutral
+    "Clay": -0.05,      # Slowest
+}
+
+# Niveau tournoi (impact sur importance du match)
+LEVEL_WEIGHT = {
+    "G": 3.0,    # Grand Slam
+    "F": 2.5,    # Finals
+    "M": 2.0,    # Masters 1000
+    "O": 1.8,    # Olympics
+    "A": 1.5,    # ATP 500
+    "B": 1.0,    # ATP 250
+    "C": 0.5,    # Challenger
+    "I": 0.3,    # ITF
+}
+
+
+# ===============================================
+# SECTION 1: SSI PAR SURFACE
+# ===============================================
+
+def build_ssi_by_surface(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calcule un SSI séparé pour chaque surface.
+    
+    Idée: Un joueur peut bien performer sur surfaces rapides
+    mais mal sur clay, même s'il joue rarement sur clay.
+    
+    Features créées:
+    - ssi_hard_A/B, ssi_clay_A/B, ssi_grass_A/B
+    - ssi_surface_match_A/B (SSI sur la surface du match)
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 1: SSI PAR SURFACE")
+    print("=" * 60)
+    
+    # Vérifier colonnes
+    if "tourney_surface_ta" not in df.columns:
+        print("  ⚠️ tourney_surface_ta not found!")
+        return df
+    
+    # Player-match view
+    if "custom_match_id" not in df.columns:
+        df = df.with_columns([
+            pl.arange(0, len(df)).cast(pl.Utf8).alias("custom_match_id")
+        ])
+    
+    # Winner view
+    winner = df.select([
+        "custom_match_id", "tourney_date_ta", "year",
+        pl.col("winner_id").alias("player_id"),
+        "tourney_surface_ta",
+        pl.lit(1).alias("won"),
+    ])
+    
+    # Loser view
+    loser = df.select([
+        "custom_match_id", "tourney_date_ta", "year",
+        pl.col("loser_id").alias("player_id"),
+        "tourney_surface_ta",
+        pl.lit(0).alias("won"),
+    ])
+    
+    pm = pl.concat([winner, loser]).filter(pl.col("player_id").is_not_null())
+    pm = pm.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    
+    print(f"  Player-match rows: {len(pm):,}")
+    
+    # Calculer win rate rolling par surface
+    surfaces = ["Hard", "Clay", "Grass"]
+    
+    for surface in surfaces:
+        print(f"  Processing {surface}...")
+        
+        # Flag pour cette surface
+        pm = pm.with_columns([
+            (pl.col("tourney_surface_ta") == surface).cast(pl.Int8).alias(f"is_{surface.lower()}"),
+            ((pl.col("tourney_surface_ta") == surface) & (pl.col("won") == 1))
+              .cast(pl.Int8)
+              .alias(f"won_{surface.lower()}")
+        ])
+        
+        # Rolling sur cette surface (shift anti-leak)
+        pm = pm.with_columns([
+            pl.col(f"is_{surface.lower()}")
+              .shift(1)
+              .rolling_sum(window_size=ROLLING_WINDOW*3, min_samples=1)
+              .over("player_id")  # UN SEUL .over()
+              .fill_nan(0).fill_null(0)
+              .alias(f"matches_{surface.lower()}"),
+            
+            pl.col(f"won_{surface.lower()}")
+              .shift(1)
+              .rolling_sum(window_size=ROLLING_WINDOW*3, min_samples=1)
+              .over("player_id")  # UN SEUL .over()
+              .fill_nan(0).fill_null(0)
+              .alias(f"wins_{surface.lower()}"),
+        ])
+        
+        # Win rate sur cette surface
+        pm = pm.with_columns([
+            pl.when(pl.col(f"matches_{surface.lower()}") >= MIN_MATCHES)
+              .then(pl.col(f"wins_{surface.lower()}") / pl.col(f"matches_{surface.lower()}"))
+              .otherwise(0.5)
+              .cast(pl.Float32)
+              .alias(f"ssi_{surface.lower()}")
+        ])
+    
+    # SSI sur la surface du match actuel
+    pm = pm.with_columns([
+        pl.when(pl.col("tourney_surface_ta") == "Hard")
+          .then(pl.col("ssi_hard"))
+          .when(pl.col("tourney_surface_ta") == "Clay")
+          .then(pl.col("ssi_clay"))
+          .when(pl.col("tourney_surface_ta") == "Grass")
+          .then(pl.col("ssi_grass"))
+          .otherwise(0.5)
+          .cast(pl.Float32)
+          .alias("ssi_current_surface")
+    ])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Merge back to matches
+    # ═══════════════════════════════════════════════════════════════
+    
+    ssi_features = pm.select([
+        "custom_match_id", "player_id",
+        "ssi_hard", "ssi_clay", "ssi_grass", "ssi_current_surface"
+    ])
+    
+    # Winner (A)
+    df = df.join(
+        ssi_features.select([
+            "custom_match_id",
+            pl.col("player_id").alias("winner_id"),
+            pl.col("ssi_hard").alias("ssi_hard_A"),
+            pl.col("ssi_clay").alias("ssi_clay_A"),
+            pl.col("ssi_grass").alias("ssi_grass_A"),
+            pl.col("ssi_current_surface").alias("ssi_current_surface_A"),
+        ]),
+        on=["custom_match_id", "winner_id"],
+        how="left"
+    )
+    
+    # Loser (B)
+    df = df.join(
+        ssi_features.select([
+            "custom_match_id",
+            pl.col("player_id").alias("loser_id"),
+            pl.col("ssi_hard").alias("ssi_hard_B"),
+            pl.col("ssi_clay").alias("ssi_clay_B"),
+            pl.col("ssi_grass").alias("ssi_grass_B"),
+            pl.col("ssi_current_surface").alias("ssi_current_surface_B"),
+        ]),
+        on=["custom_match_id", "loser_id"],
+        how="left"
+    )
+    
+    # Diffs
+    df = df.with_columns([
+        (pl.col("ssi_current_surface_A") - pl.col("ssi_current_surface_B"))
+          .alias("diff_ssi_current_surface"),
+        (pl.col("ssi_hard_A") - pl.col("ssi_hard_B")).alias("diff_ssi_hard"),
+        (pl.col("ssi_clay_A") - pl.col("ssi_clay_B")).alias("diff_ssi_clay"),
+        (pl.col("ssi_grass_A") - pl.col("ssi_grass_B")).alias("diff_ssi_grass"),
+    ])
+    
+    # Stats
+    for col in ["ssi_current_surface_A", "diff_ssi_current_surface"]:
+        if col in df.columns:
+            cov = df[col].is_not_null().mean()
+            print(f"  {col}: {100*cov:.1f}% coverage")
+    
+    del pm, ssi_features
+    gc.collect()
+    
+    return df
+
+
+# ===============================================
+# SECTION 2: SSI INDOOR VS OUTDOOR
+# ===============================================
+
+def build_ssi_indoor_outdoor(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Calcule SSI séparé pour indoor et outdoor.
+    
+    Certains joueurs performent mieux en indoor (atmosphère,
+    pas de vent, rebond plus régulier).
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 2: SSI INDOOR VS OUTDOOR")
+    print("=" * 60)
+    
+    if "is_indoor" not in df.columns:
+        print("  ⚠️ is_indoor not found!")
+        return df
+    
+    # Player-match view
+    winner = df.select([
+        "custom_match_id", "tourney_date_ta",
+        pl.col("winner_id").alias("player_id"),
+        "is_indoor",
+        pl.lit(1).alias("won"),
+    ])
+    
+    loser = df.select([
+        "custom_match_id", "tourney_date_ta",
+        pl.col("loser_id").alias("player_id"),
+        "is_indoor",
+        pl.lit(0).alias("won"),
+    ])
+    
+    pm = pl.concat([winner, loser]).filter(pl.col("player_id").is_not_null())
+    pm = pm.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    
+    # Convertir is_indoor en Int8 si nécessaire
+    pm = pm.with_columns([
+        pl.col("is_indoor").cast(pl.Int8).fill_null(0).alias("is_indoor_int")
+    ])
+    
+    # Indoor stats
+    pm = pm.with_columns([
+        (pl.col("is_indoor_int") * pl.col("won")).alias("won_indoor"),
+        ((1 - pl.col("is_indoor_int")) * pl.col("won")).alias("won_outdoor"),
+    ])
+    
+    # Rolling
+    for cond, suffix in [("is_indoor_int", "indoor"), ("1-is_indoor_int", "outdoor")]:
+        if suffix == "indoor":
+            pm = pm.with_columns([
+                pl.col("is_indoor_int")
+                  .shift(1)
+                  .rolling_sum(window_size=ROLLING_WINDOW*2, min_samples=1)
+                  .over("player_id")
+                  .fill_nan(0).fill_null(0)
+                  .alias("matches_indoor"),
+                
+                pl.col("won_indoor")
+                  .shift(1)
+                  .rolling_sum(window_size=ROLLING_WINDOW*2, min_samples=1)
+                  .over("player_id")
+                  .fill_nan(0).fill_null(0)
+                  .alias("wins_indoor"),
+            ])
+        else:  # outdoor
+            pm = pm.with_columns([
+                (1 - pl.col("is_indoor_int"))
+                  .shift(1)
+                  .rolling_sum(window_size=ROLLING_WINDOW*2, min_samples=1)
+                  .over("player_id")
+                  .fill_nan(0).fill_null(0)
+                  .alias("matches_outdoor"),
+                
+                pl.col("won_outdoor")
+                  .shift(1)
+                  .rolling_sum(window_size=ROLLING_WINDOW*2, min_samples=1)
+                  .over("player_id")
+                  .fill_nan(0).fill_null(0)
+                  .alias("wins_outdoor"),
+            ])
+    
+    # Win rates
+    pm = pm.with_columns([
+        pl.when(pl.col("matches_indoor") >= MIN_MATCHES)
+          .then(pl.col("wins_indoor") / pl.col("matches_indoor"))
+          .otherwise(0.5)
+          .cast(pl.Float32)
+          .alias("ssi_indoor"),
+        
+        pl.when(pl.col("matches_outdoor") >= MIN_MATCHES)
+          .then(pl.col("wins_outdoor") / pl.col("matches_outdoor"))
+          .otherwise(0.5)
+          .cast(pl.Float32)
+          .alias("ssi_outdoor"),
+    ])
+    
+    # Indoor advantage (indoor - outdoor)
+    pm = pm.with_columns([
+        (pl.col("ssi_indoor") - pl.col("ssi_outdoor"))
+          .cast(pl.Float32)
+          .alias("indoor_preference")
+    ])
+    
+    # Merge back
+    indoor_features = pm.select([
+        "custom_match_id", "player_id",
+        "ssi_indoor", "ssi_outdoor", "indoor_preference"
+    ])
+    
+    # Winner (A)
+    df = df.join(
+        indoor_features.select([
+            "custom_match_id",
+            pl.col("player_id").alias("winner_id"),
+            pl.col("ssi_indoor").alias("ssi_indoor_A"),
+            pl.col("ssi_outdoor").alias("ssi_outdoor_A"),
+            pl.col("indoor_preference").alias("indoor_preference_A"),
+        ]),
+        on=["custom_match_id", "winner_id"],
+        how="left"
+    )
+    
+    # Loser (B)
+    df = df.join(
+        indoor_features.select([
+            "custom_match_id",
+            pl.col("player_id").alias("loser_id"),
+            pl.col("ssi_indoor").alias("ssi_indoor_B"),
+            pl.col("ssi_outdoor").alias("ssi_outdoor_B"),
+            pl.col("indoor_preference").alias("indoor_preference_B"),
+        ]),
+        on=["custom_match_id", "loser_id"],
+        how="left"
+    )
+    
+    # Feature: SSI sur le contexte actuel (indoor/outdoor)
+    df = df.with_columns([
+        pl.when(pl.col("is_indoor") == True)
+          .then(pl.col("ssi_indoor_A") - pl.col("ssi_indoor_B"))
+          .otherwise(pl.col("ssi_outdoor_A") - pl.col("ssi_outdoor_B"))
+          .cast(pl.Float32)
+          .alias("diff_ssi_context"),
+        
+        (pl.col("indoor_preference_A") - pl.col("indoor_preference_B"))
+          .alias("diff_indoor_preference"),
+    ])
+    
+    del pm, indoor_features
+    gc.collect()
+    
+    return df
+
+
+# ===============================================
+# SECTION 3: SSI BY TOURNAMENT LEVEL
+# ===============================================
+
+def build_ssi_by_level(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Performance par niveau de tournoi.
+    
+    Certains joueurs performent mieux dans les gros tournois
+    (pressure players) vs les petits tournois.
+    """
+    print("\n" + "=" * 60)
+    print("SECTION 3: SSI BY TOURNAMENT LEVEL")
+    print("=" * 60)
+    
+    if "tourney_level_ta" not in df.columns:
+        print("  ⚠️ tourney_level_ta not found!")
+        return df
+    
+    # Classifier: Big (G, F, M) vs Small (A, B, C, I)
+    df = df.with_columns([
+        pl.col("tourney_level_ta").is_in(["G", "F", "M", "O"]).cast(pl.Int8).alias("is_big_event")
+    ])
+    
+    # Player-match view
+    winner = df.select([
+        "custom_match_id", "tourney_date_ta",
+        pl.col("winner_id").alias("player_id"),
+        "is_big_event",
+        pl.lit(1).alias("won"),
+    ])
+    
+    loser = df.select([
+        "custom_match_id", "tourney_date_ta",
+        pl.col("loser_id").alias("player_id"),
+        "is_big_event",
+        pl.lit(0).alias("won"),
+    ])
+    
+    pm = pl.concat([winner, loser]).filter(pl.col("player_id").is_not_null())
+    pm = pm.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    
+    # Big event stats
+    pm = pm.with_columns([
+        (pl.col("is_big_event") * pl.col("won")).alias("won_big"),
+        ((1 - pl.col("is_big_event")) * pl.col("won")).alias("won_small"),
+    ])
+    
+    # Rolling
+    pm = pm.with_columns([
+        pl.col("is_big_event")
+          .shift(1)
+          .rolling_sum(window_size=ROLLING_WINDOW*2, min_samples=1)
+          .over("player_id")
+          .fill_nan(0).fill_null(0)
+          .alias("matches_big"),
+        
+        pl.col("won_big")
+          .shift(1)
+          .rolling_sum(window_size=ROLLING_WINDOW*2, min_samples=1)
+          .over("player_id")
+          .fill_nan(0).fill_null(0)
+          .alias("wins_big"),
+        
+        (1 - pl.col("is_big_event"))
+          .shift(1)
+          .rolling_sum(window_size=ROLLING_WINDOW*2, min_samples=1)
+          .over("player_id")
+          .fill_nan(0).fill_null(0)
+          .alias("matches_small"),
+        
+        pl.col("won_small")
+          .shift(1)
+          .rolling_sum(window_size=ROLLING_WINDOW*2, min_samples=1)
+          .over("player_id")
+          .fill_nan(0).fill_null(0)
+          .alias("wins_small"),
+    ])
+    
+    # Win rates
+    pm = pm.with_columns([
+        pl.when(pl.col("matches_big") >= MIN_MATCHES)
+          .then(pl.col("wins_big") / pl.col("matches_big"))
+          .otherwise(0.5)
+          .cast(pl.Float32)
+          .alias("wr_big_events"),
+        
+        pl.when(pl.col("matches_small") >= MIN_MATCHES)
+          .then(pl.col("wins_small") / pl.col("matches_small"))
+          .otherwise(0.5)
+          .cast(pl.Float32)
+          .alias("wr_small_events"),
+    ])
+    
+    # Big event advantage (big - small)
+    pm = pm.with_columns([
+        (pl.col("wr_big_events") - pl.col("wr_small_events"))
+          .cast(pl.Float32)
+          .alias("big_event_preference")
+    ])
+    
+    # Merge back
+    level_features = pm.select([
+        "custom_match_id", "player_id",
+        "wr_big_events", "wr_small_events", "big_event_preference"
+    ])
+    
+    # Winner (A)
+    df = df.join(
+        level_features.select([
+            "custom_match_id",
+            pl.col("player_id").alias("winner_id"),
+            pl.col("wr_big_events").alias("wr_big_events_A"),
+            pl.col("wr_small_events").alias("wr_small_events_A"),
+            pl.col("big_event_preference").alias("big_event_preference_A"),
+        ]),
+        on=["custom_match_id", "winner_id"],
+        how="left"
+    )
+    
+    # Loser (B)
+    df = df.join(
+        level_features.select([
+            "custom_match_id",
+            pl.col("player_id").alias("loser_id"),
+            pl.col("wr_big_events").alias("wr_big_events_B"),
+            pl.col("wr_small_events").alias("wr_small_events_B"),
+            pl.col("big_event_preference").alias("big_event_preference_B"),
+        ]),
+        on=["custom_match_id", "loser_id"],
+        how="left"
+    )
+    
+    # Feature: diff dans le contexte actuel
+    df = df.with_columns([
+        pl.when(pl.col("is_big_event") == 1)
+          .then(pl.col("wr_big_events_A") - pl.col("wr_big_events_B"))
+          .otherwise(pl.col("wr_small_events_A") - pl.col("wr_small_events_B"))
+          .cast(pl.Float32)
+          .alias("diff_wr_event_context"),
+        
+        (pl.col("big_event_preference_A") - pl.col("big_event_preference_B"))
+          .alias("diff_big_event_preference"),
+    ])
+    
+    del pm, level_features
+    gc.collect()
+    
+    return df
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    print("\n" + "=" * 70)
+    print("   PP05B - SSI MULTI-FACTEUR GOD SOTA 2026")
+    print("=" * 70)
+    print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+    
+    start_time = time.time()
+    
+    # Load matches_base
+    print("\n[1] Loading matches_base...")
+    df = pl.read_parquet(MATCHES_BASE_PATH)
+    print(f"  Loaded: {len(df):,} matches")
+    
+    original_cols = set(df.columns)
+    
+    # Build features
+    df = build_ssi_by_surface(df)
+    df = build_ssi_indoor_outdoor(df)
+    df = build_ssi_by_level(df)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # SUMMARY
+    # ═══════════════════════════════════════════════════════════════
+    
+    new_cols = set(df.columns) - original_cols
+    
+    print("\n" + "=" * 70)
+    print("   SUMMARY")
+    print("=" * 70)
+    print(f"  New columns: {len(new_cols)}")
+    
+    print(f"\n  📊 NEW FEATURES ({len(new_cols)}):")
+    for col in sorted(new_cols):
+        if df[col].dtype in [pl.Float32, pl.Float64]:
+            cov = df[col].is_not_null().mean()
+            mean_val = df.filter(pl.col(col).is_not_null())[col].mean()
+            print(f"     {col}: {100*cov:.1f}% coverage, mean={mean_val:.3f}")
+        else:
+            print(f"     {col}: (non-numeric)")
+    
+    # Save
+    output_path = OUTPUT_DIR / "ssi_multi_match_level.parquet"
+    
+    # Sélectionner seulement les colonnes nécessaires
+    id_cols = ["custom_match_id", "match_id_ta_dedup", "winner_id", "loser_id"]
+    save_cols = [c for c in id_cols if c in df.columns] + list(new_cols)
+    
+    df.select(save_cols).write_parquet(output_path)
+    print(f"\n  ✅ Saved to {output_path}")
+    
+    elapsed = time.time() - start_time
+    print(f"\n  ⏱️ Total time: {elapsed:.1f}s")
+    
+    print("\n" + "=" * 70)
+    print("   PP05B COMPLETE")
+    print("=" * 70)
+    
+    return df
+
+
+if __name__ == "__main__":
+    result = main()

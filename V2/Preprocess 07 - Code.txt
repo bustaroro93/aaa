@@ -1,0 +1,663 @@
+# ===============================================
+# PP_07 - CHARTING PLAYER + STYLE (GOD MODE CORRIGÉ)
+# TennisTitan SOTA 2026
+# ===============================================
+#
+# CORRECTIONS APPLIQUÉES:
+#   1. Header: PP_08 → PP_07
+#   2. Features renommées: style_* → chart_style_* (évite conflit PP_05)
+#   3. AJOUT Section 6: Merge vers SOTA_v4
+#   4. Seuils ajustés pour meilleure distribution
+#
+# Input: data_clean/charting_long/ (créé par PP_01)
+# Output: 
+#   - data_clean/features/charting_player_style/
+#   - data_clean/ml_ready/matches_ml_ready_SOTA_v4.parquet
+# ===============================================
+
+import polars as pl
+from pathlib import Path
+from datetime import datetime
+import time
+import warnings
+warnings.filterwarnings("ignore")
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+FEATURES_DIR = DATA_CLEAN / "features"
+
+# Input: charting_long (créé par PP_01)
+CHARTING_LONG_DIR = DATA_CLEAN / "charting_long"
+
+# Alternative: charting brut
+CHARTING_RAW_DIR = ROOT / "data_tennis_abstract_production_async" / "charting_data_v4_6_singlepool"
+
+# Output
+OUTPUT_DIR = FEATURES_DIR / "charting_player_style"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Rolling windows
+ROLLING_WINDOWS = [5, 10, 20]
+
+# Stats importantes
+PRIORITY_STATS = [
+    "a_pct", "df_pct", "1stin", "1st_pct", "2nd_pct",
+    "rpw_pct", "unret_pct",
+    "wide_pct", "body_pct", "t_pct",
+    "dc_wide_pct", "dc_body_pct", "dc_t_pct",
+    "ad_wide_pct", "ad_body_pct", "ad_t_pct",
+    "avgrally", "inplayw_pct", "rallylen",
+    "wnr_pct", "ufe_pct", "winner_pct", "unferr_pct",
+    "net_pct", "won_pct",
+    "deep_pct", "shlw_pct",
+    "ptsw_pct", "bpsaved",
+    "pts", "fcde_pct", "lte3w_pct",
+]
+
+
+# ===============================================
+# PARTIE 1: CHARGEMENT DES DONNÉES
+# ===============================================
+
+def load_charting_long() -> pl.DataFrame:
+    """Charge les données charting_long."""
+    print("\n[1/6] Loading charting_long...")
+    
+    if CHARTING_LONG_DIR.exists():
+        print(f"  Loading from {CHARTING_LONG_DIR}...")
+        try:
+            df = pl.read_parquet(f"{CHARTING_LONG_DIR}/**/*.parquet")
+            print(f"  ✅ Loaded: {len(df):,} rows")
+            print(f"  Columns: {df.columns}")
+            
+            if "stat_name" in df.columns:
+                unique_stats = df.select("stat_name").unique().height
+                print(f"  Unique stat_names: {unique_stats}")
+            
+            return df
+        except Exception as e:
+            print(f"  ⚠️ Error loading charting_long: {e}")
+    
+    if CHARTING_RAW_DIR.exists():
+        print(f"  Loading from {CHARTING_RAW_DIR}...")
+        try:
+            df = pl.read_parquet(f"{CHARTING_RAW_DIR}/**/*.parquet")
+            print(f"  ✅ Loaded: {len(df):,} rows from RAW")
+            return df
+        except Exception as e:
+            print(f"  ⚠️ Error loading RAW: {e}")
+    
+    print("  ❌ No charting data found!")
+    return None
+
+
+# ===============================================
+# PARTIE 2: PIVOT DES STATS
+# ===============================================
+
+def pivot_charting_stats(df: pl.DataFrame) -> pl.DataFrame:
+    """Pivote les données du format long vers format wide."""
+    print("\n[2/6] Pivoting charting stats...")
+    
+    if df is None:
+        return None
+    
+    print(f"  Available columns: {df.columns}")
+    
+    # Colonnes clés
+    match_col = next((c for c in ["match_id", "custom_match_id"] if c in df.columns), None)
+    player_col = next((c for c in ["player_id", "player_name"] if c in df.columns), None)
+    
+    if not match_col or not player_col:
+        print(f"  ❌ Missing key columns! match={match_col}, player={player_col}")
+        return None
+    
+    print(f"  Match column: {match_col}")
+    print(f"  Player column: {player_col}")
+    
+    # Filtrer "Overall"
+    if "set_context" in df.columns:
+        df_overall = df.filter(pl.col("set_context") == "Overall")
+        print(f"  After Overall filter: {len(df_overall):,} rows")
+    else:
+        df_overall = df
+    
+    stat_col = next((c for c in ["stat_name", "stat_category"] if c in df.columns), None)
+    
+    if not stat_col:
+        print(f"  ❌ Missing stat column!")
+        return None
+    
+    print(f"  Stat column: {stat_col}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # ✅ FIX NASA: Créer valeur unifiée (stat_pct prioritaire pour les %)
+    # ═══════════════════════════════════════════════════════════════
+    df_overall = df_overall.with_columns(
+        pl.coalesce([pl.col("stat_pct"), pl.col("stat_value")])
+        .cast(pl.Float64, strict=False)
+        .alias("stat_num")
+    )
+    value_col = "stat_num"
+    print(f"  ✅ Using unified value column: stat_num = coalesce(stat_pct, stat_value)")
+    
+    available_stats = df_overall.select(stat_col).unique().to_series().to_list()
+    print(f"  Available stats: {len(available_stats)}")
+    
+    stats_to_use = [s for s in PRIORITY_STATS if s in available_stats]
+    print(f"  Priority stats found: {len(stats_to_use)}/{len(PRIORITY_STATS)}")
+    
+    if not stats_to_use:
+        print("  ⚠️ No priority stats found, using all available...")
+        stats_to_use = available_stats[:50]
+    
+    print(f"  Stats to extract: {stats_to_use[:15]}...")
+    
+    df_filtered = df_overall.filter(pl.col(stat_col).is_in(stats_to_use))
+    print(f"  After stat filter: {len(df_filtered):,} rows")
+    
+    try:
+        df_pivot = df_filtered.pivot(
+            values=value_col,
+            index=[match_col, player_col],
+            columns=stat_col,
+            aggregate_function="first"
+        )
+        print(f"  ✅ Pivoted shape: {df_pivot.shape}")
+        
+        # Renommer avec préfixe chart_
+        rename_dict = {col: f"chart_{col}" for col in df_pivot.columns 
+                       if col not in [match_col, player_col]}
+        df_pivot = df_pivot.rename(rename_dict)
+        
+        chart_cols = [c for c in df_pivot.columns if c.startswith("chart_")]
+        print(f"  Chart columns created: {len(chart_cols)}")
+        print(f"  Examples: {chart_cols[:10]}")
+        
+        # ✅ Stats sur les valeurs non-null
+        sample_cols = ["chart_a_pct", "chart_rpw_pct", "chart_1st_pct"]
+        for col in sample_cols:
+            if col in df_pivot.columns:
+                nn = df_pivot[col].is_not_null().sum()
+                print(f"  📊 {col} non-null: {nn:,} / {len(df_pivot):,}")
+        
+        return df_pivot
+        
+    except Exception as e:
+        print(f"  ❌ Pivot error: {e}")
+        return None
+
+
+# ===============================================
+# PARTIE 3: ROLLING PAR JOUEUR
+# ===============================================
+
+def compute_player_rolling(df: pl.DataFrame) -> pl.DataFrame:
+    """Calcule les rolling averages avec shift(1) anti-leakage."""
+    print("\n[3/6] Computing player rolling features...")
+    
+    if df is None:
+        return None
+    
+    feature_cols = [c for c in df.columns if c.startswith("chart_")]
+    print(f"  Feature columns: {len(feature_cols)}")
+    
+    if not feature_cols:
+        print("  ❌ No chart_ columns found!")
+        return df
+    
+    player_col = next((c for c in ["player_id", "player_name"] if c in df.columns), None)
+    match_col = next((c for c in ["match_id", "custom_match_id"] if c in df.columns), None)
+    
+    if not player_col:
+        print("  ❌ No player column found!")
+        return df
+    
+    # ═══════════════════════════════════════════════════════════════
+    # ✅ FIX NASA: Extraire date du match_id pour tri chronologique garanti
+    # ═══════════════════════════════════════════════════════════════
+    if match_col == "match_id" and "match_date" not in df.columns:
+        df = df.with_columns(
+            pl.col("match_id")
+            .str.slice(0, 8)
+            .str.strptime(pl.Date, "%Y%m%d", strict=False)
+            .alias("match_date")
+        )
+        print(f"  ✅ Extracted match_date from match_id")
+    
+    # Tri chronologique explicite
+    sort_cols = [player_col, "match_date", match_col] if "match_date" in df.columns else [player_col, match_col]
+    df = df.sort(sort_cols)
+    print(f"  Sorted by {sort_cols}")
+    
+    all_rolling_exprs = []
+    
+    for window in ROLLING_WINDOWS:
+        print(f"  Computing r{window} rolling...")
+        
+        for col in feature_cols:
+            # ✅ ANTI-LEAKAGE: shift(1) AVANT rolling
+            all_rolling_exprs.append(
+                pl.col(col)
+                .shift(1)
+                .rolling_mean(window, min_periods=1)
+                .over(player_col)
+                .cast(pl.Float32)
+                .alias(f"r{window}_{col}")
+            )
+    
+    df = df.with_columns(all_rolling_exprs)
+    
+    n_rolling = len([c for c in df.columns if c.startswith(("r5_", "r10_", "r20_"))])
+    print(f"  ✅ Created {n_rolling} rolling features")
+    
+    return df
+
+
+# ===============================================
+# PARTIE 4: STYLE FEATURES (✅ CORRIGÉ)
+# ===============================================
+
+def add_style_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Ajoute les features de style.
+    
+    ✅ NASA GOD SOTA 26:
+    - Seuils calibrés sur vraies distributions
+    - net_pct = % réussite au filet (pas fréquence de montée)
+    - Préfixe chart_style_* (évite conflit PP05)
+    """
+    print("\n[4/6] Adding style features...")
+    
+    if df is None:
+        return None
+    
+    def find_col(patterns):
+        for p in patterns:
+            matches = [c for c in df.columns if p in c]
+            if matches:
+                return matches[0]
+        return None
+    
+    # Colonnes sources
+    ace_col = find_col(["r10_chart_a_pct"])
+    first_col = find_col(["r10_chart_1st_pct"])
+    rpw_col = find_col(["r10_chart_rpw_pct"])
+    net_col = find_col(["r10_chart_net_pct"])
+    winner_col = find_col(["r10_chart_wnr_pct", "r10_chart_winner_pct"])
+    rally_col = find_col(["r10_chart_avgrally", "r10_chart_rallylen"])
+    
+    # Debug stats
+    for col, name in [(ace_col, "ace"), (net_col, "net"), (rpw_col, "rpw")]:
+        if col:
+            stats = df.select([
+                pl.col(col).mean().alias("mean"),
+                pl.col(col).quantile(0.75).alias("p75"),
+                pl.col(col).quantile(0.90).alias("p90"),
+            ]).row(0)
+            print(f"  📊 {name}: mean={stats[0]:.1f}, p75={stats[1]:.1f}, p90={stats[2]:.1f}")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 1. Serve Dominance = (ace + 1st_won) / 2  [mean ≈ 40]
+    # ═══════════════════════════════════════════════════════════════
+    if ace_col and first_col:
+        df = df.with_columns([
+            ((pl.col(ace_col).fill_null(8.5) + pl.col(first_col).fill_null(72)) / 2)
+            .cast(pl.Float32)
+            .alias("chart_style_serve_dominance")
+        ])
+        print(f"  ✅ chart_style_serve_dominance")
+    else:
+        df = df.with_columns([pl.lit(40.0).cast(pl.Float32).alias("chart_style_serve_dominance")])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 2. Return Strength = rpw_pct  [mean ≈ 36]
+    # ═══════════════════════════════════════════════════════════════
+    if rpw_col:
+        df = df.with_columns([
+            pl.col(rpw_col).fill_null(36).cast(pl.Float32).alias("chart_style_return_strength")
+        ])
+        print(f"  ✅ chart_style_return_strength")
+    else:
+        df = df.with_columns([pl.lit(36.0).cast(pl.Float32).alias("chart_style_return_strength")])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 3. Aggression = ace * 1.5 + winner * 0.5  [mean ≈ 23]
+    # ═══════════════════════════════════════════════════════════════
+    if ace_col and winner_col:
+        df = df.with_columns([
+            (pl.col(ace_col).fill_null(8.5) * 1.5 + pl.col(winner_col).fill_null(20) * 0.5)
+            .cast(pl.Float32)
+            .alias("chart_style_aggression")
+        ])
+        print(f"  ✅ chart_style_aggression")
+    else:
+        df = df.with_columns([pl.lit(23.0).cast(pl.Float32).alias("chart_style_aggression")])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 4. Rally Preference = avgrally - 4.5
+    # ═══════════════════════════════════════════════════════════════
+    if rally_col:
+        df = df.with_columns([
+            (pl.col(rally_col).fill_null(4.5) - 4.5)
+            .cast(pl.Float32)
+            .alias("chart_style_rally_preference")
+        ])
+        print(f"  ✅ chart_style_rally_preference")
+    else:
+        df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias("chart_style_rally_preference")])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 5. Net Skill (PAS "tendency" - c'est % réussite au filet)  [mean ≈ 38]
+    # ═══════════════════════════════════════════════════════════════
+    if net_col:
+        df = df.with_columns([
+            pl.col(net_col).fill_null(37).cast(pl.Float32).alias("chart_style_net_skill")
+        ])
+        print(f"  ✅ chart_style_net_skill (% réussite au filet)")
+    else:
+        df = df.with_columns([pl.lit(37.0).cast(pl.Float32).alias("chart_style_net_skill")])
+    
+    # ═══════════════════════════════════════════════════════════════
+    # 6. Style Category - SEUILS CALIBRÉS SUR VRAIES DONNÉES
+    # ═══════════════════════════════════════════════════════════════
+    df = df.with_columns([
+        pl.when(
+            # NET_DOMINANT: élite au filet (top ~10-15%, p90 ≈ 55)
+            pl.col("chart_style_net_skill") >= 55
+        ).then(pl.lit("NET_DOMINANT"))
+        .when(
+            # SERVE_BOT: excellent service + rallies courts
+            (pl.col("chart_style_serve_dominance") >= 45) & 
+            (pl.col("chart_style_rally_preference") < -0.5)
+        ).then(pl.lit("SERVE_BOT"))
+        .when(
+            # AGGRESSIVE_BASELINER: haute aggression + bon service
+            (pl.col("chart_style_aggression") >= 30) & 
+            (pl.col("chart_style_serve_dominance") >= 40)
+        ).then(pl.lit("AGGRESSIVE_BASELINER"))
+        .when(
+            # COUNTER_PUNCHER: excellent retour + faible aggression
+            (pl.col("chart_style_return_strength") >= 42) & 
+            (pl.col("chart_style_aggression") < 25)
+        ).then(pl.lit("COUNTER_PUNCHER"))
+        .when(
+            # GRINDER: rallies longs + faible aggression
+            (pl.col("chart_style_rally_preference") >= 0.8) & 
+            (pl.col("chart_style_aggression") < 22)
+        ).then(pl.lit("GRINDER"))
+        .otherwise(pl.lit("ALL_COURT"))
+        .alias("chart_style_category")
+    ])
+    print(f"  ✅ chart_style_category (seuils calibrés NASA)")
+    
+    return df
+
+
+# ===============================================
+# PARTIE 5: EXPORT (✅ CORRIGÉ - garder match_id)
+# ===============================================
+
+def save_output(df: pl.DataFrame) -> pl.DataFrame:
+    """Sauvegarde le dataset."""
+    print("\n[5/6] Saving charting features...")
+    
+    if df is None:
+        return None
+    
+    # ✅ IMPORTANT: Garder match_id pour le merge avec SOTA
+    id_cols = [c for c in ["match_id", "custom_match_id", "player_id", "player_name"] 
+               if c in df.columns]
+    rolling_cols = [c for c in df.columns if c.startswith(("r5_", "r10_", "r20_"))]
+    style_cols = [c for c in df.columns if c.startswith("chart_style_")]
+    
+    export_cols = id_cols + rolling_cols + style_cols
+    df_export = df.select([c for c in export_cols if c in df.columns])
+    
+    # Dédupliquer par (match_id, player_id)
+    dedup_cols = [c for c in ["match_id", "player_id"] if c in df_export.columns]
+    if len(dedup_cols) >= 2:
+        before = len(df_export)
+        df_export = df_export.unique(subset=dedup_cols)
+        after = len(df_export)
+        if before != after:
+            print(f"  Deduplicated: {before:,} → {after:,}")
+    
+    output_file = OUTPUT_DIR / "charting_player_style.parquet"
+    df_export.write_parquet(output_file, compression="zstd")
+    
+    print(f"\n  📁 Output: {output_file}")
+    print(f"  📊 Shape: {df_export.shape}")
+    print(f"  📊 Rolling features: {len(rolling_cols)}")
+    print(f"  📊 Style features: {len(style_cols)}")
+    
+    if "player_id" in df_export.columns:
+        print(f"  📊 Unique players: {df_export['player_id'].n_unique():,}")
+    if "match_id" in df_export.columns:
+        print(f"  📊 Unique matches: {df_export['match_id'].n_unique():,}")
+    
+    if "chart_style_category" in df_export.columns:
+        print(f"\n  🎾 Style Distribution:")
+        style_dist = df_export.group_by("chart_style_category").len().sort("len", descending=True)
+        for row in style_dist.iter_rows():
+            pct = 100 * row[1] / len(df_export)
+            print(f"     • {row[0]}: {row[1]:,} ({pct:.1f}%)")
+    
+    return df_export
+
+
+# ===============================================
+# PARTIE 6: MERGE TO SOTA_v4 (✅ NOUVEAU)
+# ===============================================
+
+def merge_charting_to_sota():
+    """
+    ✅ NASA NO-LEAK:
+    Join charting via (match_id_ta_source, winner_id/loser_id)
+    car chart.match_id == SOTA.match_id_ta_source
+    """
+    print("\n" + "=" * 70)
+    print("   SECTION 6: MERGE TO SOTA_v4 (NASA NO LEAK)")
+    print("=" * 70)
+
+    SOTA_V3_PATH = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v3.parquet"
+    SOTA_V2_PATH = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v2.parquet"
+    SOTA_V1_PATH = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA.parquet"
+
+    if SOTA_V3_PATH.exists():
+        ml_path = SOTA_V3_PATH
+        print("  ✅ Loading SOTA_v3")
+    elif SOTA_V2_PATH.exists():
+        ml_path = SOTA_V2_PATH
+        print("  ⚠️ Using SOTA_v2")
+    elif SOTA_V1_PATH.exists():
+        ml_path = SOTA_V1_PATH
+        print("  ⚠️ Using SOTA_v1")
+    else:
+        print("  ❌ No SOTA file found!")
+        return None
+
+    ml_df = pl.read_parquet(ml_path)
+    original_cols = len(ml_df.columns)
+    print(f"  ML shape: {ml_df.shape}")
+
+    if "match_id_ta_source" not in ml_df.columns:
+        raise ValueError("❌ match_id_ta_source absent dans SOTA → merge charting impossible.")
+
+    nn = ml_df.select(pl.col("match_id_ta_source").is_not_null().sum()).item()
+    print(f"  match_id_ta_source non-null: {nn:,}/{len(ml_df):,} ({100*nn/len(ml_df):.2f}%)")
+
+    chart_file = OUTPUT_DIR / "charting_player_style.parquet"
+    if not chart_file.exists():
+        raise ValueError("❌ charting_player_style.parquet introuvable. Lance PP07 steps 1-5 d'abord.")
+
+    chart = pl.read_parquet(chart_file)
+    print(f"  Chart shape: {chart.shape}")
+
+    if "match_id" not in chart.columns or "player_id" not in chart.columns:
+        raise ValueError("❌ Chart doit contenir match_id + player_id.")
+
+    # Features charting
+    chart_feature_cols = [c for c in chart.columns if c.startswith(("r5_", "r10_", "r20_", "chart_style_"))]
+    print(f"  Features to merge: {len(chart_feature_cols)}")
+
+    # Dedup safe
+    chart = chart.unique(subset=["match_id", "player_id"], keep="first")
+
+    # ✅ Cast IDs pour join stable (évite bugs de type)
+    chart = chart.with_columns([
+        pl.col("match_id").cast(pl.Utf8),
+        pl.col("player_id").cast(pl.Utf8),
+    ])
+    ml_df = ml_df.with_columns([
+        pl.col("match_id_ta_source").cast(pl.Utf8),
+        pl.col("winner_id").cast(pl.Utf8),
+        pl.col("loser_id").cast(pl.Utf8),
+    ])
+
+    # -----------------------
+    # Winner (A)
+    # -----------------------
+    print("\n[6.3] Merging winner (A)...")
+    chart_A = (
+        chart
+        .select(["match_id", "player_id"] + chart_feature_cols)
+        .rename({"match_id": "match_id_ta_source", "player_id": "winner_id"})
+        .rename({c: f"{c}_A" for c in chart_feature_cols})
+    )
+    ml_df = ml_df.join(chart_A, on=["match_id_ta_source", "winner_id"], how="left")
+
+    # -----------------------
+    # Loser (B)
+    # -----------------------
+    print("[6.4] Merging loser (B)...")
+    chart_B = (
+        chart
+        .select(["match_id", "player_id"] + chart_feature_cols)
+        .rename({"match_id": "match_id_ta_source", "player_id": "loser_id"})
+        .rename({c: f"{c}_B" for c in chart_feature_cols})
+    )
+    ml_df = ml_df.join(chart_B, on=["match_id_ta_source", "loser_id"], how="left")
+
+    # -----------------------
+    # Derived diffs
+    # -----------------------
+    print("[6.5] Adding diff features...")
+    style_diffs = [
+        ("chart_style_serve_dominance", "serve_dominance"),
+        ("chart_style_return_strength", "return_strength"),
+        ("chart_style_aggression", "aggression"),
+        ("chart_style_rally_preference", "rally_preference"),
+        ("chart_style_net_skill", "net_skill"),
+    ]
+    for base, short in style_diffs:
+        a = f"{base}_A"
+        b = f"{base}_B"
+        if a in ml_df.columns and b in ml_df.columns:
+            ml_df = ml_df.with_columns(
+                (pl.col(a).fill_null(0) - pl.col(b).fill_null(0))
+                .cast(pl.Float32)
+                .alias(f"diff_chart_{short}")
+            )
+
+    # -----------------------
+    # Save
+    # -----------------------
+    print("\n[6.6] Saving SOTA_v4...")
+    out = DATA_CLEAN / "ml_ready" / "matches_ml_ready_SOTA_v4.parquet"
+    ml_df.write_parquet(out, compression="zstd")
+
+    new_cols = len(ml_df.columns) - original_cols
+    print(f"\n  ✅ Saved SOTA_v4: {out}")
+    print(f"     Shape: {ml_df.shape}")
+    print(f"     New cols: +{new_cols}")
+
+    # Coverage
+    print(f"\n  📊 Charting Coverage:")
+    for col in ["r10_chart_a_pct_A", "chart_style_serve_dominance_A", "chart_style_category_A"]:
+        if col in ml_df.columns:
+            cov = ml_df.select(pl.col(col).is_not_null().mean()).item()
+            print(f"     {col}: {cov:.2%}")
+
+    return ml_df
+
+
+# ===============================================
+# MAIN (✅ CORRIGÉ)
+# ===============================================
+
+def main():
+    """Pipeline principal avec merge automatique vers SOTA_v4."""
+    
+    print("\n" + "=" * 70)
+    print("   PP_07 - CHARTING PLAYER + STYLE (GOD MODE)")  # ✅ Corrigé PP_08 → PP_07
+    print("   TennisTitan SOTA 2026")
+    print("=" * 70)
+    print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   Input: {CHARTING_LONG_DIR}")
+    print(f"   Output: {OUTPUT_DIR}")
+    print("=" * 70)
+    
+    t0 = time.perf_counter()
+    
+    # 1. Load
+    df = load_charting_long()
+    if df is None:
+        print("\n❌ ABORT: No charting data found!")
+        print("\n💡 SOLUTIONS:")
+        print("   1. Vérifier que PP_01 a bien créé data_clean/charting_long/")
+        print("   2. Ou que les données brutes sont dans data_tennis_abstract_production_async/")
+        return None
+    
+    # 2. Pivot
+    df = pivot_charting_stats(df)
+    if df is None:
+        print("\n❌ ABORT: Pivot failed")
+        return None
+    
+    # 3. Rolling
+    df = compute_player_rolling(df)
+    
+    # 4. Style features
+    df = add_style_features(df)
+    
+    # 5. Save charting features
+    df_export = save_output(df)
+    
+    # 6. ✅ NOUVEAU: Merge to SOTA_v4
+    df_sota = None
+    if df_export is not None:
+        df_sota = merge_charting_to_sota()
+    
+    elapsed = time.perf_counter() - t0
+    
+    print(f"\n" + "=" * 70)
+    print(f"   ✅ PP_07 COMPLETE!")
+    print(f"=" * 70)
+    print(f"   ⏱️  Time: {elapsed:.1f}s")
+    
+    print(f"""
+📊 OUTPUT FILES:
+   ✅ {OUTPUT_DIR}/charting_player_style.parquet
+   ✅ {DATA_CLEAN}/ml_ready/matches_ml_ready_SOTA_v4.parquet
+
+📈 PIPELINE STATUS:
+   PP_01 → PP_04 : matches_ml_ready.parquet (951 cols)
+   PP_05         : SOTA_v2.parquet (994 cols)
+   PP_06         : SOTA_v3.parquet (~1050 cols)
+   PP_07         : SOTA_v4.parquet (~1150 cols) ← VOUS ÊTES ICI
+
+🚀 NEXT STEPS:
+   1. PP_08: Feature Selection + Split temporel
+   2. PP_09: XGBoost/LightGBM baseline
+   3. PP_10+: Deep Learning SOTA
+""")
+    
+    return df_export
+
+
+if __name__ == "__main__":
+    main()

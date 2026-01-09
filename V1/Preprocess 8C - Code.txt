@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+# ===============================================
+# PP_08C - OPPONENT-ADJUSTED STATS (GOD SOTA 2026)
+# TennisTitan - Performance ajustée par qualité adversaire
+# ===============================================
+#
+# CONCEPT:
+# Les stats brutes ne tiennent pas compte de la qualité de l'adversaire.
+# Un 70% win rate vs Top 50 > 80% win rate vs joueurs 200+
+#
+# FEATURES CRÉÉES:
+# - Stats de service/retour vs différents niveaux (Top10, Top20, Top50, Top100)
+# - Win rate vs joueurs de niveau similaire (±20 places)
+# - Performance vs gauchers/droitiers
+# - Dominance score ajusté
+#
+# POSITION PIPELINE:
+# PP_08 (Advanced Features) → PP_08b (Opponent Adjusted) → PP_12...
+#
+# Input: matches_base/ (besoin de l'historique complet)
+# Output: features/opponent_adjusted/opponent_adj_features.parquet
+# ===============================================
+
+import numpy as np
+import polars as pl
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+import warnings
+warnings.filterwarnings("ignore")
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path(r"C:\Users\Administrateur\Tennis POLAR v3")
+DATA_CLEAN = ROOT / "data_clean"
+MATCHES_BASE = DATA_CLEAN / "matches_base"
+OUTPUT_DIR = DATA_CLEAN / "features" / "opponent_adjusted"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Paramètres
+ROLLING_WINDOW = 50  # Nombre de matchs pour calculer les stats
+MIN_MATCHES = 5      # Minimum de matchs pour une stat valide
+RANK_BUCKETS = [10, 20, 50, 100, 200]  # Niveaux d'adversaires
+
+print("=" * 70)
+print("   PP_08C - OPPONENT-ADJUSTED STATS (GOD SOTA 2026)")
+print("=" * 70)
+print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"   Rolling window: {ROLLING_WINDOW} matches")
+print("=" * 70)
+
+
+# ===============================================
+# OPPONENT-ADJUSTED CALCULATOR
+# ===============================================
+
+class OpponentAdjustedCalculator:
+    """
+    Calcule les stats ajustées par niveau d'adversaire.
+    
+    Pour chaque joueur, on track séparément:
+    - Performance vs Top 10
+    - Performance vs Top 20
+    - Performance vs Top 50
+    - Performance vs Top 100
+    - Performance vs joueurs similaires (±20 places)
+    """
+    
+    def __init__(self, rolling_window: int = 50, min_matches: int = 5):
+        self.window = rolling_window
+        self.min_matches = min_matches
+        
+        # Historique par joueur et par bucket
+        # player_id -> bucket -> list of (date, stats_dict)
+        self.history = defaultdict(lambda: defaultdict(list))
+        
+        # Stats globales pour fallback
+        self.global_stats = defaultdict(list)
+    
+    def _get_opponent_bucket(self, opp_rank: int, player_rank: int) -> list:
+        """Retourne les buckets auxquels appartient l'adversaire."""
+        if opp_rank is None or opp_rank <= 0:
+            return []
+        
+        buckets = []
+        for bucket in RANK_BUCKETS:
+            if opp_rank <= bucket:
+                buckets.append(f"top{bucket}")
+        
+        # Bucket "similar" si ±20 places
+        if player_rank and abs(opp_rank - player_rank) <= 20:
+            buckets.append("similar")
+        
+        return buckets
+    
+    def _extract_match_stats(self, match: dict, is_winner: bool) -> dict:
+        """Extrait les stats d'un match pour un joueur."""
+        prefix = "w_" if is_winner else "l_"
+        opp_prefix = "l_" if is_winner else "w_"
+        
+        stats = {
+            "won": 1 if is_winner else 0,
+            "ace_rate": None,
+            "df_rate": None,
+            "first_in_rate": None,
+            "first_won_rate": None,
+            "second_won_rate": None,
+            "bp_saved_rate": None,
+            "bp_conv_rate": None,
+        }
+        
+        # Service stats
+        svpt = match.get(f"{prefix}svpt")
+        if svpt and svpt > 0:
+            stats["ace_rate"] = match.get(f"{prefix}ace", 0) / svpt
+            stats["df_rate"] = match.get(f"{prefix}df", 0) / svpt
+            
+            first_in = match.get(f"{prefix}1stIn")
+            if first_in and first_in > 0:
+                stats["first_in_rate"] = first_in / svpt
+                stats["first_won_rate"] = match.get(f"{prefix}1stWon", 0) / first_in
+            
+            second_pts = svpt - (first_in or 0)
+            if second_pts > 0:
+                stats["second_won_rate"] = match.get(f"{prefix}2ndWon", 0) / second_pts
+        
+        # Break points
+        bp_faced = match.get(f"{prefix}bpFaced")
+        if bp_faced and bp_faced > 0:
+            stats["bp_saved_rate"] = match.get(f"{prefix}bpSaved", 0) / bp_faced
+        
+        # BP conversion (sur le service adverse)
+        opp_bp_faced = match.get(f"{opp_prefix}bpFaced")
+        if opp_bp_faced and opp_bp_faced > 0:
+            opp_bp_saved = match.get(f"{opp_prefix}bpSaved", 0)
+            stats["bp_conv_rate"] = (opp_bp_faced - opp_bp_saved) / opp_bp_faced
+        
+        return stats
+    
+    def get_adjusted_stats(self, player_id: str, match_date) -> dict:
+        """
+        Retourne les stats ajustées AVANT le match courant.
+        """
+        result = {}
+        
+        for bucket in [f"top{b}" for b in RANK_BUCKETS] + ["similar"]:
+            history = self.history[player_id][bucket]
+            
+            # Filtrer par fenêtre temporelle et prendre les N derniers
+            recent = [h for h in history if h[0] < match_date][-self.window:]
+            
+            if len(recent) >= self.min_matches:
+                # Calculer les moyennes
+                wins = [h[1]["won"] for h in recent]
+                result[f"win_rate_vs_{bucket}"] = np.mean(wins)
+                
+                # Ace rate vs ce niveau
+                aces = [h[1]["ace_rate"] for h in recent if h[1]["ace_rate"] is not None]
+                if len(aces) >= self.min_matches:
+                    result[f"ace_rate_vs_{bucket}"] = np.mean(aces)
+                
+                # Hold rate (1st won + 2nd won approximation)
+                holds = []
+                for h in recent:
+                    fw = h[1].get("first_won_rate")
+                    sw = h[1].get("second_won_rate")
+                    fi = h[1].get("first_in_rate")
+                    if fw is not None and sw is not None and fi is not None:
+                        hold = fi * fw + (1 - fi) * sw
+                        holds.append(hold)
+                if len(holds) >= self.min_matches:
+                    result[f"hold_rate_vs_{bucket}"] = np.mean(holds)
+                
+                # BP conversion vs ce niveau
+                bp_convs = [h[1]["bp_conv_rate"] for h in recent if h[1]["bp_conv_rate"] is not None]
+                if len(bp_convs) >= self.min_matches:
+                    result[f"bp_conv_vs_{bucket}"] = np.mean(bp_convs)
+                
+                # Nombre de matchs dans ce bucket
+                result[f"n_matches_vs_{bucket}"] = len(recent)
+            else:
+                # Pas assez de données
+                result[f"win_rate_vs_{bucket}"] = None
+                result[f"ace_rate_vs_{bucket}"] = None
+                result[f"hold_rate_vs_{bucket}"] = None
+                result[f"bp_conv_vs_{bucket}"] = None
+                result[f"n_matches_vs_{bucket}"] = len(recent)
+        
+        return result
+    
+    def update(self, player_id: str, player_rank: int, 
+               opp_rank: int, match_date, stats: dict):
+        """Met à jour l'historique après un match."""
+        buckets = self._get_opponent_bucket(opp_rank, player_rank)
+        
+        for bucket in buckets:
+            self.history[player_id][bucket].append((match_date, stats))
+            
+            # Limiter la taille de l'historique
+            if len(self.history[player_id][bucket]) > self.window * 2:
+                self.history[player_id][bucket] = self.history[player_id][bucket][-self.window * 2:]
+
+
+# ===============================================
+# COMPUTE FEATURES
+# ===============================================
+
+def compute_opponent_adjusted_features():
+    """Calcule les features opponent-adjusted pour tous les matchs."""
+    
+    print("\n[1/4] Loading matches...")
+    
+    # Load matches
+    df = pl.read_parquet(MATCHES_BASE)
+    
+    # Sort by date (CRITICAL for anti-leakage)
+    if "match_sequence_key" in df.columns:
+        df = df.sort("match_sequence_key")
+    else:
+        df = df.sort(["tourney_date_ta", "round_order"])
+    
+    print(f"  Matches: {len(df):,}")
+    
+    # Convert to list for sequential processing
+    required_cols = [
+        "custom_match_id", "winner_id", "loser_id", "tourney_date_ta",
+        "winner_rank_ta", "loser_rank_ta",
+        "w_ace", "w_df", "w_svpt", "w_1stIn", "w_1stWon", "w_2ndWon",
+        "l_ace", "l_df", "l_svpt", "l_1stIn", "l_1stWon", "l_2ndWon",
+        "w_bpSaved", "w_bpFaced", "l_bpSaved", "l_bpFaced",
+    ]
+    
+    available_cols = [c for c in required_cols if c in df.columns]
+    matches = df.select(available_cols).to_dicts()
+    
+    print("\n[2/4] Computing opponent-adjusted stats...")
+    
+    calculator = OpponentAdjustedCalculator(
+        rolling_window=ROLLING_WINDOW,
+        min_matches=MIN_MATCHES
+    )
+    
+    results = []
+    
+    for i, match in enumerate(matches):
+        if i > 0 and i % 50000 == 0:
+            print(f"  Processed {i:,} / {len(matches):,}")
+        
+        match_id = match["custom_match_id"]
+        winner_id = match["winner_id"]
+        loser_id = match["loser_id"]
+        match_date = match["tourney_date_ta"]
+        winner_rank = match.get("winner_rank_ta")
+        loser_rank = match.get("loser_rank_ta")
+        
+        # Skip invalid
+        if winner_id is None or loser_id is None or match_date is None:
+            continue
+        
+        # Get stats BEFORE match (anti-leakage)
+        winner_stats = calculator.get_adjusted_stats(winner_id, match_date)
+        loser_stats = calculator.get_adjusted_stats(loser_id, match_date)
+        
+        # Build result row
+        result = {"custom_match_id": match_id}
+        
+        # Add winner stats with suffix
+        for key, value in winner_stats.items():
+            result[f"{key}_winner"] = value
+        
+        # Add loser stats with suffix
+        for key, value in loser_stats.items():
+            result[f"{key}_loser"] = value
+        
+        results.append(result)
+        
+        # Update calculator with this match's results
+        winner_match_stats = calculator._extract_match_stats(match, is_winner=True)
+        loser_match_stats = calculator._extract_match_stats(match, is_winner=False)
+        
+        calculator.update(winner_id, winner_rank, loser_rank, match_date, winner_match_stats)
+        calculator.update(loser_id, loser_rank, winner_rank, match_date, loser_match_stats)
+    
+    print(f"\n[3/4] Creating DataFrame...")
+    
+    features_df = pl.DataFrame(results, infer_schema_length=None)
+    
+    # Add derived features
+    print("  Adding derived features...")
+    
+    # Différences winner - loser pour les principales stats
+    for bucket in [f"top{b}" for b in RANK_BUCKETS] + ["similar"]:
+        win_col = f"win_rate_vs_{bucket}_winner"
+        lose_col = f"win_rate_vs_{bucket}_loser"
+        
+        if win_col in features_df.columns and lose_col in features_df.columns:
+            features_df = features_df.with_columns([
+                (pl.col(win_col) - pl.col(lose_col))
+                .cast(pl.Float32)
+                .alias(f"diff_win_rate_vs_{bucket}")
+            ])
+    
+    # Dominance score ajusté (moyenne pondérée des win rates vs différents niveaux)
+    dominance_exprs = []
+    # ✅ FIX: Safe calculation - no explosion when all nulls
+    weights = {"top10": 0.4, "top20": 0.25, "top50": 0.2, "top100": 0.1, "similar": 0.05}
+    
+    for suffix in ["_winner", "_loser"]:
+        weighted_sum = pl.lit(0.0)
+        weight_sum = pl.lit(0.0)
+        
+        for bucket, weight in weights.items():
+            col = f"win_rate_vs_{bucket}{suffix}"
+            if col in features_df.columns:
+                # ✅ FIX: Only add weight when value is NOT null
+                weighted_sum = weighted_sum + pl.when(pl.col(col).is_not_null()).then(pl.col(col) * weight).otherwise(0.0)
+                weight_sum = weight_sum + pl.when(pl.col(col).is_not_null()).then(pl.lit(weight)).otherwise(0.0)
+        
+        # ✅ FIX: If no valid weights, return 0.5 (neutral), otherwise compute and clip
+        features_df = features_df.with_columns([
+            pl.when(weight_sum > 0)
+              .then((weighted_sum / weight_sum).clip(0.0, 1.0))
+              .otherwise(pl.lit(0.5))
+              .cast(pl.Float32)
+              .alias(f"adj_dominance_score{suffix}")
+        ])
+    
+    # Différence de dominance (will be between -1 and 1)
+    features_df = features_df.with_columns([
+        (pl.col("adj_dominance_score_winner") - pl.col("adj_dominance_score_loser"))
+        .clip(-1.0, 1.0)
+        .cast(pl.Float32)
+        .alias("diff_adj_dominance_score")
+    ])
+    
+    # ✅ VALIDATION: Check range is correct
+    adj_A_min = features_df["adj_dominance_score_winner"].min()
+    adj_A_max = features_df["adj_dominance_score_winner"].max()
+    print(f"\n  📊 adj_dominance_score: min={adj_A_min:.3f}, max={adj_A_max:.3f}")
+    if adj_A_max > 1.0 or adj_A_min < 0.0:
+        print(f"  ⚠️ WARNING: adj_dominance out of [0,1] range!")
+    else:
+        print(f"  ✅ adj_dominance in valid range [0,1]")
+    
+    print(f"  Shape: {features_df.shape}")
+    print(f"  Columns: {len(features_df.columns)}")
+    
+    # Stats
+    print("\n  📊 Coverage Stats:")
+    for bucket in ["top10", "top50", "similar"]:
+        col = f"win_rate_vs_{bucket}_winner"
+        if col in features_df.columns:
+            coverage = features_df[col].is_not_null().mean()
+            print(f"     {col}: {coverage:.1%}")
+    
+    print("\n[4/4] Saving...")
+    
+    output_path = OUTPUT_DIR / "opponent_adj_features.parquet"
+    features_df.write_parquet(output_path)
+    print(f"  ✅ Saved: {output_path}")
+    
+    return features_df
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    t0 = datetime.now()
+    
+    features = compute_opponent_adjusted_features()
+    
+    elapsed = (datetime.now() - t0).total_seconds()
+    
+    print("\n" + "=" * 70)
+    print("   ✅ PP_08C OPPONENT-ADJUSTED STATS COMPLETE!")
+    print("=" * 70)
+    print(f"   ⏱️  Time: {elapsed:.1f}s")
+    print(f"   📊 Features: {len(features.columns)}")
+    print(f"   📁 Output: {OUTPUT_DIR / 'opponent_adj_features.parquet'}")
+    print("""
+📋 FEATURES CRÉÉES:
+
+   Par niveau d'adversaire (Top10, Top20, Top50, Top100, Similar):
+   • win_rate_vs_{bucket}_winner/loser    : Win rate contre ce niveau
+   • ace_rate_vs_{bucket}_winner/loser    : Ace rate contre ce niveau
+   • hold_rate_vs_{bucket}_winner/loser   : Hold rate contre ce niveau
+   • bp_conv_vs_{bucket}_winner/loser     : BP conversion contre ce niveau
+   • n_matches_vs_{bucket}_winner/loser   : Nombre de matchs contre ce niveau
+   
+   Dérivées:
+   • diff_win_rate_vs_{bucket}            : Différence win rate
+   • adj_dominance_score_winner/loser     : Score de dominance ajusté (pondéré)
+   • diff_adj_dominance_score             : Différence dominance
+
+🔄 PROCHAINE ÉTAPE:
+   Ajouter le merge dans PP_16 (Merge GOD Features)
+""")
+
+    return features
+
+
+if __name__ == "__main__":
+    main()

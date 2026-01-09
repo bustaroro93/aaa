@@ -1,0 +1,163 @@
+======================================================================
+   PREPROCESS 6 - H2H + TIEBREAK + BAGEL
+   TennisTitan SOTA 2026 - GOD MODE
+======================================================================
+   Timestamp: 2026-01-06 22:38:25
+   Gender: atp
+======================================================================
+
+======================================================================
+   SECTION 1: HEAD-TO-HEAD FEATURES (SOTA)
+======================================================================
+
+[1/6] Loading matches...
+  Matches: 543,927
+
+[2/6] Creating pair keys...
+
+[3/6] Computing H2H features (sequential - no leakage)...
+  Processed 50,000 / 543,927
+  Processed 100,000 / 543,927
+  Processed 150,000 / 543,927
+  Processed 200,000 / 543,927
+  Processed 250,000 / 543,927
+  Processed 300,000 / 543,927
+  Processed 350,000 / 543,927
+  Processed 400,000 / 543,927
+  Processed 450,000 / 543,927
+  Processed 500,000 / 543,927
+  Generated 543,927 H2H records
+
+[4/6] Converting to DataFrame...
+
+[5/6] Adding derived features...
+
+[6/6] Writing output...
+
+✅ H2H features → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\h2h_sota
+   Shape: (543927, 33)
+   Features: 27
+
+📊 SANITY CHECK:
+   h2h_matches: min=0, max=59, mean=0.58
+   has_h2h_history: 156,028 / 543,927 (28.7%)
+   Time: 4.5s
+
+======================================================================
+   SECTION 2: TIEBREAK FEATURES (SOTA)
+======================================================================
+
+[1/5] Loading matches...
+  Matches: 543,927
+
+[2/5] Parsing scores for tiebreaks...
+  Matches with tiebreaks: 144,508 (26.6%)
+
+[3/5] Creating player-level features...
+
+[4/5] Computing rolling tiebreak features...
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_1876\890742587.py:550: DeprecationWarning: the argument `min_periods` for `Expr.rolling_sum` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_sum(window_size=w, min_periods=1)
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_1876\890742587.py:555: DeprecationWarning: the argument `min_periods` for `Expr.rolling_sum` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_sum(window_size=w, min_periods=1)
+
+[5/5] Writing output...
+
+✅ Tiebreak features → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\tiebreak_features
+   Shape: (1087854, 13)
+
+📊 SANITY CHECK:
+   tb_win_rate: mean=0.472 (attendu: ~0.5)
+   tb_per_match: mean=0.273
+   Time: 1.3s
+
+======================================================================
+   SECTION 3: BAGEL/BREADSTICK FEATURES (SOTA)
+======================================================================
+
+[1/5] Loading matches...
+  Matches: 543,927
+
+[2/5] Parsing scores for bagels/breadsticks...
+  Matches with bagels: 54,306 (10.0%)
+
+[3/5] Creating player-level features...
+
+[4/5] Computing rolling bagel features...
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_1876\890742587.py:810: DeprecationWarning: the argument `min_periods` for `Expr.rolling_sum` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_sum(window_size=20, min_periods=1)
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_1876\890742587.py:817: DeprecationWarning: the argument `min_periods` for `Expr.rolling_sum` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_sum(window_size=20, min_periods=1)
+
+[5/5] Writing output...
+
+✅ Bagel features → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\bagel_features
+   Shape: (1087854, 18)
+
+📊 SANITY CHECK:
+   bagel_given_rate: mean=0.0230
+   bagel_received_rate: mean=0.0255
+   net_dominance_score: mean=-0.0090 (attendu: ~0)
+   Time: 2.0s
+
+======================================================================
+   MERGE TO ML-READY (OPTIONAL)
+======================================================================
+
+  To merge these features into your ML-ready dataset, run:
+  >>> merge_new_features_to_ml_ready()
+
+  Or re-run preprocess 2.2 after adding these feature paths.
+
+[AUTO-MERGE] Merging to SOTA_v3...
+
+======================================================================
+   SECTION 4: MERGE NEW FEATURES TO ML-READY SOTA
+======================================================================
+
+[1/4] Loading ML-ready dataset: matches_ml_ready_SOTA_v2.parquet
+  Shape: (543927, 1057)
+
+[2/4] Merging H2H features...
+  ✅ H2H merged: +37 columns
+
+[3/4] Merging Tiebreak features...
+  ✅ Tiebreak merged: +18 columns
+
+[4/4] Merging Bagel features...
+  ✅ Bagel merged: +28 columns
+
+✅ Updated ML-ready saved: C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_SOTA_v3.parquet
+   Shape: (543927, 1128) (+71 new columns)
+
+📊 NEW FEATURES SUMMARY:
+   H2H: 36 features
+   Tiebreak: 18 features
+   Bagel: 14 features
+   Breadstick: 8 features
+
+======================================================================
+   ✅ ALL FEATURES GENERATED!
+======================================================================
+
+📊 Features created:
+  • H2H: 36 files → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\h2h_sota
+  • Tiebreak: 36 files → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\tiebreak_features
+  • Bagel: 36 files → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\bagel_features
+
+⏱️  Total time: 8.3s (0.1 min)
+
+📋 NEXT STEPS:
+
+1. Option A: Re-run preprocess 2.2 (will auto-merge if paths are added)
+   - Add these paths to Preprocess 2.2:
+     H2H_DIR = FEATURES_DIR / "h2h_sota"
+     TIEBREAK_DIR = FEATURES_DIR / "tiebreak_features"
+     BAGEL_DIR = FEATURES_DIR / "bagel_features"
+
+2. Option B: Run merge_new_features_to_ml_ready() 
+   - Quick merge into existing ML-ready file
+   
+3. Then re-run preprocess 3 and training
+
+Expected improvement: +0.5-1% AUC from H2H features alone!

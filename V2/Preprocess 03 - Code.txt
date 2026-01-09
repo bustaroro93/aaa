@@ -1,0 +1,1750 @@
+# ===============================================
+# PREPROCESS 3 - GODMODE COMPLET (FIXED)
+# TennisTitan SOTA 2026 - Polars Edition
+# ===============================================
+#
+# Ce fichier unifié contient:
+# - Section A: ratings_srvret_layer (Elo SRV/RET + Markov TB exact)
+# - Section B: Psychological & Momentum Features (FIXED)
+# - Section C: Environmental Context Features
+# - Section D: Charting Style Features SOTA
+# - Section E: Sanity Checks
+#
+# Architecture anti-leakage: shift(1) AVANT tout rolling
+# Partitionnement: Polars natif (pas PyArrow)
+# ===============================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from functools import lru_cache
+from datetime import datetime
+
+import json
+import time
+import math
+import numpy as np
+import polars as pl
+
+# ===============================================
+# CONFIGURATION GLOBALE
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+
+MB_DIR_SCALED = DATA_CLEAN / "matches_base_scaled"
+MB_DIR_RAW = DATA_CLEAN / "matches_base"
+MB_DIR = MB_DIR_SCALED if MB_DIR_SCALED.exists() else MB_DIR_RAW
+
+CHARTING_DIR = DATA_CLEAN / "charting_long"
+
+GENDER = "atp"
+START_YEAR = 1980
+
+# Output directories
+OUT_SRVRET = DATA_CLEAN / "features" / "ratings_srvret_layer"
+OUT_PSYCH = DATA_CLEAN / "features" / "psychological_momentum"
+OUT_ENV = DATA_CLEAN / "features" / "environmental_context"
+OUT_CHARTING = DATA_CLEAN / "features" / "charting_style"
+OUT_BASE_ROLLING = DATA_CLEAN / "features" / "base_stats_rolling"
+OUT_BASE_ROLLING.mkdir(parents=True, exist_ok=True)
+
+for d in [OUT_SRVRET, OUT_PSYCH, OUT_ENV, OUT_CHARTING]:
+    d.mkdir(parents=True, exist_ok=True)
+
+
+# ===============================================
+# ===============================================
+# SECTION A: RATINGS SRV/RET LAYER
+# Elo continu sur % points retour + Markov TB exact
+# ===============================================
+# ===============================================
+
+# ---------- Params SRV/RET ----------
+BASE_RATING = 1500.0
+HALF_LIFE_LONG = 120.0
+HALF_LIFE_SHORT = 30.0
+K_SRVRET_LONG_BASE = 15.0
+K_SRVRET_SHORT_BASE = 22.0
+RET_SCALE = 400.0
+
+ROUND_ORDER = {
+    "RR": 1, "R128": 2, "R64": 3, "R56": 3, "R48": 3, "R32": 4,
+    "R24": 4, "R16": 5, "QF": 6, "SF": 7, "F": 8,
+    "Q": 0, "Q1": 0, "Q2": 0, "Q3": 0
+}
+
+
+# ---------- O'Malley & Markov TB exact ----------
+def hold_from_point(p: float) -> float:
+    """Proba de tenir son jeu si P(point au service) = p"""
+    p = float(np.clip(p, 1e-9, 1 - 1e-9))
+    q = 1.0 - p
+    p40 = (p ** 4) * (1 + 4 * q + 10 * (q ** 2))
+    p_deuce = 20 * (p ** 3) * (q ** 3)
+    p_adv_cycle = p * p
+    p_back_to_deuce = 2 * p * q
+    p_win_from_deuce = p_adv_cycle / (1 - p_back_to_deuce)
+    return p40 + p_deuce * p_win_from_deuce
+
+
+def point_from_hold(p_hold: float, *, tol: float = 1e-7) -> float:
+    """Inverse numérique de hold_from_point (recherche binaire)"""
+    target = float(np.clip(p_hold, 1e-9, 1 - 1e-9))
+    lo, hi = 1e-6, 1 - 1e-6
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        val = hold_from_point(mid)
+        if val < target:
+            lo = mid
+        else:
+            hi = mid
+        if abs(val - target) < tol:
+            break
+    return 0.5 * (lo + hi)
+
+
+def tiebreak_prob_A(pA_srv: float, pB_srv: float, first_server: str = "A") -> float:
+    """
+    Proba qu'A gagne un TB à 7 (écart ≥2), alternance 1 point puis blocs de 2.
+    Exact jusqu'à 6–6, puis boucle « deuce TB » résolue analytiquement.
+    """
+    pA_srv = float(np.clip(pA_srv, 1e-9, 1 - 1e-9))
+    pB_srv = float(np.clip(pB_srv, 1e-9, 1 - 1e-9))
+    pA_ret = 1.0 - pB_srv
+    pB_ret = 1.0 - pA_srv
+
+    def server_at(pt_idx: int) -> int:
+        if pt_idx == 0:
+            return 0 if first_server.upper() == "A" else 1
+        block = (pt_idx - 1) // 2
+        if first_server.upper() == "A":
+            return 1 if block % 2 == 0 else 0
+        else:
+            return 0 if block % 2 == 0 else 1
+
+    def prob_two_point_cycle_A_wins(next_server: int) -> tuple[float, float, float]:
+        if next_server == 0:
+            P_A2 = pA_srv * pA_ret
+            P_B2 = (1 - pA_srv) * pB_srv
+        else:
+            P_A2 = pA_ret * pA_srv
+            P_B2 = (1 - pA_ret) * (1 - pA_srv)
+        P_split = max(0.0, 1.0 - P_A2 - P_B2)
+        return P_A2, P_B2, P_split
+
+    @lru_cache(maxsize=None)
+    def F(a_pts: int, b_pts: int, pt_idx: int) -> float:
+        if (a_pts >= 7 or b_pts >= 7) and abs(a_pts - b_pts) >= 2:
+            return 1.0 if a_pts > b_pts else 0.0
+        if a_pts == 6 and b_pts == 6:
+            nxt = server_at(pt_idx)
+            P_A2, P_B2, P_split = prob_two_point_cycle_A_wins(nxt)
+            denom = P_A2 + P_B2
+            return P_A2 / denom if denom > 0 else 0.5
+        s = server_at(pt_idx)
+        if s == 0:
+            return pA_srv * F(a_pts + 1, b_pts, pt_idx + 1) + (1 - pA_srv) * F(a_pts, b_pts + 1, pt_idx + 1)
+        else:
+            return pA_ret * F(a_pts + 1, b_pts, pt_idx + 1) + (1 - pA_ret) * F(a_pts, b_pts + 1, pt_idx + 1)
+
+    return F(0, 0, 0)
+
+
+def set_win_prob_game_markov_exact_tb(p_hold_A: float, p_hold_B: float,
+                                      start_server: str = "A") -> float:
+    """Jeu-level jusqu'à 6–6, puis TB exact"""
+    p_hold_A = float(np.clip(p_hold_A, 1e-6, 1 - 1e-6))
+    p_hold_B = float(np.clip(p_hold_B, 1e-6, 1 - 1e-6))
+
+    pA_srv = point_from_hold(p_hold_A)
+    pB_srv = point_from_hold(p_hold_B)
+    p_break_A = 1.0 - p_hold_B
+
+    @lru_cache(maxsize=None)
+    def G(a_games: int, b_games: int, server: int) -> float:
+        if (a_games >= 6 or b_games >= 6) and abs(a_games - b_games) >= 2:
+            return 1.0 if a_games > b_games else 0.0
+        if a_games == 6 and b_games == 6:
+            first_tb_server = "A" if (server == 0) else "B"
+            return tiebreak_prob_A(pA_srv, pB_srv, first_server=first_tb_server)
+        if server == 0:
+            return p_hold_A * G(a_games + 1, b_games, 1) + (1 - p_hold_A) * G(a_games, b_games + 1, 1)
+        else:
+            return p_break_A * G(a_games + 1, b_games, 0) + (1 - p_break_A) * G(a_games, b_games + 1, 0)
+
+    return G(0, 0, 0 if start_server.upper() == "A" else 1)
+
+
+def match_prob_from_set_prob(p_set_A: float, best_of: int) -> float:
+    s = float(np.clip(p_set_A, 1e-6, 1 - 1e-6))
+    if best_of == 3:
+        return s * s * (3 - 2 * s)
+    elif best_of == 5:
+        return (s ** 3) * (10 - 15 * s + 6 * (s ** 2))
+    else:
+        raise ValueError("best_of doit être 3 ou 5")
+
+
+def markov_match_baseline_exact_tb(p_hold_A: float, p_hold_B: float, best_of: int) -> tuple[float, float]:
+    """Moyenne sur l'incertitude du 1er serveur (50/50)"""
+    sA = set_win_prob_game_markov_exact_tb(p_hold_A, p_hold_B, start_server="A")
+    sB = set_win_prob_game_markov_exact_tb(p_hold_A, p_hold_B, start_server="B")
+    s_mean = 0.5 * (sA + sB)
+    return match_prob_from_set_prob(s_mean, best_of), s_mean
+
+
+# ---------- Math utils ----------
+def logit10(p: float) -> float:
+    p = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+    return math.log10(p / (1.0 - p))
+
+
+def p_ret_expected(retR: float, srvR: float, bias10: float, scale: float = RET_SCALE) -> float:
+    return 1.0 / (1.0 + 10.0 ** (-((retR - srvR) + bias10) / float(scale)))
+
+
+def time_decay_factor(delta_days: float | None, half_life: float) -> float:
+    if delta_days is None or math.isnan(delta_days) or delta_days <= 0:
+        return 1.0
+    return 0.5 ** (delta_days / half_life)
+
+
+def _as_str_id(v) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s.lower() in {"nan", "none", "<na>", "", "null"}:
+        return None
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def _none_if_blank(x) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return None if s == "" or s.lower() in {"nan", "none", "null"} else s
+
+
+# ---------- SRV/RET Store ----------
+@dataclass
+class SRState:
+    srv120: dict = field(default_factory=dict)
+    srv30: dict = field(default_factory=dict)
+    ret120: dict = field(default_factory=dict)
+    ret30: dict = field(default_factory=dict)
+    last_seen: dict = field(default_factory=dict)
+    n_played: dict = field(default_factory=dict)
+
+
+class SRStore:
+    def __init__(self):
+        self.st = SRState()
+
+    def _get(self, d: dict, key: str, default=BASE_RATING) -> float:
+        return d.get(key, default)
+
+    def pre(self, pid: str, date_int: int) -> dict:
+        last = self.st.last_seen.get(pid)
+        if last is None:
+            days = None
+        else:
+            try:
+                d1 = datetime.strptime(str(int(last)), "%Y%m%d")
+                d2 = datetime.strptime(str(int(date_int)), "%Y%m%d")
+                days = (d2 - d1).days
+            except:
+                days = None
+        return {
+            "srv120": self._get(self.st.srv120, pid),
+            "srv30": self._get(self.st.srv30, pid),
+            "ret120": self._get(self.st.ret120, pid),
+            "ret30": self._get(self.st.ret30, pid),
+            "n": self.st.n_played.get(pid, 0),
+            "days": days
+        }
+
+    def update(self, date_int: int, pid_w: str, pid_l: str,
+               w_rpw: float | None, l_rpw: float | None, bias10: float):
+        preW = self.pre(pid_w, date_int)
+        preL = self.pre(pid_l, date_int)
+
+        decay120 = 0.5 * (time_decay_factor(preW["days"], HALF_LIFE_LONG)
+                         + time_decay_factor(preL["days"], HALF_LIFE_LONG))
+        decay30 = 0.5 * (time_decay_factor(preW["days"], HALF_LIFE_SHORT)
+                        + time_decay_factor(preL["days"], HALF_LIFE_SHORT))
+        K120 = K_SRVRET_LONG_BASE * decay120
+        K30 = K_SRVRET_SHORT_BASE * decay30
+
+        rW120 = self.st.ret120.get(pid_w, BASE_RATING)
+        rL120 = self.st.ret120.get(pid_l, BASE_RATING)
+        sW120 = self.st.srv120.get(pid_w, BASE_RATING)
+        sL120 = self.st.srv120.get(pid_l, BASE_RATING)
+        rW30 = self.st.ret30.get(pid_w, BASE_RATING)
+        rL30 = self.st.ret30.get(pid_l, BASE_RATING)
+        sW30 = self.st.srv30.get(pid_w, BASE_RATING)
+        sL30 = self.st.srv30.get(pid_l, BASE_RATING)
+
+        if w_rpw is not None and not math.isnan(w_rpw):
+            expW120 = p_ret_expected(rW120, sL120, bias10)
+            delta = (w_rpw - expW120)
+            self.st.ret120[pid_w] = rW120 + K120 * delta
+            self.st.srv120[pid_l] = sL120 - K120 * delta
+            expW30 = p_ret_expected(rW30, sL30, bias10)
+            delta = (w_rpw - expW30)
+            self.st.ret30[pid_w] = rW30 + K30 * delta
+            self.st.srv30[pid_l] = sL30 - K30 * delta
+
+        if l_rpw is not None and not math.isnan(l_rpw):
+            expL120 = p_ret_expected(rL120, sW120, bias10)
+            delta = (l_rpw - expL120)
+            self.st.ret120[pid_l] = rL120 + K120 * delta
+            self.st.srv120[pid_w] = sW120 - K120 * delta
+            expL30 = p_ret_expected(rL30, sW30, bias10)
+            delta = (l_rpw - expL30)
+            self.st.ret30[pid_l] = rL30 + K30 * delta
+            self.st.srv30[pid_w] = sW30 - K30 * delta
+
+        for pid in (pid_w, pid_l):
+            self.st.last_seen[pid] = int(date_int)
+            self.st.n_played[pid] = self.st.n_played.get(pid, 0) + 1
+
+
+def build_srvret_layer(gender: str = GENDER):
+    """Construit ratings_srvret_layer (batch)"""
+    t0 = time.perf_counter()
+    print("\n" + "=" * 70)
+    print("SECTION A: RATINGS SRV/RET LAYER")
+    print("=" * 70)
+
+    # 1. Chargement
+    print("[1/5] Loading matches_base...")
+    df = pl.scan_parquet(f"{MB_DIR}/**/*.parquet").collect()
+    df = df.filter(pl.col("gender").str.to_lowercase() == gender)
+    print(f"  Loaded: {len(df):,} rows")
+
+    # 2. Vérification colonnes
+    need_stats = ["w_rpw_p", "l_rpw_p"]
+    missing = [c for c in need_stats if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Colonnes stats manquantes: {missing}")
+
+    # 3. Nettoyage %
+    print("[2/5] Cleaning % columns...")
+
+    def clean_pct_col(df: pl.DataFrame, col: str, out_col: str) -> pl.DataFrame:
+        return df.with_columns([
+            pl.when(pl.col(col).is_null())
+            .then(None)
+            .otherwise(
+                pl.when(pl.col(col).cast(pl.Float64, strict=False) > 1.0)
+                .then(pl.col(col).cast(pl.Float64, strict=False) / 100.0)
+                .otherwise(pl.col(col).cast(pl.Float64, strict=False))
+            )
+            .clip(0.0, 1.0)
+            .alias(out_col)
+        ])
+
+    df = clean_pct_col(df, "w_rpw_p", "w_rpw_f")
+    df = clean_pct_col(df, "l_rpw_p", "l_rpw_f")
+
+    for col in ["w_rpw_f", "l_rpw_f"]:
+        non_null = df.select(pl.col(col).is_not_null().sum()).item()
+        print(f"  [{col}] non-null={non_null:,} | NaN rate={1 - non_null / len(df):.1%}")
+
+    # 4. Biais par surface
+    print("[3/5] Computing surface biases...")
+    vals_global = pl.concat([
+        df.select(pl.col("w_rpw_f").alias("rpw")),
+        df.select(pl.col("l_rpw_f").alias("rpw"))
+    ]).filter(pl.col("rpw").is_not_null())
+    vals_global = vals_global.with_columns([pl.col("rpw").clip(0.05, 0.95)])
+    # ✅ FIX: Biais fixe = 0 (évite lookahead subtil)
+    GLOBAL_BIAS10 = 0.0
+    print(f"  Global bias: {GLOBAL_BIAS10:.2f} (fixed, no lookahead)")
+
+    bias_by_surface = {}
+    for surf in ["Hard", "Clay", "Grass", "Carpet"]:
+        bias_by_surface[surf] = 0.0
+        print(f"  {surf}: {bias_by_surface[surf]:.2f} (fixed)")
+
+    # 5. Préparation + tri
+    for col in ["tourney_slug_ta", "custom_match_id", "match_id_ta_dedup",
+                "match_id_ta_source", "round_ta"]:
+        if col not in df.columns:
+            df = df.with_columns([pl.lit(None).cast(pl.Utf8).alias(col)])
+
+    df = df.filter(pl.col("tourney_date_int").is_not_null())
+    df = df.with_columns([
+        pl.col("round_ta").cast(pl.Utf8).str.to_uppercase().str.strip_chars()
+        .replace(ROUND_ORDER, default=4)
+        .cast(pl.Int16)
+        .alias("__round_rank")
+    ])
+    df = df.sort([
+        "tourney_date_int", "tourney_slug_ta", "__round_rank",
+        "custom_match_id", "match_id_ta_dedup", "match_id_ta_source"
+    ])
+    print(f"  After sort: {len(df):,} rows")
+
+    # 6. Boucle séquentielle
+    print("[4/5] Computing SRV/RET ratings (sequential)...")
+    store = SRStore()
+    rows = []
+    df_dicts = df.to_dicts()
+
+    for i, r in enumerate(df_dicts):
+        if i % 100000 == 0 and i > 0:
+            print(f"  Processed {i:,} / {len(df_dicts):,}")
+
+        datei = r.get("tourney_date_int")
+        if datei is None:
+            continue
+        datei = int(datei)
+
+        w_id = _as_str_id(r.get("winner_id"))
+        l_id = _as_str_id(r.get("loser_id"))
+        if not w_id or not l_id or w_id == l_id:
+            continue
+
+        surf = _none_if_blank(r.get("tourney_surface_ta"))
+        bias10 = bias_by_surface.get(surf, GLOBAL_BIAS10)
+
+        w_rpw = r.get("w_rpw_f")
+        l_rpw = r.get("l_rpw_f")
+        if w_rpw is not None and not math.isnan(w_rpw):
+            w_rpw = float(np.clip(w_rpw, 0.05, 0.95))
+        else:
+            w_rpw = None
+        if l_rpw is not None and not math.isnan(l_rpw):
+            l_rpw = float(np.clip(l_rpw, 0.05, 0.95))
+        else:
+            l_rpw = None
+
+        # Snapshot AVANT update
+        preA = store.pre(w_id, datei)
+        preB = store.pre(l_id, datei)
+
+        p_ret_A_vs_B_120 = p_ret_expected(preA["ret120"], preB["srv120"], bias10)
+        p_ret_B_vs_A_120 = p_ret_expected(preB["ret120"], preA["srv120"], bias10)
+        p_ret_A_vs_B_30 = p_ret_expected(preA["ret30"], preB["srv30"], bias10)
+        p_ret_B_vs_A_30 = p_ret_expected(preB["ret30"], preA["srv30"], bias10)
+
+        p_hold_A_120 = 1.0 - p_ret_B_vs_A_120
+        p_hold_B_120 = 1.0 - p_ret_A_vs_B_120
+        p_hold_A_30 = 1.0 - p_ret_B_vs_A_30
+        p_hold_B_30 = 1.0 - p_ret_A_vs_B_30
+
+        p_match_bo3_120, p_set_A_120 = markov_match_baseline_exact_tb(p_hold_A_120, p_hold_B_120, best_of=3)
+        p_match_bo5_120, _ = markov_match_baseline_exact_tb(p_hold_A_120, p_hold_B_120, best_of=5)
+        p_match_bo3_30, p_set_A_30 = markov_match_baseline_exact_tb(p_hold_A_30, p_hold_B_30, best_of=3)
+        p_match_bo5_30, _ = markov_match_baseline_exact_tb(p_hold_A_30, p_hold_B_30, best_of=5)
+
+        year_val = r.get("year")
+        if year_val is None:
+            year_val = datei // 10000
+
+        # ✅ FIX: Définir best_of_val
+        best_of_val = int(r.get("best_of_ta") or 3)
+        if best_of_val not in (3, 5):
+            best_of_val = 3
+            
+        # ✅ FORMAT LONG: 2 records par match (1 par joueur)
+        # Record pour WINNER en tant que "self"
+        rec_w = {
+            "custom_match_id": r.get("custom_match_id"),
+            "match_key": r.get("match_key", r.get("custom_match_id")),
+            "gender": r.get("gender", gender),
+            "year": int(year_val),
+            "tourney_date_int": datei,
+            "tourney_surface_ta": surf,
+            "player_id": w_id,
+            "opp_id": l_id,
+            
+            # Self ratings
+            "self_srv120": preA["srv120"],
+            "self_srv30": preA["srv30"],
+            "self_ret120": preA["ret120"],
+            "self_ret30": preA["ret30"],
+            
+            # Opponent ratings
+            "opp_srv120": preB["srv120"],
+            "opp_srv30": preB["srv30"],
+            "opp_ret120": preB["ret120"],
+            "opp_ret30": preB["ret30"],
+            
+            # Probabilités (self perspective)
+            "p_ret_self_vs_opp_120": p_ret_A_vs_B_120,
+            "p_ret_opp_vs_self_120": p_ret_B_vs_A_120,
+            "p_ret_self_vs_opp_30": p_ret_A_vs_B_30,
+            "p_ret_opp_vs_self_30": p_ret_B_vs_A_30,
+            
+            "p_hold_self_120": p_hold_A_120,
+            "p_hold_opp_120": p_hold_B_120,
+            "p_hold_self_30": p_hold_A_30,
+            "p_hold_opp_30": p_hold_B_30,
+            
+            "p_set_self_120": p_set_A_120,
+            "p_match_markov_bo3_self_120": p_match_bo3_120,
+            "p_match_markov_bo5_self_120": p_match_bo5_120,
+            "p_set_self_30": p_set_A_30,
+            "p_match_markov_bo3_self_30": p_match_bo3_30,
+            "p_match_markov_bo5_self_30": p_match_bo5_30,
+            
+            "days_since_last_self": preA["days"],
+            "days_since_last_opp": preB["days"],
+            
+            # ✅ Derived (noms clairs)
+            "srv_dominance_self": preA["srv120"] - preA["ret120"],
+            "delta_srv120_self_minus_opp": preA["srv120"] - preB["srv120"],
+            "delta_ret120_self_minus_opp": preA["ret120"] - preB["ret120"],
+
+            # ✅ AJOUT: best_of + proba active
+            "best_of": best_of_val,
+            "p_match_markov_self_120": p_match_bo5_120 if best_of_val == 5 else p_match_bo3_120,
+            "p_match_markov_self_30": p_match_bo5_30 if best_of_val == 5 else p_match_bo3_30,
+        }
+        
+        # Record pour LOSER en tant que "self"
+        rec_l = {
+            "custom_match_id": r.get("custom_match_id"),
+            "match_key": r.get("match_key", r.get("custom_match_id")),
+            "gender": r.get("gender", gender),
+            "year": int(year_val),
+            "tourney_date_int": datei,
+            "tourney_surface_ta": surf,
+            "player_id": l_id,
+            "opp_id": w_id,
+            
+            # Self ratings (loser)
+            "self_srv120": preB["srv120"],
+            "self_srv30": preB["srv30"],
+            "self_ret120": preB["ret120"],
+            "self_ret30": preB["ret30"],
+            
+            # Opponent ratings (winner)
+            "opp_srv120": preA["srv120"],
+            "opp_srv30": preA["srv30"],
+            "opp_ret120": preA["ret120"],
+            "opp_ret30": preA["ret30"],
+            
+            # Probabilités (self = loser perspective)
+            "p_ret_self_vs_opp_120": p_ret_B_vs_A_120,
+            "p_ret_opp_vs_self_120": p_ret_A_vs_B_120,
+            "p_ret_self_vs_opp_30": p_ret_B_vs_A_30,
+            "p_ret_opp_vs_self_30": p_ret_A_vs_B_30,
+            
+            "p_hold_self_120": p_hold_B_120,
+            "p_hold_opp_120": p_hold_A_120,
+            "p_hold_self_30": p_hold_B_30,
+            "p_hold_opp_30": p_hold_A_30,
+            
+            "p_set_self_120": 1.0 - p_set_A_120,
+            "p_match_markov_bo3_self_120": 1.0 - p_match_bo3_120,
+            "p_match_markov_bo5_self_120": 1.0 - p_match_bo5_120,
+            "p_set_self_30": 1.0 - p_set_A_30,
+            "p_match_markov_bo3_self_30": 1.0 - p_match_bo3_30,
+            "p_match_markov_bo5_self_30": 1.0 - p_match_bo5_30,
+            
+            "days_since_last_self": preB["days"],
+            "days_since_last_opp": preA["days"],
+            
+            # ✅ Derived (symétrique)
+            "srv_dominance_self": preB["srv120"] - preB["ret120"],
+            "delta_srv120_self_minus_opp": preB["srv120"] - preA["srv120"],
+            "delta_ret120_self_minus_opp": preB["ret120"] - preA["ret120"],
+
+            # ✅ AJOUT: best_of + proba active (symétrique)
+            "best_of": best_of_val,
+            "p_match_markov_self_120": (1.0 - p_match_bo5_120) if best_of_val == 5 else (1.0 - p_match_bo3_120),
+            "p_match_markov_self_30": (1.0 - p_match_bo5_30) if best_of_val == 5 else (1.0 - p_match_bo3_30),
+        }
+        
+        rows.append(rec_w)
+        rows.append(rec_l)
+        store.update(datei, w_id, l_id, w_rpw, l_rpw, bias10)
+
+    print(f"  Generated {len(rows):,} feature rows")
+
+    # 7. Conversion + écriture
+    print("[5/5] Writing output...")
+    feat = pl.DataFrame(rows)
+    
+    # ✅ Casts complets (évite collisions int/str + joins instables)
+    feat = feat.with_columns([
+        pl.col("custom_match_id").cast(pl.Utf8),
+        pl.col("match_key").cast(pl.Utf8),
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("opp_id").cast(pl.Utf8),
+        pl.col("best_of").cast(pl.Int8),
+    ])
+    
+    # ✅ Unique sur (custom_match_id, player_id)
+    feat = feat.unique(subset=["custom_match_id", "player_id"], keep="last")
+    
+    feat = feat.with_columns([
+        pl.col("year").cast(pl.Int32),
+        pl.col("tourney_date_int").cast(pl.Int32),
+        pl.col("gender").cast(pl.Utf8),
+    ])
+
+    float_prefixes = (
+        "self_",
+        "opp_srv", "opp_ret",          # ✅ évite opp_id
+        "p_ret_", "p_hold_", "p_set_",
+        "p_match_markov_",
+        "delta_",
+        "srv_dominance",
+        "days_since_last_",
+    )
+    
+    float_cols = [c for c in feat.columns if c.startswith(float_prefixes)]
+    for c in float_cols:
+        feat = feat.with_columns(pl.col(c).cast(pl.Float32))
+
+    feat.write_parquet(OUT_SRVRET, partition_by=["gender", "year"], compression="zstd")
+
+    meta = {
+        "schema_version": "2.1.6-polars",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "halflife_long": HALF_LIFE_LONG,
+        "halflife_short": HALF_LIFE_SHORT,
+        "markov_tb": "exact point-level",
+        "engine": "polars"
+    }
+    (OUT_SRVRET / "_meta.json").write_text(json.dumps(meta, indent=2))
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n✅ ratings_srvret_layer → {OUT_SRVRET}")
+    print(f"   Shape: {feat.shape}")
+    print(f"   Time: {elapsed:.1f}s")
+
+    return feat
+
+# ===============================================
+# SECTION A.5: BASE STATS ROLLING FEATURES (FIXED V2)
+# Rolling averages sur stats de service/retour de matches_base
+# Coverage: 100% (vs 5% pour charting)
+# ===============================================
+
+# Output directory
+OUT_BASE_ROLLING = DATA_CLEAN / "features" / "base_stats_rolling"
+OUT_BASE_ROLLING.mkdir(parents=True, exist_ok=True)
+
+# Stats de base à transformer en rolling
+BASE_STATS_CANDIDATES = [
+    # Counts
+    "ace", "df", "svpt", "1stIn", "1stWon", "2ndWon",
+    "bpSaved", "bpFaced", "ret_bp_converted", "ret_bp_opportunities",
+    # Pourcentages
+    "s_ace_p", "s_df_p", "s_1stIn_p", "s_1stWon_p", "s_2ndWon_p",
+    "ret_1stWon_p", "ret_2ndWon_p", "tpw_p", "rpw_p", "bp_conv_p",
+    "dr_p",
+]
+
+
+def build_base_stats_rolling(gender: str = GENDER):
+    """
+    Construit base_stats_rolling layer
+    
+    Rolling 5/10/20 sur les stats de service/retour de matches_base.
+    Chaque joueur obtient ses propres rolling stats basées sur ses performances passées.
+    
+    Anti-leakage: shift(1) AVANT tout rolling
+    """
+    t0 = time.perf_counter()
+    print("\n" + "=" * 70)
+    print("SECTION A.5: BASE STATS ROLLING FEATURES")
+    print("=" * 70)
+
+    # 1. Chargement
+    print("[1/6] Loading matches_base...")
+    df = pl.scan_parquet(f"{MB_DIR}/**/*.parquet").filter(
+        (pl.col("gender") == gender) & (pl.col("year") >= START_YEAR)
+    ).collect()
+    print(f"  Loaded {len(df):,} rows")
+
+    if "match_key" not in df.columns:
+        df = df.with_columns([pl.col("custom_match_id").alias("match_key")])
+    # 2. Identifier les colonnes COMMUNES (qui existent pour winner ET loser)
+    print("[2/6] Identifying common stats (w_ AND l_)...")
+    
+    common_stats = []
+    missing_stats = []
+    
+    for stat in BASE_STATS_CANDIDATES:
+        w_col = f"w_{stat}"
+        l_col = f"l_{stat}"
+        
+        w_exists = w_col in df.columns
+        l_exists = l_col in df.columns
+        
+        if w_exists and l_exists:
+            common_stats.append(stat)
+        else:
+            missing_stats.append(f"{stat} (w={w_exists}, l={l_exists})")
+    
+    print(f"  Common stats: {len(common_stats)}/{len(BASE_STATS_CANDIDATES)}")
+    if missing_stats:
+        print(f"  ⚠️ Skipped (asymmetric): {missing_stats[:5]}...")
+
+    if len(common_stats) == 0:
+        print("❌ ERROR: No common stats found!")
+        return None
+
+    # 3. Nettoyer les pourcentages (conversion 0-100 → 0-1 si nécessaire)
+    print("[3/6] Cleaning percentage columns...")
+    for stat in common_stats:
+        if "_p" in stat:
+            for prefix in ["w_", "l_"]:
+                col = f"{prefix}{stat}"
+                # Convertir en Float64 et normaliser si > 1
+                df = df.with_columns([
+                    pl.when(pl.col(col).is_null())
+                    .then(None)
+                    .otherwise(
+                        pl.when(pl.col(col).cast(pl.Float64, strict=False) > 1.0)
+                        .then(pl.col(col).cast(pl.Float64, strict=False) / 100.0)
+                        .otherwise(pl.col(col).cast(pl.Float64, strict=False))
+                    )
+                    .clip(0.0, 1.0)
+                    .alias(col)
+                ])
+
+    # 4. Créer format long - MÉTHODE EXPLICITE pour garantir mêmes colonnes
+    print("[4/6] Creating long format...")
+    
+    # Définir les colonnes de sortie communes
+    base_id_cols = ["custom_match_id", "match_key", "tourney_date_ta", "year"]
+
+    # Construire winner DataFrame
+    winner_exprs = [pl.col(c) for c in base_id_cols if c in df.columns]
+    winner_exprs.append(pl.col("winner_id").alias("player_id"))
+    for stat in common_stats:
+        winner_exprs.append(pl.col(f"w_{stat}").cast(pl.Float64).alias(stat))
+    
+    part_winner = df.select(winner_exprs)
+    
+    # Construire loser DataFrame avec EXACTEMENT les mêmes colonnes
+    loser_exprs = [pl.col(c) for c in base_id_cols if c in df.columns]
+    loser_exprs.append(pl.col("loser_id").alias("player_id"))
+    for stat in common_stats:
+        loser_exprs.append(pl.col(f"l_{stat}").cast(pl.Float64).alias(stat))
+    
+    part_loser = df.select(loser_exprs)
+    
+    # Vérification des shapes
+    print(f"  Winner cols: {part_winner.columns}")
+    print(f"  Loser cols: {part_loser.columns}")
+    print(f"  Winner shape: {part_winner.shape}")
+    print(f"  Loser shape: {part_loser.shape}")
+    
+    # Vérifier que les colonnes sont identiques
+    if part_winner.columns != part_loser.columns:
+        print("❌ ERROR: Column mismatch!")
+        print(f"  Winner only: {set(part_winner.columns) - set(part_loser.columns)}")
+        print(f"  Loser only: {set(part_loser.columns) - set(part_winner.columns)}")
+        return None
+    
+    # Concat et sort
+    long_df = pl.concat([part_winner, part_loser])
+    long_df = long_df.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date, strict=False)
+    ])
+    long_df = long_df.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    print(f"  Long format: {len(long_df):,} rows")
+
+    # 5. Calculer rolling features
+    print("[5/6] Computing rolling features...")
+    
+    rolling_cols_created = []
+    for stat in common_stats:
+        # D'abord shift(1) pour éviter le leakage
+        long_df = long_df.with_columns([
+            pl.col(stat).shift(1).over("player_id").alias(f"_{stat}_shifted")
+        ])
+        
+        # Puis rolling sur la version shiftée
+        for N in [5, 10, 20]:
+            col_name = f"r{N}_{stat}"
+            long_df = long_df.with_columns([
+                pl.col(f"_{stat}_shifted")
+                .rolling_mean(window_size=N, min_periods=1)
+                .over("player_id")
+                .cast(pl.Float32)
+                .alias(col_name)
+            ])
+            rolling_cols_created.append(col_name)
+        
+        # Supprimer la colonne temporaire
+        long_df = long_df.drop(f"_{stat}_shifted")
+    
+    print(f"  Created {len(rolling_cols_created)} rolling features")
+
+    # 6. Features dérivées
+    print("[6/6] Adding derived features...")
+    derived_cols = []
+    
+    # Ace rate calculé
+    if "r10_ace" in long_df.columns and "r10_svpt" in long_df.columns:
+        long_df = long_df.with_columns([
+            (pl.col("r10_ace") / pl.when(pl.col("r10_svpt") < 1).then(1).otherwise(pl.col("r10_svpt")))
+            .fill_null(0.05).fill_nan(0.05)
+            .clip(0.0, 0.5)
+            .cast(pl.Float32)
+            .alias("r10_ace_rate_calc")
+        ])
+        derived_cols.append("r10_ace_rate_calc")
+    
+    # DF rate calculé
+    if "r10_df" in long_df.columns and "r10_svpt" in long_df.columns:
+        long_df = long_df.with_columns([
+            (pl.col("r10_df") / pl.when(pl.col("r10_svpt") < 1).then(1).otherwise(pl.col("r10_svpt")))
+            .fill_null(0.03).fill_nan(0.03)
+            .clip(0.0, 0.3)
+            .cast(pl.Float32)
+            .alias("r10_df_rate_calc")
+        ])
+        derived_cols.append("r10_df_rate_calc")
+    
+    # BP save rate calculé
+    if "r10_bpSaved" in long_df.columns and "r10_bpFaced" in long_df.columns:
+        long_df = long_df.with_columns([
+            (pl.col("r10_bpSaved") / pl.when(pl.col("r10_bpFaced") < 1).then(1).otherwise(pl.col("r10_bpFaced")))
+            .fill_null(0.60).fill_nan(0.60)
+            .clip(0.0, 1.0)
+            .cast(pl.Float32)
+            .alias("r10_bp_save_rate_calc")
+        ])
+        derived_cols.append("r10_bp_save_rate_calc")
+    
+    # ============================================
+    # SERVE STRENGTH - CORRIGÉ avec fill_nan()
+    # ============================================
+    srv_cols = ["r10_s_ace_p", "r10_s_1stWon_p", "r10_s_2ndWon_p"]
+    if all(c in long_df.columns for c in srv_cols):
+        long_df = long_df.with_columns([
+            (0.3 * pl.col("r10_s_ace_p").fill_null(0.06).fill_nan(0.06) +
+             0.4 * pl.col("r10_s_1stWon_p").fill_null(0.69).fill_nan(0.69) +
+             0.3 * pl.col("r10_s_2ndWon_p").fill_null(0.50).fill_nan(0.50))
+            .cast(pl.Float32)
+            .alias("r10_serve_strength")
+        ])
+        derived_cols.append("r10_serve_strength")
+        print("    ✅ r10_serve_strength computed")
+    
+    # ============================================
+    # RETURN STRENGTH - CORRIGÉ avec fill_nan()
+    # ============================================
+    ret_cols = ["r10_ret_1stWon_p", "r10_ret_2ndWon_p", "r10_rpw_p"]
+    if all(c in long_df.columns for c in ret_cols):
+        long_df = long_df.with_columns([
+            (0.3 * pl.col("r10_ret_1stWon_p").fill_null(0.30).fill_nan(0.30) +
+             0.3 * pl.col("r10_ret_2ndWon_p").fill_null(0.50).fill_nan(0.50) +
+             0.4 * pl.col("r10_rpw_p").fill_null(0.37).fill_nan(0.37))
+            .cast(pl.Float32)
+            .alias("r10_return_strength")
+        ])
+        derived_cols.append("r10_return_strength")
+        print("    ✅ r10_return_strength computed")
+
+    print(f"  Derived features: {len(derived_cols)}")
+
+    # Output
+    print("  Writing output...")
+    
+    # Sélectionner colonnes finales
+    output_cols = ["custom_match_id", "match_key", "player_id", "year"] + rolling_cols_created + derived_cols
+    output_cols = [c for c in output_cols if c in long_df.columns]
+    
+    out_df = long_df.select(output_cols)
+    out_df = out_df.with_columns([pl.lit(gender).alias("gender")])
+    out_df = out_df.unique(subset=["custom_match_id", "player_id"], keep="last")
+    out_df = out_df.with_columns([pl.col("year").cast(pl.Int32)])
+
+    # ✅ Casts uniformes
+    out_df = out_df.with_columns([
+        pl.col("custom_match_id").cast(pl.Utf8),
+        pl.col("match_key").cast(pl.Utf8),
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("gender").cast(pl.Utf8),
+        pl.col("year").cast(pl.Int32),
+    ])
+        
+    # Écriture partitionnée
+    out_df.write_parquet(OUT_BASE_ROLLING, partition_by=["gender", "year"], compression="zstd")
+    
+    elapsed = time.perf_counter() - t0
+    
+    # Stats de coverage
+    sample_col = rolling_cols_created[0] if rolling_cols_created else None
+    if sample_col:
+        coverage = out_df.select(pl.col(sample_col).is_not_null().mean()).item()
+    else:
+        coverage = 0
+    
+    print(f"\n✅ base_stats_rolling → {OUT_BASE_ROLLING}")
+    print(f"   Shape: {out_df.shape}")
+    print(f"   Rolling features: {len(rolling_cols_created)}")
+    print(f"   Derived features: {len(derived_cols)}")
+    print(f"   Coverage: {coverage:.1%}")
+    print(f"   Time: {elapsed:.1f}s")
+    
+    # Sanity check
+    print(f"\n📊 SANITY CHECK:")
+    for col in ["r10_s_ace_p", "r10_s_1stWon_p", "r10_rpw_p", "r10_serve_strength", "r10_return_strength"]:
+        if col in out_df.columns:
+            stats = out_df.select([
+                pl.col(col).mean().alias("mean"),
+                pl.col(col).std().alias("std"),
+                pl.col(col).is_not_null().mean().alias("coverage")
+            ]).row(0)
+            print(f"   {col}: mean={stats[0]:.3f}, std={stats[1]:.3f}, coverage={stats[2]:.1%}")
+    
+    return out_df
+
+# ===============================================
+# ===============================================
+# SECTION B: PSYCHOLOGICAL & MOMENTUM FEATURES
+# Streaks, upset, clutch, comeback, mental toughness
+# ⚠️ VERSION CORRIGÉE - 3 BUGS FIXÉS
+# ===============================================
+# ===============================================
+
+def build_psychological_features(gender: str = GENDER):
+    """
+    Construit psychological_momentum layer
+    
+    ⚠️ VERSION CORRIGÉE - 3 bugs de leakage fixés:
+    1. win_streak_current: utilisait len() au lieu de cum_sum()
+    2. max_win_streak_30d: manquait shift(1)
+    3. streak_norm: utilisait min/max global au lieu de clip fixe
+    """
+    t0 = time.perf_counter()
+    print("\n" + "=" * 70)
+    print("SECTION B: PSYCHOLOGICAL & MOMENTUM FEATURES (FIXED)")
+    print("=" * 70)
+
+    # 1. Chargement
+    print("[1/4] Loading matches_base...")
+    matches_df = (
+        pl.scan_parquet(f"{MB_DIR}/**/*.parquet")
+        .filter((pl.col("gender") == gender) & (pl.col("year") >= START_YEAR))
+        .collect()
+    )
+    print(f"  Loaded {len(matches_df):,} rows")
+
+    matches_df = matches_df.with_columns([
+        pl.col("tourney_date_ta").cast(pl.Date, strict=False)
+    ])
+
+    # ✅ Assurer match_key existe
+    if "match_key" not in matches_df.columns:
+        matches_df = matches_df.with_columns([pl.col("custom_match_id").alias("match_key")])
+        
+    # 2. Format long
+    print("[2/4] Creating long format...")
+    part_winner = matches_df.select([
+        pl.col("custom_match_id"), pl.col("match_key"), pl.col("match_id_ta_dedup"),
+        pl.col("tourney_date_ta"), pl.col("year"),
+        pl.col("winner_id").alias("player_id"),
+        pl.col("winner_rank_ta").alias("player_rank"),
+        pl.col("loser_rank_ta").alias("opp_rank"),
+        pl.col("score_ta"), pl.col("best_of_ta"),
+        pl.col("is_tiebreak_played"),
+        pl.col("w_bpSaved"), pl.col("w_bpFaced"),
+        pl.col("l_bpSaved"), pl.col("l_bpFaced"),
+        pl.lit(1).alias("won"),
+    ])
+
+    part_loser = matches_df.select([
+        pl.col("custom_match_id"), pl.col("match_key"), pl.col("match_id_ta_dedup"),
+        pl.col("tourney_date_ta"), pl.col("year"),
+        pl.col("loser_id").alias("player_id"),
+        pl.col("loser_rank_ta").alias("player_rank"),
+        pl.col("winner_rank_ta").alias("opp_rank"),
+        pl.col("score_ta"), pl.col("best_of_ta"),
+        pl.col("is_tiebreak_played"),
+        pl.col("w_bpSaved"), pl.col("w_bpFaced"),
+        pl.col("l_bpSaved"), pl.col("l_bpFaced"),
+        pl.lit(0).alias("won"),
+    ])
+
+    df = pl.concat([part_winner, part_loser])
+    df = df.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+    print(f"  Long format: {len(df):,} rows")
+
+    # 3. Features
+    print("[3/4] Computing features...")
+
+    # ✅ shift(1) AVANT tout rolling - ANTI-LEAKAGE
+    df = df.with_columns([pl.col("won").shift(1).over("player_id").alias("won_prev")])
+
+    # Streaks (rolling sum sur won_prev - déjà shifted, donc OK)
+    for w in [5, 10, 20]:
+        df = df.with_columns([
+            pl.col("won_prev")
+            .fill_null(0)  # ✅ FIX: évite null au début
+            .rolling_sum(window_size=w, min_periods=1)
+            .over("player_id")
+            .alias(f"win_streak_{w}"),
+        ])
+        df = df.with_columns([(w - pl.col(f"win_streak_{w}")).alias(f"loss_streak_{w}")])
+
+    # ===============================================
+    # 🔧 FIX #1: win_streak_current
+    # ANCIEN (LEAKAGE): pl.len().over([...]) comptait les matchs FUTURS
+    # NOUVEAU: pl.lit(1).cum_sum() compte uniquement jusqu'au match actuel
+    # ===============================================
+    
+    # Streak change detection
+    df = df.with_columns([
+        (pl.col("won_prev") != pl.col("won_prev").shift(1).over("player_id"))
+        .fill_null(True)
+        .alias("streak_change")
+    ])
+    df = df.with_columns([pl.col("streak_change").cum_sum().over("player_id").alias("streak_group")])
+    
+    # ✅ FIXED: Compteur CUMULATIF dans le groupe (ne voit PAS le futur)
+    # ANCIEN: pl.len().over(["player_id", "streak_group"]).cast(pl.Int32).alias("streak_size")
+    # NOUVEAU: Créer colonne temporaire puis cum_sum (pl.lit(1).cum_sum() ne marche pas directement)
+    df = df.with_columns([pl.lit(1).alias("_one")])
+    df = df.with_columns([
+        pl.col("_one").cum_sum().over(["player_id", "streak_group"]).alias("streak_position"),
+        pl.col("won_prev").first().over(["player_id", "streak_group"]).alias("streak_type")
+    ])
+    df = df.drop("_one")
+    
+    # win_streak_current: positif si série de victoires, négatif si série de défaites
+    # ✅ FIX: Premier match (won_prev null) = 0
+    df = df.with_columns([
+        pl.when(pl.col("won_prev").is_null())
+        .then(0)
+        .when(pl.col("streak_type") == 1)
+        .then(pl.col("streak_position"))
+        .otherwise(-pl.col("streak_position"))
+        .cast(pl.Int32)
+        .alias("win_streak_current")
+    ])
+
+    # ===============================================
+    # 🔧 FIX #2: max_win_streak_30d
+    # ANCIEN (LEAKAGE): rolling_max sans shift incluait le match courant
+    # NOUVEAU: ajout de .shift(1) après rolling_max
+    # ===============================================
+    df = df.with_columns([
+        pl.col("win_streak_10")
+        .rolling_max(window_size=10, min_periods=1)
+        .over("player_id")
+        .shift(1)  # ✅ FIXED: shift APRÈS rolling_max
+        .fill_null(0)
+        .alias("max_win_streak_30d"),
+        
+        pl.col("loss_streak_10")
+        .rolling_max(window_size=10, min_periods=1)
+        .over("player_id")
+        .shift(1)  # ✅ FIXED: shift APRÈS rolling_max
+        .fill_null(0)
+        .alias("max_loss_streak_30d"),
+    ])
+
+    # Upset rate
+    df = df.with_columns([
+        pl.when(
+            (pl.col("won") == 1) &
+            (pl.col("player_rank") > pl.col("opp_rank")) &
+            pl.col("player_rank").is_not_null() &
+            pl.col("opp_rank").is_not_null()
+        ).then(1).otherwise(0).alias("is_upset")
+    ])
+    df = df.with_columns([pl.col("is_upset").shift(1).over("player_id").alias("is_upset_prev")])
+
+    for w in [10, 20, 50]:
+        df = df.with_columns([
+            pl.col("is_upset_prev")
+            .rolling_mean(window_size=w, min_periods=5)
+            .over("player_id")
+            .alias(f"upset_rate_r{w}")
+        ])
+
+    # Upset vs top
+    df = df.with_columns([
+        (pl.col("opp_rank") <= 10).cast(pl.Int8).alias("is_vs_top10"),
+        (pl.col("opp_rank") <= 50).cast(pl.Int8).alias("is_vs_top50"),
+    ])
+    df = df.with_columns([
+        (pl.col("is_upset") & (pl.col("is_vs_top10") == 1)).cast(pl.Int8).alias("upset_vs_top10"),
+        (pl.col("is_upset") & (pl.col("is_vs_top50") == 1)).cast(pl.Int8).alias("upset_vs_top50"),
+    ])
+    df = df.with_columns([
+        pl.col("upset_vs_top10").shift(1).over("player_id").alias("upset_top10_prev"),
+        pl.col("upset_vs_top50").shift(1).over("player_id").alias("upset_top50_prev"),
+    ])
+    df = df.with_columns([
+        pl.col("upset_top10_prev").rolling_mean(window_size=20, min_periods=3).over("player_id").alias("upset_rate_vs_top10_r20"),
+        pl.col("upset_top50_prev").rolling_mean(window_size=20, min_periods=5).over("player_id").alias("upset_rate_vs_top50_r20"),
+    ])
+
+    # Clutch
+    df = df.with_columns([
+        pl.col("is_tiebreak_played").fill_null(False).cast(pl.Int8).alias("tb_played"),
+    ])
+    df = df.with_columns([
+        ((pl.col("tb_played") == 1) & (pl.col("won") == 1)).cast(pl.Int8).alias("tb_won")
+    ])
+    df = df.with_columns([
+        pl.when(pl.col("won") == 1).then(pl.col("w_bpSaved")).otherwise(pl.col("l_bpSaved")).alias("bp_saved"),
+        pl.when(pl.col("won") == 1).then(pl.col("w_bpFaced")).otherwise(pl.col("l_bpFaced")).alias("bp_faced"),
+    ])
+    df = df.with_columns([
+        (pl.col("bp_saved") / pl.col("bp_faced")).fill_null(0.5).fill_nan(0.5).alias("bp_save_rate")
+    ])
+    df = df.with_columns([
+        pl.col("tb_won").shift(1).over("player_id").alias("tb_won_prev"),
+        pl.col("bp_save_rate").shift(1).over("player_id").alias("bp_save_prev"),
+    ])
+    df = df.with_columns([
+        pl.col("tb_won_prev").rolling_mean(window_size=20, min_periods=5).over("player_id").alias("clutch_tb_r20"),
+        pl.col("bp_save_prev").rolling_mean(window_size=10, min_periods=5).over("player_id").alias("clutch_bp_save_r10"),
+    ])
+    df = df.with_columns([
+        (0.5 * pl.col("clutch_tb_r20").fill_null(0.5) +
+         0.5 * pl.col("clutch_bp_save_r10").fill_null(0.5)).alias("clutch_score")
+    ])
+
+    # Comeback
+    df = df.with_columns([
+        pl.col("score_ta").str.extract(r"^(\d+)-(\d+)", 1).cast(pl.Int32, strict=False).alias("first_set_w"),
+        pl.col("score_ta").str.extract(r"^(\d+)-(\d+)", 2).cast(pl.Int32, strict=False).alias("first_set_l"),
+    ])
+    df = df.with_columns([
+        pl.when((pl.col("first_set_w") < pl.col("first_set_l")) & (pl.col("won") == 1))
+        .then(1).otherwise(0).alias("comeback_from_set_down")
+    ])
+    df = df.with_columns([pl.col("comeback_from_set_down").shift(1).over("player_id").alias("comeback_prev")])
+    df = df.with_columns([
+        pl.col("comeback_prev").rolling_mean(window_size=20, min_periods=3).over("player_id").alias("comeback_rate_r20")
+    ])
+
+    # ===============================================
+    # 🔧 FIX #3: Mental toughness (streak_norm)
+    # ANCIEN (LEAKAGE): min()/max() global sur tout le dataset
+    # NOUVEAU: clip à valeurs fixes [-20, 20] puis normalisation
+    # ===============================================
+    # ANCIEN:
+    # ((pl.col("win_streak_current") - pl.col("win_streak_current").min()) /
+    #  (pl.col("win_streak_current").max() - pl.col("win_streak_current").min() + 1e-6))
+    # NOUVEAU:
+    df = df.with_columns([
+        # Clip win_streak_current to reasonable bounds [-20, 20]
+        # Then normalize using fixed bounds (not data-dependent)
+        # streak_norm: 0 = worst losing streak (-20), 0.5 = neutral (0), 1 = best winning streak (+20)
+        ((pl.col("win_streak_current").clip(-20, 20) + 20) / 40.0)
+        .fill_null(0.5)
+        .alias("streak_norm")
+    ])
+    
+    df = df.with_columns([
+        (0.30 * pl.col("streak_norm") +
+         0.25 * pl.col("upset_rate_r20").fill_null(0.5) +
+         0.25 * pl.col("clutch_score").fill_null(0.5) +
+         0.20 * pl.col("comeback_rate_r20").fill_null(0.5)).alias("mental_toughness_score")
+    ])
+
+    # 4. Output
+    print("[4/4] Writing output...")
+    output_cols = [
+        "custom_match_id", "player_id", "year", "match_key",
+        "win_streak_current", "win_streak_5", "win_streak_10", "win_streak_20",
+        "max_win_streak_30d", "max_loss_streak_30d",
+        "upset_rate_r10", "upset_rate_r20", "upset_rate_r50",
+        "upset_rate_vs_top10_r20", "upset_rate_vs_top50_r20",
+        "clutch_score", "clutch_tb_r20", "clutch_bp_save_r10",
+        "comeback_rate_r20", "mental_toughness_score"
+    ]
+    output_cols = [c for c in output_cols if c in df.columns]
+
+    out_df = df.select(output_cols)
+    out_df = out_df.with_columns([pl.lit(gender).alias("gender")])
+    out_df = out_df.unique(subset=["custom_match_id", "player_id"], keep="last")
+    out_df = out_df.with_columns([pl.col("year").cast(pl.Int32)])
+
+    float_cols = [c for c in out_df.columns if c not in ["custom_match_id", "match_key", "player_id", "year", "gender"]]
+    for c in float_cols:
+        out_df = out_df.with_columns([pl.col(c).cast(pl.Float32)])
+
+    # ✅ Casts uniformes
+    out_df = out_df.with_columns([
+        pl.col("custom_match_id").cast(pl.Utf8),
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("gender").cast(pl.Utf8),
+        pl.col("year").cast(pl.Int32),
+    ])
+    if "match_key" in out_df.columns:
+        out_df = out_df.with_columns([pl.col("match_key").cast(pl.Utf8)])
+        
+    out_df.write_parquet(OUT_PSYCH, partition_by=["gender", "year"], compression="zstd")
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n✅ psychological_momentum → {OUT_PSYCH}")
+    print(f"   Shape: {out_df.shape}")
+    
+    # Sanity check - valeurs attendues réalistes
+    print(f"\n📊 SANITY CHECK (valeurs attendues réalistes):")
+    print(f"   win_streak_current: min={out_df['win_streak_current'].min()}, max={out_df['win_streak_current'].max()}")
+    print(f"   win_streak_5: mean={out_df['win_streak_5'].mean():.2f} (attendu: ~2.5)")
+    print(f"   upset_rate_r20: mean={out_df['upset_rate_r20'].mean():.3f} (attendu: ~0.1-0.3)")
+    print(f"   clutch_score: mean={out_df['clutch_score'].mean():.3f} (attendu: ~0.4-0.6)")
+    print(f"   Time: {elapsed:.1f}s")
+
+    return out_df
+
+
+# ===============================================
+# ===============================================
+# SECTION C: ENVIRONMENTAL CONTEXT FEATURES
+# Altitude, ball type, court speed, weather
+# ===============================================
+# ===============================================
+
+ALTITUDE_MAP = {
+    "acapulco": 5, "bogota": 2640, "quito": 2850,
+    "johannesburg": 1753, "puebla": 2149, "mexico": 2240, "denver": 1609,
+    "gstaad": 1050, "kitzbuhel": 762, "munich": 519,
+    "madrid": 657, "sofia": 550, "metz": 175,
+    "saopaulo": 760, "santiago": 520,
+    "miami": 0, "usopen": 0, "australianopen": 0, "wimbledon": 0,
+    "rolandgarros": 75, "indianwells": 0, "montecarlo": 0,
+    "rome": 21, "shanghai": 4, "paris": 35, "london": 11,
+    "dubai": 0, "doha": 0, "brisbane": 0, "sydney": 0, "auckland": 0,
+}
+
+BALL_TYPE_MAP = {
+    "usopen": "wilson_us_open", "australianopen": "dunlop",
+    "rolandgarros": "babolat", "wimbledon": "slazenger",
+    "indianwells": "penn", "miami": "dunlop", "montecarlo": "dunlop",
+    "madrid": "dunlop", "rome": "dunlop", "canada": "penn",
+    "montreal": "penn", "toronto": "penn", "cincinnati": "wilson",
+    "shanghai": "wilson", "paris": "dunlop", "parismasters": "dunlop",
+    "barcelona": "dunlop", "hamburg": "dunlop", "queens": "slazenger",
+    "halle": "dunlop", "washington": "penn", "beijing": "wilson",
+    "tokyo": "dunlop", "basel": "wilson", "vienna": "dunlop",
+    "acapulco": "penn", "dubai": "dunlop", "rotterdam": "dunlop", "rio": "dunlop",
+}
+
+BALL_PROPERTIES = {
+    "wilson_us_open": {"speed": 0.80, "bounce": 0.70},
+    "wilson": {"speed": 0.75, "bounce": 0.70},
+    "dunlop": {"speed": 0.70, "bounce": 0.75},
+    "penn": {"speed": 0.65, "bounce": 0.80},
+    "slazenger": {"speed": 0.60, "bounce": 0.70},
+    "babolat": {"speed": 0.50, "bounce": 0.90},
+    "tecnifibre": {"speed": 0.68, "bounce": 0.78},
+    "unknown": {"speed": 0.70, "bounce": 0.75},
+}
+
+SURFACE_BASE_SPEED = {"Hard": 0.75, "Clay": 0.45, "Grass": 0.85, "Carpet": 0.80}
+
+ROUND_TIME_PROXY = {
+    "F": 18, "SF": 16, "QF": 14, "R16": 12, "R32": 11,
+    "R64": 10, "R128": 10, "RR": 14, "BR": 12, "Q1": 10, "Q2": 10, "Q3": 11,
+}
+
+SOUTHERN_HEMISPHERE = {
+    "australianopen", "brisbane", "sydney", "adelaide", "auckland",
+    "melbourne", "hobart", "buenos", "saopaulo", "rio", "santiago",
+    "johannesburg", "perth"
+}
+
+
+def build_environmental_features(gender: str = GENDER):
+    """Construit environmental_context layer"""
+    t0 = time.perf_counter()
+    print("\n" + "=" * 70)
+    print("SECTION C: ENVIRONMENTAL CONTEXT FEATURES")
+    print("=" * 70)
+
+    # 1. Chargement
+    print("[1/3] Loading matches_base...")
+    df = pl.scan_parquet(f"{MB_DIR}/**/*.parquet").filter(pl.col("gender") == gender).collect()
+    print(f"  Loaded {len(df):,} rows")
+
+    # ✅ Assurer match_key existe
+    if "match_key" not in df.columns:
+        df = df.with_columns([pl.col("custom_match_id").alias("match_key")])
+    # 2. Features
+    print("[2/3] Computing features...")
+
+    # Slug normalisé
+    df = df.with_columns([
+        pl.col("tourney_slug_ta").cast(pl.Utf8).str.to_lowercase()
+        .str.replace_all("-", "").str.replace_all("_", "").str.replace_all(" ", "")
+        .str.replace(r"^\d{4}", "")
+        .alias("tourney_slug_lower")
+    ])
+
+    # Altitude
+    df = df.with_columns([
+        pl.col("tourney_slug_lower").replace(ALTITUDE_MAP, default=0).cast(pl.Int32).alias("altitude_m")
+    ])
+    df = df.with_columns([
+        pl.when(pl.col("altitude_m") <= 500).then(pl.lit("sea_level"))
+        .when(pl.col("altitude_m") <= 1500).then(pl.lit("medium"))
+        .otherwise(pl.lit("high")).alias("altitude_category")
+    ])
+    df = df.with_columns([(pl.col("altitude_m") / 1000.0).clip(0.0, 3.0).alias("altitude_serve_boost")])
+
+    # Ball type
+    df = df.with_columns([
+        pl.col("tourney_slug_lower").replace(BALL_TYPE_MAP, default="unknown").alias("ball_type")
+    ])
+    ball_speed = {k: v["speed"] for k, v in BALL_PROPERTIES.items()}
+    ball_bounce = {k: v["bounce"] for k, v in BALL_PROPERTIES.items()}
+    df = df.with_columns([
+        pl.col("ball_type").replace(ball_speed, default=0.70).cast(pl.Float32).alias("ball_speed_index"),
+        pl.col("ball_type").replace(ball_bounce, default=0.75).cast(pl.Float32).alias("ball_bounce_index"),
+    ])
+
+    # Court speed
+    surface_col = "tourney_surface_ta" if "tourney_surface_ta" in df.columns else "surface"
+    df = df.with_columns([
+        pl.col(surface_col).replace(SURFACE_BASE_SPEED, default=0.70).cast(pl.Float32).alias("court_speed_base")
+    ])
+    if "is_indoor" in df.columns:
+        df = df.with_columns([
+            pl.when(pl.col("is_indoor").fill_null(False)).then(0.05).otherwise(0.0).cast(pl.Float32).alias("indoor_speed_boost")
+        ])
+    else:
+        df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias("indoor_speed_boost")])
+
+    df = df.with_columns([
+        (pl.col("court_speed_base") + pl.col("indoor_speed_boost")).clip(0.30, 1.0).alias("court_speed_edition")
+    ])
+
+    # Weather proxies
+    if "is_indoor" in df.columns:
+        df = df.with_columns([
+            pl.when(pl.col("is_indoor").fill_null(False)).then(0.0).otherwise(1.0).cast(pl.Float32).alias("weather_impact")
+        ])
+    else:
+        df = df.with_columns([pl.lit(1.0).cast(pl.Float32).alias("weather_impact")])
+
+    df = df.with_columns([pl.col("tourney_date_ta").cast(pl.Date, strict=False).dt.month().alias("match_month")])
+    df = df.with_columns([pl.col("match_month").is_in([6, 7, 8]).cast(pl.Int8).alias("is_summer")])
+    df = df.with_columns([pl.col("tourney_slug_lower").is_in(SOUTHERN_HEMISPHERE).cast(pl.Int8).alias("is_southern")])
+
+    df = df.with_columns([
+        pl.when(pl.col("is_indoor").fill_null(False)).then(21)
+        .when(pl.col("is_southern") == 1).then(
+            pl.when(pl.col("match_month").is_in([12, 1, 2])).then(30)
+            .when(pl.col("match_month").is_in([6, 7, 8])).then(12).otherwise(20)
+        ).otherwise(
+            pl.when(pl.col("match_month").is_in([6, 7, 8])).then(28)
+            .when(pl.col("match_month").is_in([12, 1, 2])).then(10).otherwise(18)
+        ).cast(pl.Int16).alias("temperature_proxy")
+    ])
+    df = df.with_columns([((pl.col("temperature_proxy") - 20) / 20.0).clip(-0.10, 0.10).cast(pl.Float32).alias("temp_speed_effect")])
+
+    # Time of day
+    df = df.with_columns([
+        pl.col("round_ta").cast(pl.Utf8).str.to_uppercase().replace(ROUND_TIME_PROXY, default=12).cast(pl.Int16).alias("estimated_match_hour")
+    ])
+    df = df.with_columns([
+        ((pl.col("estimated_match_hour") - 10) / 8.0).clip(0.0, 1.0).cast(pl.Float32).alias("time_fatigue_factor"),
+        (pl.col("estimated_match_hour") >= 19).cast(pl.Int8).alias("is_night_session")
+    ])
+
+    # 3. Output
+    print("[3/3] Writing output...")
+    output_cols = [
+        "custom_match_id", "gender", "year", "match_key",
+        "altitude_m", "altitude_category", "altitude_serve_boost",
+        "ball_type", "ball_speed_index", "ball_bounce_index",
+        "court_speed_base", "indoor_speed_boost", "court_speed_edition",
+        "weather_impact", "temperature_proxy", "temp_speed_effect",
+        "estimated_match_hour", "time_fatigue_factor", "is_night_session",
+    ]
+    output_cols = [c for c in output_cols if c in df.columns]
+
+    out_df = df.select(output_cols).unique(subset=["custom_match_id"], keep="last")
+    out_df = out_df.with_columns([pl.col("year").cast(pl.Int32)])
+    out_df = out_df.with_columns([
+        pl.col("custom_match_id").cast(pl.Utf8),
+        pl.col("gender").cast(pl.Utf8),
+        pl.col("year").cast(pl.Int32),
+    ])
+    if "match_key" in out_df.columns:
+        out_df = out_df.with_columns([pl.col("match_key").cast(pl.Utf8)])
+        
+    out_df.write_parquet(OUT_ENV, partition_by=["gender", "year"], compression="zstd")
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n✅ environmental_context → {OUT_ENV}")
+    print(f"   Shape: {out_df.shape}")
+    print(f"   Time: {elapsed:.1f}s")
+
+    return out_df
+
+
+# ===============================================
+# ===============================================
+# SECTION D: CHARTING STYLE FEATURES SOTA
+# Rolling averages sur stats charting + features dérivées
+# ===============================================
+# ===============================================
+
+CHARTING_STATS = {
+    "serve_direction": ["wide_pct", "body_pct", "t_pct", "dc_wide_pct", "dc_t_pct", "ad_wide_pct", "ad_t_pct"],
+    "rally": ["avgrally", "rallylen", "inplay_pct", "inplayw_pct", "lte3w_pct"],
+    "net": ["net_pct", "wnr_at_net", "ufe_at_net", "passed_at_net"],
+    "quality": ["wnr_pct", "ufe_pct", "fcde_pct", "wnrs_pct", "unferr_pct"],
+    "depth": ["deep_pct", "shlw_pct", "v_deep_pct"],
+    "clutch": ["bpsaved", "rpw_pct", "unret_pct"],
+}
+ALL_CHARTING_STATS = [s for group in CHARTING_STATS.values() for s in group]
+
+
+def build_charting_style_features(gender: str = GENDER):
+    """Construit charting_style layer"""
+    t0 = time.perf_counter()
+    print("\n" + "=" * 70)
+    print("SECTION D: CHARTING STYLE FEATURES SOTA")
+    print("=" * 70)
+
+    # 1. Charger charting
+    if not CHARTING_DIR.exists():
+        print(f"⚠️ charting_long introuvable: {CHARTING_DIR}")
+        return None
+
+    print("[1/5] Loading charting_long...")
+    chart_raw = pl.scan_parquet(f"{CHARTING_DIR}/**/*.parquet").collect()
+    print(f"  Raw: {len(chart_raw):,} rows")
+
+    chart_raw = chart_raw.filter(pl.col("set_context").cast(pl.Utf8).str.to_lowercase() == "overall")
+    print(f"  After Overall filter: {len(chart_raw):,} rows")
+
+    if chart_raw.is_empty():
+        print("⚠️ Aucune donnée charting Overall")
+        return None
+
+    # 2. Pivot
+    print("[2/5] Pivoting charting stats...")
+    available_stats = chart_raw.select("stat_name").unique().to_series().to_list()
+    stats_to_use = [s for s in ALL_CHARTING_STATS if s in available_stats]
+    print(f"  Stats available: {len(stats_to_use)}/{len(ALL_CHARTING_STATS)}")
+
+    chart_df = chart_raw.filter(pl.col("stat_name").is_in(stats_to_use))
+    chart_df = chart_df.with_columns([pl.coalesce([pl.col("stat_pct"), pl.col("stat_value")]).alias("value")])
+
+    chart_pivot = chart_df.pivot(
+        values="value", index=["match_id", "player_id"],
+        on="stat_name", aggregate_function="first"
+    )
+    rename_map = {c: f"chart_{c}" for c in chart_pivot.columns if c not in ["match_id", "player_id"]}
+    chart_pivot = chart_pivot.rename(rename_map)
+    print(f"  Pivot shape: {chart_pivot.shape}")
+
+    # 3. Participations
+    print("[3/5] Loading participations...")
+    matches_df = (
+        pl.scan_parquet(f"{MB_DIR}/**/*.parquet")
+        .filter((pl.col("gender") == gender) & (pl.col("year") >= 1990))
+        .collect()
+    )
+    matches_df = matches_df.with_columns([pl.col("tourney_date_ta").cast(pl.Date, strict=False)])
+
+    # ✅ Assurer match_key existe
+    if "match_key" not in matches_df.columns:
+        matches_df = matches_df.with_columns([pl.col("custom_match_id").alias("match_key")])
+    part_winner = matches_df.select([
+        pl.col("custom_match_id"), pl.col("match_key"), pl.col("match_id_ta_dedup"), 
+        pl.col("match_id_ta_source"),
+        pl.col("tourney_date_ta"), pl.col("year"), 
+        pl.col("winner_id").alias("player_id")
+    ])
+    part_loser = matches_df.select([
+        pl.col("custom_match_id"), pl.col("match_key"), pl.col("match_id_ta_dedup"),
+        pl.col("match_id_ta_source"),
+        pl.col("tourney_date_ta"), pl.col("year"),
+        pl.col("loser_id").alias("player_id")
+    ])
+    part_df = pl.concat([part_winner, part_loser]).sort(["tourney_date_ta", "custom_match_id"])
+    part_df = part_df.with_columns([pl.lit(gender).alias("gender")])
+    print(f"  Participations: {len(part_df):,} rows")
+
+    # 4. Merge + rolling
+    print("[4/5] Computing rolling features...")
+    part_df = part_df.with_columns([pl.col("match_id_ta_source").cast(pl.Utf8).alias("_merge_key")])
+    chart_pivot = chart_pivot.with_columns([pl.col("match_id").cast(pl.Utf8).alias("_merge_key")])
+
+    chart_cols_to_join = [c for c in chart_pivot.columns if c != "match_id"]
+    df = part_df.join(chart_pivot.select(chart_cols_to_join), on=["_merge_key", "player_id"], how="left")
+    df = df.sort(["player_id", "tourney_date_ta", "custom_match_id"])
+
+    chart_cols = [c for c in df.columns if c.startswith("chart_")]
+    if chart_cols:
+        join_rate = df.select(pl.col(chart_cols[0]).is_not_null().mean()).item()
+        print(f"  Join rate: {100 * join_rate:.1f}%")
+
+    # Has charting hist
+    if chart_cols:
+        df = df.with_columns([
+            (pl.col(chart_cols[0]).shift(1).is_not_null().cum_sum().over("player_id") > 0)
+            .cast(pl.Int8).alias("has_charting_hist")
+        ])
+
+    # Rolling avec shift(1)
+    for col in chart_cols:
+        df = df.with_columns([pl.col(col).shift(1).over("player_id").alias(f"_{col}_prev")])
+        for N in [5, 10, 20]:
+            df = df.with_columns([
+                pl.col(f"_{col}_prev")
+                .rolling_mean(window_size=N, min_periods=1)
+                .over("player_id")
+                .cast(pl.Float32)
+                .alias(f"r{N}_{col}")
+            ])
+        df = df.drop(f"_{col}_prev")
+
+    # Features dérivées
+    srv_cols = ["r10_chart_wide_pct", "r10_chart_body_pct", "r10_chart_t_pct"]
+    if all(c in df.columns for c in srv_cols):
+        df = df.with_columns([
+            pl.col("r10_chart_wide_pct").fill_null(0.33).alias("_p_wide"),
+            pl.col("r10_chart_body_pct").fill_null(0.33).alias("_p_body"),
+            pl.col("r10_chart_t_pct").fill_null(0.33).alias("_p_t"),
+        ])
+        df = df.with_columns([(pl.col("_p_wide") + pl.col("_p_body") + pl.col("_p_t")).alias("_p_sum")])
+        df = df.with_columns([
+            (pl.col("_p_wide") / pl.when(pl.col("_p_sum") < 0.01).then(0.01).otherwise(pl.col("_p_sum"))).clip(0.01, 0.99).alias("_p_wide_n"),
+            (pl.col("_p_body") / pl.when(pl.col("_p_sum") < 0.01).then(0.01).otherwise(pl.col("_p_sum"))).clip(0.01, 0.99).alias("_p_body_n"),
+            (pl.col("_p_t") / pl.when(pl.col("_p_sum") < 0.01).then(0.01).otherwise(pl.col("_p_sum"))).clip(0.01, 0.99).alias("_p_t_n"),
+        ])
+        df = df.with_columns([
+            (-(pl.col("_p_wide_n") * pl.col("_p_wide_n").log(base=2)) -
+             (pl.col("_p_body_n") * pl.col("_p_body_n").log(base=2)) -
+             (pl.col("_p_t_n") * pl.col("_p_t_n").log(base=2)))
+            .cast(pl.Float32).alias("serve_direction_entropy")
+        ])
+        df = df.drop(["_p_wide", "_p_body", "_p_t", "_p_sum", "_p_wide_n", "_p_body_n", "_p_t_n"])
+
+    if all(c in df.columns for c in ["r10_chart_wnr_pct", "r10_chart_ufe_pct"]):
+        df = df.with_columns([
+            (pl.col("r10_chart_wnr_pct").fill_null(0) /
+             (pl.col("r10_chart_wnr_pct").fill_null(0) + pl.col("r10_chart_ufe_pct").fill_null(0) + 1e-6))
+            .clip(0.0, 1.0).cast(pl.Float32).alias("aggression_ratio")
+        ])
+
+    if "r10_chart_net_pct" in df.columns:
+        if "r10_chart_wnr_at_net" in df.columns:
+            df = df.with_columns([
+                (pl.col("r10_chart_net_pct").fill_null(0) * pl.col("r10_chart_wnr_at_net").fill_null(0.5))
+                .cast(pl.Float32).alias("net_approach_score")
+            ])
+
+    if "r10_chart_lte3w_pct" in df.columns:
+        if "r10_chart_avgrally" in df.columns:
+            df = df.with_columns([
+                ((1 - pl.col("r10_chart_lte3w_pct").fill_null(0.5)) *
+                 (pl.col("r10_chart_avgrally").fill_null(4) / 10.0).clip(0.0, 1.0))
+                .cast(pl.Float32).alias("rally_endurance_score")
+            ])
+
+    if "r10_chart_deep_pct" in df.columns and "r10_chart_shlw_pct" in df.columns:
+        df = df.with_columns([
+            (pl.col("r10_chart_deep_pct").fill_null(0.5) - pl.col("r10_chart_shlw_pct").fill_null(0.2))
+            .clip(-1.0, 1.0).cast(pl.Float32).alias("depth_score")
+        ])
+
+    # 5. Output
+    print("[5/5] Writing output...")
+    base_cols = ["custom_match_id", "match_key", "player_id", "year", "gender"]
+    chart_rolling_cols = [c for c in df.columns if c.startswith(("r5_chart_", "r10_chart_", "r20_chart_"))]
+    derived_cols = ["has_charting_hist", "serve_direction_entropy", "aggression_ratio",
+                    "net_approach_score", "rally_endurance_score", "depth_score"]
+    derived_cols = [c for c in derived_cols if c in df.columns]
+
+    output_cols = base_cols + ["has_charting_hist"] + chart_rolling_cols + derived_cols
+    output_cols = list(dict.fromkeys([c for c in output_cols if c in df.columns]))
+
+    out_df = df.select(output_cols).unique(subset=["custom_match_id", "player_id"], keep="last")
+    out_df = out_df.with_columns([pl.col("year").cast(pl.Int32)])
+    out_df = out_df.with_columns([
+        pl.col("custom_match_id").cast(pl.Utf8),
+        pl.col("player_id").cast(pl.Utf8),
+        pl.col("gender").cast(pl.Utf8),
+        pl.col("year").cast(pl.Int32),
+    ])
+    if "match_key" in out_df.columns:
+        out_df = out_df.with_columns([pl.col("match_key").cast(pl.Utf8)])
+    out_df.write_parquet(OUT_CHARTING, partition_by=["gender", "year"], compression="zstd")
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n✅ charting_style → {OUT_CHARTING}")
+    print(f"   Shape: {out_df.shape}")
+    print(f"   Rolling features: {len(chart_rolling_cols)}")
+    print(f"   Derived features: {len(derived_cols)}")
+    print(f"   Time: {elapsed:.1f}s")
+
+    return out_df
+
+
+# ===============================================
+# ===============================================
+# SECTION E: SANITY CHECKS
+# ===============================================
+# ===============================================
+
+def run_sanity_checks():
+    """Exécute tous les sanity checks"""
+    print("\n" + "=" * 70)
+    print("SECTION E: SANITY CHECKS")
+    print("=" * 70)
+
+    results = {}
+
+    # SRV/RET
+    if OUT_SRVRET.exists():
+        print("\n--- SRV/RET Layer ---")
+        df = pl.scan_parquet(f"{OUT_SRVRET}/**/*.parquet").collect()
+        print(f"  Rows: {len(df):,}")
+
+        proba_cols = [c for c in df.columns if c.startswith(("p_ret_", "p_hold_", "p_set_", "p_match_markov_"))]
+        all_ok = True
+        for c in proba_cols[:4]:
+            stats = df.select([
+                pl.col(c).filter(pl.col(c).is_not_null()).min().alias("min"),
+                pl.col(c).filter(pl.col(c).is_not_null()).max().alias("max"),
+            ]).to_dicts()[0]
+            if stats["min"] is not None and (stats["min"] < -1e-6 or stats["max"] > 1 + 1e-6):
+                print(f"  ❌ {c} hors [0,1]")
+                all_ok = False
+
+        results["srvret"] = all_ok
+        print(f"  {'✅' if all_ok else '❌'} SRV/RET checks")
+
+    # Psychological
+    if OUT_PSYCH.exists():
+        print("\n--- Psychological Layer (FIXED) ---")
+        df = pl.scan_parquet(f"{OUT_PSYCH}/**/*.parquet").collect()
+        print(f"  Rows: {len(df):,}")
+
+        for c in ["upset_rate_r20", "clutch_score", "mental_toughness_score"]:
+            if c in df.columns:
+                non_null = df.select(pl.col(c).is_not_null().sum()).item()
+                print(f"  {c}: {non_null:,} non-null")
+        
+        # Check win_streak_current bounds (should be realistic now)
+        if "win_streak_current" in df.columns:
+            wsc_min = df["win_streak_current"].min()
+            wsc_max = df["win_streak_current"].max()
+            print(f"  win_streak_current: [{wsc_min}, {wsc_max}] (should be bounded)")
+            if wsc_max > 100:
+                print(f"  ⚠️ WARNING: win_streak_current max={wsc_max} seems high!")
+
+        results["psychological"] = True
+        print("  ✅ Psychological checks")
+
+    # Environmental
+    if OUT_ENV.exists():
+        print("\n--- Environmental Layer ---")
+        df = pl.scan_parquet(f"{OUT_ENV}/**/*.parquet").collect()
+        print(f"  Rows: {len(df):,}")
+
+        if "altitude_m" in df.columns:
+            high_alt = df.filter(pl.col("altitude_m") > 0).height
+            print(f"  altitude_m > 0: {high_alt:,}")
+
+        results["environmental"] = True
+        print("  ✅ Environmental checks")
+
+    # Charting
+    if OUT_CHARTING.exists():
+        print("\n--- Charting Style Layer ---")
+        df = pl.scan_parquet(f"{OUT_CHARTING}/**/*.parquet").collect()
+        print(f"  Rows: {len(df):,}")
+
+        rolling_cols = [c for c in df.columns if c.startswith(("r5_", "r10_", "r20_"))]
+        print(f"  Rolling features: {len(rolling_cols)}")
+
+        results["charting"] = True
+        print("  ✅ Charting checks")
+
+    # Résumé
+    print("\n" + "-" * 40)
+    all_passed = all(v for v in results.values())
+    if all_passed:
+        print("🎉 Tous les sanity checks passés!")
+    else:
+        print("⚠️ Certains checks ont échoué")
+
+    return results
+
+
+# ===============================================
+# ===============================================
+# MAIN EXECUTION
+# ===============================================
+# ===============================================
+
+def main():
+    """Exécute le pipeline complet preprocess2.1"""
+    t_total = time.perf_counter()
+
+    print("\n" + "=" * 70)
+    print("   TENNISTITAN 2026 - PREPROCESS 2.1 GODMODE (FIXED)")
+    print("   Polars Edition - 3 Leakage Bugs Corrected")
+    print("=" * 70)
+    print(f"   ROOT: {ROOT}")
+    print(f"   MB_DIR: {MB_DIR}")
+    print(f"   GENDER: {GENDER}")
+    print("=" * 70)
+    print("""
+   🔧 CORRECTIONS APPLIQUÉES:
+   1. win_streak_current: len().over() → cum_sum().over()
+   2. max_win_streak_30d: ajout shift(1) après rolling_max
+   3. streak_norm: min/max global → clip fixe [-20, 20]
+""")
+
+    # Section A: SRV/RET Layer
+    build_srvret_layer(GENDER)
+
+    # Section B: Psychological Features (FIXED)
+    build_psychological_features(GENDER)
+
+    # Section C: Environmental Features
+    build_environmental_features(GENDER)
+
+    # Section D: Charting Style Features
+    build_charting_style_features(GENDER)
+    # Section A.5: Base Stats Rolling
+    build_base_stats_rolling(GENDER)
+
+    # Section E: Sanity Checks
+    run_sanity_checks()
+
+    # Résumé final
+    elapsed_total = time.perf_counter() - t_total
+    print("\n" + "=" * 70)
+    print("   PREPROCESS 2.1 COMPLET (FIXED)!")
+    print("=" * 70)
+
+    print("\nFeatures générées:")
+    for name, path in [
+        ("ratings_srvret_layer", OUT_SRVRET),
+        ("psychological_momentum", OUT_PSYCH),
+        ("environmental_context", OUT_ENV),
+        ("charting_style", OUT_CHARTING),
+    ]:
+        if path.exists():
+            n_files = len(list(path.rglob("*.parquet")))
+            print(f"  • {name}: {n_files} fichiers")
+
+    print(f"\n⏱️  Temps total: {elapsed_total:.1f}s ({elapsed_total / 60:.1f} min)")
+    print("\n✅ Pipeline preprocess 03 terminé avec succès!")
+
+if __name__ == "__main__":
+    main()

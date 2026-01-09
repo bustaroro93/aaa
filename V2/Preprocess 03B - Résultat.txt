@@ -1,0 +1,103 @@
+======================================================================
+   PP03B v2 - PLAYER ATTRIBUTES (SANS CONFLITS)
+======================================================================
+   2026-01-08 18:24:58
+   Features: Backhand, Rolling vs Lefty, Physical, Duration
+======================================================================
+
+[1] Loading players_ref...
+  Loaded 8,023 players, 22 columns
+
+[2] Loading matches_base...
+  Loaded 544,245 matches
+
+============================================================
+SECTION 1: BACKHAND MATCHUP FEATURES (NOUVEAU)
+============================================================
+  Players with backhand info: 3,371 (42.0%)
+
+  📊 BACKHAND MATCHUP STATS:
+     2Hv2H: 218,992 (40.2%)
+     2HvU: 107,042 (19.7%)
+     Uv2H: 63,367 (11.6%)
+     UvU: 43,327 (8.0%)
+     1Hv2H: 33,252 (6.1%)
+     2Hv1H: 33,188 (6.1%)
+
+============================================================
+SECTION 2: ROLLING PERFORMANCE VS LEFTIES (NOUVEAU)
+============================================================
+  Creating temporary hand columns...
+  Player-match rows: 1,088,490
+  Valid r20_win_rate_vs_lefty: 78,139 (7.2%)
+  Mean win rate vs lefty: 0.513
+
+============================================================
+SECTION 3: PHYSICAL MATCHUP (NOUVEAU - PP08E)
+============================================================
+  Players with height: 3,264 (40.7%)
+  Matches with height: 323,827 (59.5%)
+  Mean height diff: 0.8 cm
+  Mean height A: 182.9 cm
+
+============================================================
+SECTION 4: DURATION FEATURES (NOUVEAU - PP05B)
+============================================================
+  Valid duration: 200,859 (36.9%)
+  Global average duration: 101.4 min
+  Player-match rows: 1,088,490
+
+  Matches with r20_avg_duration: 254,982 (46.9%)
+  Mean r20_avg_duration_A: 101.4 min
+
+======================================================================
+   SUMMARY
+======================================================================
+  Original columns: 99
+  New columns: 33
+  Final shape: (544245, 132)
+
+  📊 NEW FEATURES (33):
+     ✅ backhand_A: (categorical)
+     ✅ backhand_B: (categorical)
+     ✅ bh_advantage_A: 100.0% coverage
+     ✅ bh_matchup_type: (categorical)
+     ✅ bmi_A: 82.1% coverage
+     ✅ bmi_B: 71.9% coverage
+     ✅ bmi_diff: 59.0% coverage
+     ✅ both_grinders: 100.0% coverage
+     ✅ both_quick: 100.0% coverage
+     ✅ diff_avg_duration: 32.6% coverage
+     ✅ diff_win_rate_vs_lefty: 0.7% coverage
+     ✅ duration_style_A: (categorical)
+     ✅ duration_style_B: (categorical)
+     ✅ grinder_vs_quick_A: 100.0% coverage
+     ✅ height_A: 82.4% coverage
+     ✅ height_B: 72.2% coverage
+     ✅ height_advantage_A: 100.0% coverage
+     ✅ height_diff: 59.5% coverage
+     ✅ is_1h_backhand_A: 100.0% coverage
+     ✅ is_1h_backhand_B: 100.0% coverage
+     ✅ r20_avg_duration_A: 46.9% coverage
+     ✅ r20_avg_duration_B: 39.0% coverage
+     ✅ r20_matches_vs_lefty_A: 100.0% coverage
+     ✅ r20_matches_vs_lefty_B: 100.0% coverage
+     ✅ r20_std_duration_A: 46.9% coverage
+     ✅ r20_std_duration_B: 39.0% coverage
+     ✅ r20_win_rate_vs_lefty_A: 7.6% coverage
+     ✅ r20_win_rate_vs_lefty_B: 6.8% coverage
+     ✅ r20_wins_vs_lefty_A: 100.0% coverage
+     ✅ r20_wins_vs_lefty_B: 100.0% coverage
+     ✅ weight_A: 82.8% coverage
+     ✅ weight_B: 72.8% coverage
+     ✅ weight_diff: 60.2% coverage
+
+  ✅ Saved to C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\player_attributes\player_attributes_v2_match_level.parquet
+
+  ⏱️ Total time: 1.3s
+
+======================================================================
+   NEXT STEPS:
+   1. Run PP03B_merge.py to integrate into ML_READY
+   2. Run PP03C for Glicko vs Opponent Hand
+======================================================================

@@ -1,0 +1,343 @@
+📁 Using: SOTA_v6 → matches_ml_ready_SOTA_v6.parquet
+
+======================================================================
+   PP_09 - NASA GOD MODE SOTA 2026
+   TennisTitan - Anti-Leakage FINAL
+======================================================================
+   Timestamp: 2026-01-06 22:49:01
+   RANK_MODE: ultimate
+   EXCLUDE_ODDS: True
+   OUTPUT_DIR: C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_final_no_odds
+======================================================================
+
+======================================================================
+   SECTION 1: LOAD DATASET
+======================================================================
+
+  Loading C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_ready\matches_ml_ready_SOTA_v6.parquet...
+  Shape: (543927, 1447)
+  After surface filter: 543866 (removed 61)
+  🧹 Early dropped 4 leakage cols
+
+  🔍 Validating paired features...
+  ✅ Validated 25 protected features
+
+======================================================================
+   CELLULE A: FORM/FATIGUE FEATURES
+======================================================================
+
+[A.1] Adding is_vs_top10/50...
+  ⏭️ Skipped in RANK_MODE=ultimate (using neutral rank features instead)
+
+[A.2] Adding rounds_played_tourney...
+  ✅ rounds_played_approx_A/B
+
+[A.3] Adding entry type flags...
+  ✅ is_qualifier/wildcard/lucky_loser
+
+[A.4] Adding fatigue_qualifs...
+  ✅ fatigue_qualifs_A/B
+
+[A.5] Checking r20_win_rate_vs_top10...
+  ✅ r20_win_rate_vs_top10_A exists (coverage: 5.1%)
+  ✅ r20_win_rate_vs_top10_B exists (coverage: 3.3%)
+
+  Cellule A: 9 features added
+
+======================================================================
+   CELLULE B: CYCLIC ENCODING & FATIGUE INDEX
+======================================================================
+
+[B.1] Adding cyclic temporal features...
+  ✅ month_sin/cos, week_sin/cos, dow_sin/cos, season_progress
+
+[B.2] Adding cumulative fatigue index...
+  ✅ cumulative_fatigue_index_A (qualifs)
+  ✅ cumulative_fatigue_index_B (qualifs)
+  ✅ fatigue_advantage_A (A-B: positif = A moins fatigué)
+
+  Cellule B: 12 features added
+
+======================================================================
+   CELLULE C: PLAYERS ENRICHMENT
+======================================================================
+
+  Loading players from C:\Users\Administrateur\Tennis POLAR v3\data_atp_detailed\atp_master_players.csv...
+  Loaded 8023 players
+  Using ID column: atp_id_ref
+  ✅ Player features joined
+  ✅ age_at_match_A
+  ✅ pro_career_len_A
+  ✅ age_at_match_B
+  ✅ pro_career_len_B
+
+  Cellule C: 16 features added
+
+======================================================================
+   CELLULE F: AGE-PEAK FEATURES
+======================================================================
+  🧹 Dropped 8 incorrect PP08 age features
+  🔍 age_A column: age_at_match_A
+  🔍 age_B column: age_at_match_B
+  📊 age_at_match_A: null=7.4%, nan=0.0%
+  ✅ Age-Peak features added
+     age_from_peak coverage: 92.6%
+
+  Cellule F: 0 features added
+
+======================================================================
+   CELLULE D: TOURNEY SPEED INDEX
+======================================================================
+
+  ✅ tourney_speed_index exists (coverage: 100.0%)
+
+  ✅ pref_ssi_A/B exist (from PP05)
+
+  Adding speed sensitivity...
+  ⚠️ speed_sensitivity_A (defaulted)
+  ⚠️ speed_sensitivity_B (defaulted)
+  ✅ inter__speed_matchup
+
+  Cellule D: 3 features added
+
+======================================================================
+   CELLULE E: META-FEATURES
+======================================================================
+
+[E.1] Adding logit transforms...
+
+[E.2] Adding charting meta-features...
+
+[E.3] Adding SSI mismatch...
+  ✅ pref_ssi_A/B exist (from PP05)
+
+[E.4] Adding rank interactions (symmetric only)...
+  ⏭️ Skipped in ultimate mode (using neutral rank features later)
+
+[E.5] Adding rest advantage...
+
+[E.6] Adding Glicko surface gaps...
+
+[E.7] Adding mental/clutch gaps...
+  ✅ mental_gap
+  ✅ clutch_gap
+  ✅ upset_rate_gap
+  ✅ comeback_rate_gap
+  ✅ win_streak_gap
+
+  Cellule E: 12 features added
+
+======================================================================
+   FEATURE SUMMARY
+======================================================================
+  Total columns before shuffle: 1495
+
+======================================================================
+   SECTION 3: SHUFFLE A/B
+======================================================================
+  Swapping 271,500 rows (49.9%)
+  Paired features to swap: 628
+  ✅ Inverted 23 diff* cols on swap
+  ✅ Auto-inverted 21 signed cols on swap:
+      - age_peak_advantage_A
+      - career_trajectory_advantage_A
+      - clutch_advantage_A
+      - clutch_gap
+      - comeback_rate_gap
+      - fatigue_advantage_A
+      - form_slope_diff
+      - h2h_advantage_A
+      - handedness_advantage_A
+      - inter__speed_matchup
+      ... and 11 more
+
+  Target distribution:
+    0: 271,500 (49.9%)
+    1: 272,366 (50.1%)
+
+  ✅ Renamed winner_id/loser_id → player_A_id/player_B_id
+
+======================================================================
+   POST-SHUFFLE GLICKO PROBABILITY (NASA ANTI-LEAK)
+======================================================================
+  Using: g2_global_rating_A, g2_global_rating_B
+  ✅ glicko_prob_A, glicko_prob_surface_A, glicko_prob_blend_A (POST-SHUFFLE)
+
+======================================================================
+   POST-SHUFFLE MARKOV CHAIN (NASA ANTI-LEAK)
+======================================================================
+  p_srv_pt_prior_A: mean=nan
+  p_srv_pt_prior_B: mean=nan
+  ✅ Markov POST-SHUFFLE: p_match_A mean=nan
+
+======================================================================
+   NEUTRAL RANK FEATURES (NASA ULTIME)
+======================================================================
+  📁 Loaded 504,146 ranking entries
+  ✅ Neutral ranks joined
+     Coverage: A=95.6%, B=95.6%
+  ✅ diff_log_rank, is_underdog_A, diff_rank_normalized
+  ✅ rank_best, rank_worst, has_top10_player, has_top50_player, rank_gap
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_3112\3877966580.py:1411: UserWarning: Sortedness of columns cannot be checked when 'by' groups provided
+  joined_A = left_A.join_asof(
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_3112\3877966580.py:1429: UserWarning: Sortedness of columns cannot be checked when 'by' groups provided
+  joined_B = left_B.join_asof(
+
+  🔍 Info: corr(target, diff_log_rank) = 0.3179
+  ✅ Dropped absolute ranks: ['rank_pre_A', 'rank_pre_B'] (using derived features only)
+
+======================================================================
+   SKIP ODDS CONVERSION (EXCLUDE_ODDS=True)
+======================================================================
+  ⏭️ Odds conversion skipped
+  ✅ has_odds set to 0 for all rows (not protected)
+
+======================================================================
+   DROP OUTCOME-CONDITIONED COLS (LEAKAGE STRUCTUREL)
+======================================================================
+  🧹 Dropping 8 outcome-conditioned columns:
+      Known leakage: 0
+      w_/l_ stats: 0
+      winner_/loser_: 2
+      Intermediate p_*: 2
+      Redundant ranks: 0
+      Rank oriented (NASA): 2
+      Absolute ranks (NASA): 2
+        - winner_rank_ta
+        - loser_rank_ta
+        - p_srv_pt_A
+        - p_srv_pt_B
+        - rank_diff_A_minus_B
+        - rank_ratio_A_over_B
+        - rank_best
+        - rank_worst
+
+  🧪 NASA CHECK - Remaining winner/loser structural cols: 0
+     ✅ CLEAN - No structural leakage!
+
+  ✅ FINAL NASA CHECK: 0 winner/loser columns remaining - CLEAN!
+
+  ✅ Dropped is_swapped (not for training)
+
+======================================================================
+   SECTION 4: TEMPORAL SPLIT
+======================================================================
+
+  Train: 389,364 rows (≤2019)
+  Val:   64,794 rows (2020-2022)
+  Test:  89,708 rows (>2022)
+
+======================================================================
+   SECTION 5: FEATURE SELECTION
+======================================================================
+
+[5.0] 🔍 NASA AUDIT: Detecting unpaired _A/_B features...
+  ✅ Kept 11 allowlisted unpaired features (post-shuffle, safe):
+      + age_peak_advantage_A
+      + career_trajectory_advantage_A
+      + clutch_advantage_A
+      + deep_run_confidence_A
+      + fatigue_advantage_A
+      + fatigue_momentum_A
+      + h2h_advantage_A
+      + handedness_advantage_A
+      + is_underdog_A
+      + rest_advantage_A
+      ... and 1 more
+  🔴 Found 3 SUSPICIOUS unpaired features (LEAKAGE RISK!):
+      - glicko_prob_A
+      - glicko_prob_blend_A
+      - glicko_prob_surface_A
+  ✅ Dropped 3 suspicious unpaired features
+
+  ℹ️ has_odds excluded from features (meta only for blend)
+  ⚠️ EXCLUDE_ODDS=True: Excluding 5 odds-related features
+
+[5.1] Initial numeric features: 1461
+[5.1b] Protected SOTA features: 25
+       tourney_speed_index: 100.0%
+       pref_ssi_A: 100.0%
+       pref_ssi_B: 100.0%
+       diff_pref_ssi: 100.0%
+       diff_ssi_mismatch: 100.0%
+       srgs_A: 100.0%
+       srgs_B: 100.0%
+       srgs_diff: 100.0%
+       r20_win_rate_vs_top10_A: 4.6%
+       r20_win_rate_vs_top10_B: 4.6%
+       r20_win_rate_vs_top50_A: 15.3%
+       r20_win_rate_vs_top50_B: 15.3%
+       r20_upset_rate_A: 89.2%
+       r20_upset_rate_B: 89.1%
+       r20_choke_rate_A: 95.8%
+       r20_choke_rate_B: 95.8%
+       r20_comeback_rate_A: 95.8%
+       r20_comeback_rate_B: 95.8%
+       win_rate_vs_top10_A: 15.3%
+       win_rate_vs_top10_B: 15.3%
+       win_rate_vs_top50_A: 25.2%
+       win_rate_vs_top50_B: 25.2%
+       adj_dominance_score_A: 100.0%
+       adj_dominance_score_B: 100.0%
+       diff_adj_dominance_score: 100.0%
+[5.2] After null filter: 722
+[5.3] After variance filter: 582
+
+  Top 10 by correlation:
+    diff_log_rank: 0.3312
+    diff_win_rate_vs_top20: 0.2817
+    diff_win_rate_vs_top50: 0.2813
+    diff_win_rate_vs_top10: 0.2788
+    diff_win_rate_vs_top200: 0.2657
+    diff_win_rate_vs_top100: 0.2631
+    g2_level_X_confidence_B: 0.2504
+    g2_level_X_confidence_A: 0.2501
+    diff_rank_normalized: 0.2452
+    win_streak_20_B: 0.2359
+
+  Selected: 200 features
+    - Protected SOTA: 25
+    - Regular: 175
+  ✅ Schema identical across train/val/test (211 cols)
+
+======================================================================
+   SECTION 6: QUANTILE SCALING
+======================================================================
+
+  Scaling 200 features
+  (Excluded from scaling: ['has_odds'])
+  Scaler saved: C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_final_no_odds\quantile_scaler.joblib
+
+======================================================================
+   SECTION 7: EXPORT
+======================================================================
+
+  🕐 Sorting splits by date before export...
+     ✅ Sorted by tourney_date_ta
+
+  ✅ Exported to C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_final_no_odds
+     train.parquet: 389,364 rows
+     val.parquet: 64,794 rows
+     test.parquet: 89,708 rows
+
+======================================================================
+   ✅ PP_09 NASA COMPLETE! Time: 27.6s
+======================================================================
+
+📊 FINAL SUMMARY:
+   Train: 389,364 rows
+   Val: 64,794 rows
+   Test: 89,708 rows
+   Features: 200
+   Rank Mode: ultimate
+   Exclude Odds: True
+   Output: C:\Users\Administrateur\Tennis POLAR v3\data_clean\ml_final_no_odds
+
+✅ NASA ANTI-LEAKAGE CHECKS:
+   - is_swapped used for post-shuffle (not target_A_wins)
+   - IDs renamed to player_A_id/player_B_id
+   - All winner_/loser_/w_/l_ cols dropped
+   - SRGS features KEPT (paired _A/_B, no leakage)
+   - Markov features KEPT (properly paired _A/_B from PP08B v5)
+   - Post-shuffle advantage features KEPT (allowlisted)
+   - Ranks from historical table (NASA ULTIME) ✅

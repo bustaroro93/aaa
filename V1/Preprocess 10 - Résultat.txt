@@ -1,0 +1,364 @@
+======================================================================
+   PP_10 - NASA GOD MODE v6 FINAL
+   OOF META + BLEND CAPÉ + LOGLOSS OPTIMIZATION
+======================================================================
+   2026-01-07 09:31:49
+   Seeds: [42, 123, 456, 789, 2024]
+   Folds: 5
+   Alpha max: 0.4
+======================================================================
+
+   ✅ NASA GOD MODE FEATURES:
+   - OOF-based meta training (TimeSeriesSplit)
+   - Optimize α on LogLoss (not hit-rate)
+   - Blend conditionnel on has_odds
+   - Cap α ≤ 40%
+   - Multi-seed (5 seeds)
+   - Isotonic calibration
+
+
+[1/6] Loading dual datasets...
+
+======================================================================
+   LOAD DUAL DATASETS (NASA GOD MODE)
+======================================================================
+
+  📋 Loading feature lists from JSON...
+     NO_ODDS features: 200
+     WITH_ODDS features: 200
+
+  📁 Loading NO_ODDS dataset...
+     Train: (389364, 211), Val: (64794, 211), Test: (89708, 211)
+
+  📁 Loading WITH_ODDS dataset...
+     Train: (389364, 211), Val: (64794, 211), Test: (89708, 211)
+
+  🕐 Sorting by tourney_date_ta (CRITICAL for TimeSeriesSplit)...
+     ✅ Verified: train is correctly sorted by ['tourney_date_ta', 'custom_match_id']
+     Date range: 1990-03-05 → 2019-12-30
+
+  📊 has_odds extraction...
+     has_odds dtype: Int8
+     has_odds min/max: 0.0000 / 1.0000
+     has_odds sample: [0 0 0 0 0]
+
+  📊 has_odds distribution:
+     Train: 9.7% with real odds (37,906/389,364)
+     Val:   7.8% with real odds (5,080/64,794)
+     Test:  6.1% with real odds (5,487/89,708)
+
+  🔍 Checking for leakage...
+     ✅ NO_ODDS - No suspicious correlations
+     ✅ WITH_ODDS - No suspicious correlations
+
+======================================================================
+   PRE-FLIGHT LEAKAGE CHECKS
+======================================================================
+
+🔎 Sanity NO_ODDS: 0 odds-like features found
+
+🔎 Sanity WITH_ODDS: 5 odds-like features found
+   ⚠️ Examples: ['odds_implied_prob_A', 'odds_implied_prob_B', 'log_odds_ratio_AB', 'odds_A', 'odds_B']
+
+🧪 Running TIME-AWARE permutation probe (DATE-GROUPED)...
+   Cutoff date: 2019-09-14
+   Train dates: 2018-02-12 → 2019-09-13
+   Val dates:   2019-09-14 → 2019-12-30
+   AUC real=0.8431 | AUC shuffled=0.4948
+
+🔍 Single-feature AUC scan...
+   Top single-feature AUC (symmetric):
+   ⚠️ 0.6975  diff_log_rank
+   ⚠️ 0.6485  diff_rank_normalized
+   ⚠️ 0.6382  srvret_delta_srv120_self_minus_opp_B
+   ⚠️ 0.6382  srvret_delta_srv120_self_minus_opp_A
+   ⚠️ 0.6302  win_streak_20_A
+   ⚠️ 0.6289  win_streak_20_B
+   ⚠️ 0.6220  win_streak_10_A
+   ⚠️ 0.6198  win_streak_10_B
+   ⚠️ 0.6182  max_loss_streak_30d_A
+   ⚠️ 0.6168  max_win_streak_30d_A
+   ⚠️ 0.6156  max_win_streak_30d_B
+   ⚠️ 0.6152  max_loss_streak_30d_B
+   ⚠️ 0.6052  win_streak_gap
+   ⚠️ 0.6016  g2_global_n_matches_B
+   ⚠️ 0.6016  g2_vs_lefty_U_n_matches_B
+
+======================================================================
+   ✅ PRE-FLIGHT CHECKS PASSED (AUC real=0.8431)
+======================================================================
+
+[2/6] Training SOTA stack (no_odds) - NASA OOF MODE...
+
+  ============================================================
+  TRAINING STACK: SOTA (no_odds) (NASA OOF MODE)
+  ============================================================
+
+  [1/3] Computing OOF predictions...
+    Computing OOF for LGBM...
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+      LGBM: AUC=0.8129, LogLoss=0.5217, Coverage=99.2%
+    Computing OOF for XGB...
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+      XGB: AUC=0.8083, LogLoss=0.5286, Coverage=99.2%
+    Computing OOF for CAT...
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+      CAT: AUC=0.8208, LogLoss=0.5099, Coverage=99.2%
+
+  OOF Coverage: 99.2% (386,388/389,364)
+
+  [2/3] Training meta-learner on OOF (NASA mode)...
+    META OOF: AUC=0.8207, LogLoss=0.5152
+    Weights: lgbm=-0.178, xgb=-0.233, cat=6.067
+
+  [3/3] Training final models on full train...
+    LGBM VAL: AUC=0.8443, LogLoss=0.4757
+    XGB VAL: AUC=0.8457, LogLoss=0.4731
+    CAT VAL: AUC=0.8487, LogLoss=0.4695
+    META VAL: AUC=0.8488, LogLoss=0.4800
+
+[3/6] Training MARKET stack (with_odds) - NASA OOF MODE...
+
+  ============================================================
+  TRAINING STACK: MARKET (with_odds) (NASA OOF MODE)
+  ============================================================
+
+  [1/3] Computing OOF predictions...
+    Computing OOF for LGBM...
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+      LGBM: AUC=0.8136, LogLoss=0.5211, Coverage=99.2%
+    Computing OOF for XGB...
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+      XGB: AUC=0.8090, LogLoss=0.5278, Coverage=99.2%
+    Computing OOF for CAT...
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+    Fold 1: train_max=1997-02-03 | val_min=1997-02-07 | val_max=2000-05-01
+    Fold 2: train_max=2000-05-01 | val_min=2000-05-08 | val_max=2005-08-29
+    Fold 3: train_max=2005-08-29 | val_min=2005-09-05 | val_max=2010-06-14
+    Fold 4: train_max=2010-06-14 | val_min=2010-06-21 | val_max=2014-09-22
+    Fold 5: train_max=2014-09-22 | val_min=2014-09-29 | val_max=2019-11-24
+      CAT: AUC=0.8218, LogLoss=0.5090, Coverage=99.2%
+
+  OOF Coverage: 99.2% (386,388/389,364)
+
+  [2/3] Training meta-learner on OOF (NASA mode)...
+    META OOF: AUC=0.8217, LogLoss=0.5139
+    Weights: lgbm=-0.404, xgb=-0.147, cat=6.232
+
+  [3/3] Training final models on full train...
+    LGBM VAL: AUC=0.8445, LogLoss=0.4754
+    XGB VAL: AUC=0.8461, LogLoss=0.4726
+    CAT VAL: AUC=0.8493, LogLoss=0.4688
+    META VAL: AUC=0.8495, LogLoss=0.4791
+
+[4/6] Predicting on val and test...
+
+[5/6] Optimizing blend alpha (on LogLoss)...
+
+======================================================================
+   OPTIMIZE BLEND ALPHA (on LogLoss, capped at 40%)
+======================================================================
+
+  Matchs with odds in val: 5,080 (7.8%)
+  α=0.00: LL_odds=0.2414, AUC_odds=0.9715, HR_odds=0.8906
+  α=0.05: LL_odds=0.2409, AUC_odds=0.9717, HR_odds=0.8909
+  α=0.10: LL_odds=0.2403, AUC_odds=0.9718, HR_odds=0.8906
+  α=0.15: LL_odds=0.2398, AUC_odds=0.9720, HR_odds=0.8904
+  α=0.20: LL_odds=0.2393, AUC_odds=0.9722, HR_odds=0.8909
+  α=0.25: LL_odds=0.2388, AUC_odds=0.9724, HR_odds=0.8906
+  α=0.30: LL_odds=0.2384, AUC_odds=0.9725, HR_odds=0.8919
+  α=0.35: LL_odds=0.2380, AUC_odds=0.9727, HR_odds=0.8927
+  α=0.40: LL_odds=0.2376, AUC_odds=0.9729, HR_odds=0.8921
+
+  ✅ Best α = 0.40 (LogLoss_odds=0.2376)
+
+[6/6] Applying Isotonic Calibration...
+
+======================================================================
+   FINAL RESULTS (NASA GOD MODE)
+======================================================================
+
+  📊 Individual stacks (TEST):
+    SOTA (no_odds):   HR=0.7628, AUC=0.8565, LL=0.4702
+    MARKET (w/odds):  HR=0.7627, AUC=0.8567, LL=0.4698
+
+  📊 BLEND (α=0.40) on TEST:
+    Pre-cal:  HR=0.7629, AUC=0.8565, LL=0.4701
+    Post-cal: HR=0.7625, AUC=0.8563, LL=0.4605
+    Brier=0.1546, ECE=0.0087
+
+  📊 Breakdown by has_odds (TEST):
+    NO odds: n=84,221, HR=0.7512, AUC=0.8423, LL=0.4817
+    WITH odds: n=5,487, HR=0.9351, AUC=0.9895, LL=0.1346
+
+======================================================================
+   SAVE ARTIFACTS
+======================================================================
+  ✅ Models saved to C:\Users\Administrateur\Tennis POLAR v3\models\stack_blend_v6_nasa
+  ✅ Metrics saved
+
+======================================================================
+   ✅ PP_10 NASA GOD MODE v6 COMPLETE!
+   Time: 288.3 min
+======================================================================
+
+📋 NASA GOD MODE SUMMARY:
+   - SOTA model: 200 features, OOF coverage=99.2%
+   - MARKET model: 200 features, OOF coverage=99.2%
+   - Best α: 0.40 (optimized on LogLoss, capped at 40%)
+   
+📊 FINAL TEST RESULTS:
+   HitRate: 0.7625 (76.25%)
+   AUC:     0.8563
+   LogLoss: 0.4605
+   ECE:     0.0087
+   
+🎯 BLEND LOGIC:
+   - has_odds=0: 100% SOTA
+   - has_odds=1: 60% SOTA + 40% MARKET
+
+✅ NASA GOD MODE FEATURES:
+   - OOF-based meta (not val-based) ✅
+   - α optimized on LogLoss (not hit-rate) ✅
+   - TimeSeriesSplit with temporal sort ✅
+   - Multi-seed averaging ✅
+   - Isotonic calibration ✅

@@ -1,0 +1,771 @@
+# ===============================================
+# PP_08B - ULTIMATE GOD SOTA FEATURES 2026 v5
+# TennisTitan - FINAL VERSION (Markov _B fix)
+# ===============================================
+#
+# CORRECTIONS v5:
+#   ✅ Markov: Ajout des versions _B (p_set_B, p_match_B, edge_B)
+#   ✅ fill_nan() + fill_null() partout (NaN ≠ null en Polars)
+#   ✅ when/then natif (10x+ rapide)
+#   ✅ Détection dynamique winner_id/loser_id
+#
+# Input: ml_ready/matches_ml_ready_SOTA_v4.parquet
+# Output: ml_ready/matches_ml_ready_SOTA_v5.parquet
+# ===============================================
+
+import polars as pl
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+import time
+import warnings
+warnings.filterwarnings("ignore")
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+ML_READY_DIR = DATA_CLEAN / "ml_ready"
+PLAYERS_MASTER = ROOT / "data_atp_detailed" / "atp_master_players.csv"
+
+SOTA_CANDIDATES = [
+    ML_READY_DIR / "matches_ml_ready_SOTA_v4.parquet",
+    ML_READY_DIR / "matches_ml_ready_SOTA_v3.parquet",
+    ML_READY_DIR / "matches_ml_ready_SOTA_v2.parquet",
+    ML_READY_DIR / "matches_ml_ready_SOTA.parquet",
+]
+
+
+# ===============================================
+# HELPER: Safe fill (NaN + null)
+# ===============================================
+def safe_fill(col_name: str, default: float) -> pl.Expr:
+    """
+    Remplace NaN ET null par default.
+    
+    CRITIQUE: En Polars, NaN ≠ null !
+    - null = valeur manquante (comme None en Python)
+    - NaN = valeur IEEE 754 (comme float('nan'))
+    
+    fill_null() ne gère que null, pas NaN.
+    """
+    return pl.col(col_name).fill_nan(default).fill_null(default)
+
+
+def find_col(df: pl.DataFrame, patterns: list, suffix: str = "_A") -> str | None:
+    """Find first matching column."""
+    for pattern in patterns:
+        for col in df.columns:
+            if pattern in col.lower() and col.endswith(suffix):
+                return col
+    return None
+
+
+# ===============================================
+# HELPER: Round mapping (natif Polars)
+# ===============================================
+def get_round_difficulty_expr(col_name: str = "round_ta") -> pl.Expr:
+    """when/then natif = 10x+ plus rapide que map_elements"""
+    round_expr = pl.col(col_name).str.to_uppercase()
+    return (
+        pl.when(round_expr == "R128").then(1)
+          .when(round_expr == "R64").then(2)
+          .when(round_expr == "R32").then(3)
+          .when(round_expr == "R16").then(4)
+          .when(round_expr == "QF").then(5)
+          .when(round_expr == "SF").then(6)
+          .when(round_expr == "F").then(7)
+          .when(round_expr == "RR").then(3)
+          .when(round_expr == "Q1").then(0)
+          .when(round_expr == "Q2").then(0)
+          .when(round_expr == "Q3").then(1)
+          .otherwise(3)
+          .cast(pl.Int8)
+    )
+
+
+# ===============================================
+# SECTION 1: SRGS (NaN-SAFE v4)
+# ===============================================
+
+def _p_hold_expr(col_name: str) -> pl.Expr:
+    """P(hold) depuis un NOM DE COLONNE."""
+    p = pl.col(col_name)
+    q = 1 - p
+    p_win_before = p**4 + 4 * p**4 * q + 10 * p**4 * q**2
+    p_deuce = 20 * (p**3) * (q**3)
+    p_win_deuce = (p**2) / (p**2 + q**2 + 0.0001)
+    return (p_win_before + p_deuce * p_win_deuce).clip(0.55, 0.95)
+
+
+def _p_hold_from_expr(p: pl.Expr) -> pl.Expr:
+    """P(hold) depuis une EXPRESSION Polars."""
+    q = 1 - p
+    p_win_before = p**4 + 4 * p**4 * q + 10 * p**4 * q**2
+    p_deuce = 20 * (p**3) * (q**3)
+    p_win_deuce = (p**2) / (p**2 + q**2 + 0.0001)
+    return (p_win_before + p_deuce * p_win_deuce).clip(0.55, 0.95)
+
+
+def add_srgs_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    SRGS - VERSION NASA ANTI-LEAK.
+    
+    ✅ Utilise p_srv_pt_prior (rolling historique) au lieu des stats du match.
+    """
+    print("\n[1/8] Adding SRGS features (NASA PRIOR-ONLY)...")
+    
+    DEFAULT_P_SRV = 0.63
+    DEFAULT_RPW = 0.36
+    
+    for suffix in ["_A", "_B"]:
+        # ✅ Chercher les colonnes PRIOR en priorité (NASA safe)
+        p_srv_col = f"p_srv_pt_prior{suffix}"
+        rpw_col = f"rpw_prior{suffix}"
+        
+        if p_srv_col in df.columns:
+            print(f"  ✅ Using PRIOR: {p_srv_col}")
+            df = df.with_columns([
+                safe_fill(p_srv_col, DEFAULT_P_SRV).clip(0.50, 0.75).alias(f"p_srv_pt{suffix}")
+            ])
+        else:
+            print(f"  ⚠️ {p_srv_col} not found, using default")
+            df = df.with_columns([
+                pl.lit(DEFAULT_P_SRV).cast(pl.Float32).alias(f"p_srv_pt{suffix}")
+            ])
+        
+        # P(hold)
+        df = df.with_columns([
+            _p_hold_expr(f"p_srv_pt{suffix}").alias(f"p_hold{suffix}")
+        ])
+        
+        # P(break) depuis RPW prior
+        if rpw_col in df.columns:
+            df = df.with_columns([
+                (1 - _p_hold_from_expr(1 - safe_fill(rpw_col, DEFAULT_RPW)))
+                .clip(0.10, 0.45)
+                .alias(f"p_break{suffix}")
+            ])
+        else:
+            df = df.with_columns([
+                pl.lit(0.20).cast(pl.Float32).alias(f"p_break{suffix}")
+            ])
+    
+    # SRGS composite
+    # SRGS composite - Step 1: Create A and B
+    df = df.with_columns([
+        (pl.col("p_hold_A") * pl.col("p_break_A")).sqrt().alias("srgs_A"),
+        (pl.col("p_hold_B") * pl.col("p_break_B")).sqrt().alias("srgs_B"),
+    ])
+
+    # SRGS composite - Step 2: Create diff
+    df = df.with_columns([
+        (pl.col("srgs_A") - pl.col("srgs_B")).alias("srgs_diff"),
+    ])
+    
+    print(f"  ✅ SRGS features added (NASA ANTI-LEAK)")
+    return df
+
+
+# ===============================================
+# SECTION 2: MARKOV (NaN-SAFE + _B VERSIONS)
+# ===============================================
+
+def add_full_markov_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Full Markov Chain - NaN-SAFE.
+    
+    ✅ FIX v5: Ajout des versions _B pour toutes les features Markov
+    - markov_p_set_B = 1 - markov_p_set_A
+    - markov_p_match_B = 1 - markov_p_match_A  
+    - markov_edge_B = -markov_edge_A
+    """
+    print("\n[2/8] Adding Full Markov Chain features (v5 avec _B)...")
+    
+    DEFAULT_P_SRV = 0.63
+    
+    def safe_get_numpy(col_name: str, default: float) -> np.ndarray:
+        if col_name in df.columns:
+            arr = df[col_name].to_numpy().astype(np.float64)
+            arr = np.where(np.isnan(arr), default, arr)
+            return arr
+        return np.full(len(df), default)
+    
+    # ✅ NASA: Utiliser les PRIORS (pas les stats du match)
+    p_A = safe_get_numpy("p_srv_pt_prior_A", DEFAULT_P_SRV)
+    p_B = safe_get_numpy("p_srv_pt_prior_B", DEFAULT_P_SRV)
+    
+    # Fallback sur p_srv_pt si les priors n'existent pas
+    if "p_srv_pt_prior_A" not in df.columns:
+        print("  ⚠️ p_srv_pt_prior_A not found, falling back to p_srv_pt_A")
+        p_A = safe_get_numpy("p_srv_pt_A", DEFAULT_P_SRV)
+    if "p_srv_pt_prior_B" not in df.columns:
+        print("  ⚠️ p_srv_pt_prior_B not found, falling back to p_srv_pt_B")
+        p_B = safe_get_numpy("p_srv_pt_B", DEFAULT_P_SRV)
+    
+    print(f"     p_srv_pt_A: mean={np.mean(p_A):.4f}, min={np.min(p_A):.4f}, max={np.max(p_A):.4f}")
+    
+    def p_game_vec(p: np.ndarray) -> np.ndarray:
+        q = 1 - p
+        p_deuce = 20 * (p ** 3) * (q ** 3)
+        denom = p ** 2 + q ** 2
+        p_win_deuce = np.where(denom < 1e-10, 0.5, (p ** 2) / denom)
+        p_win_before = p**4 + 4 * p**4 * q + 10 * p**4 * q**2
+        return np.clip(p_win_before + p_deuce * p_win_deuce, 0.01, 0.99)
+    
+    p_hold_A = p_game_vec(p_A)
+    p_hold_B = p_game_vec(p_B)
+    
+    p_break_A = 1 - p_hold_B
+    p_break_B = 1 - p_hold_A
+    
+    # p_set pour A (proba que A gagne le set)
+    num = p_hold_A * p_break_A
+    den = p_hold_B * p_break_B + 1e-10
+    r = num / den
+    p_set_A = np.clip(r / (1 + r), 0.05, 0.95)
+    
+    # ✅ FIX v5: p_set pour B = 1 - p_set_A
+    p_set_B = 1 - p_set_A
+    
+    best_of = safe_get_numpy("best_of_ta", 3.0).astype(int)
+    q_set_A = 1 - p_set_A
+    q_set_B = 1 - p_set_B
+    
+    # p_match pour A
+    p_match_A = np.where(
+        best_of == 5,
+        p_set_A**3 + 3 * p_set_A**3 * q_set_A + 6 * p_set_A**3 * q_set_A**2,
+        p_set_A**2 + 2 * p_set_A**2 * q_set_A
+    )
+    p_match_A = np.clip(p_match_A, 0.01, 0.99)
+    
+    # ✅ FIX v5: p_match pour B = 1 - p_match_A
+    p_match_B = 1 - p_match_A
+    
+    # Handle NaN
+    n_nan = np.isnan(p_match_A).sum()
+    if n_nan > 0:
+        print(f"  ⚠️ {n_nan} NaN détectés, remplacement par 0.5")
+        p_match_A = np.where(np.isnan(p_match_A), 0.5, p_match_A)
+        p_match_B = np.where(np.isnan(p_match_B), 0.5, p_match_B)
+        p_set_A = np.where(np.isnan(p_set_A), 0.5, p_set_A)
+        p_set_B = np.where(np.isnan(p_set_B), 0.5, p_set_B)
+    
+    # ✅ FIX v5: Créer TOUTES les versions A ET B
+    df = df.with_columns([
+        # P(hold) - déjà pairé
+        pl.Series("markov_p_hold_A", p_hold_A).cast(pl.Float32),
+        pl.Series("markov_p_hold_B", p_hold_B).cast(pl.Float32),
+        
+        # P(set) - maintenant pairé ✅
+        pl.Series("markov_p_set_A", p_set_A).cast(pl.Float32),
+        pl.Series("markov_p_set_B", p_set_B).cast(pl.Float32),
+        
+        # P(match) - maintenant pairé ✅
+        pl.Series("markov_p_match_A", p_match_A).cast(pl.Float32),
+        pl.Series("markov_p_match_B", p_match_B).cast(pl.Float32),
+        
+        # Edge (avantage) - maintenant pairé ✅
+        pl.Series("markov_edge_A", p_match_A - 0.5).cast(pl.Float32),
+        pl.Series("markov_edge_B", p_match_B - 0.5).cast(pl.Float32),
+        
+        # Fair odds - déjà pairé
+        pl.Series("markov_fair_odds_A", 1.0 / (p_match_A + 0.001)).cast(pl.Float32),
+        pl.Series("markov_fair_odds_B", 1.0 / (p_match_B + 0.001)).cast(pl.Float32),
+    ])
+    
+    print(f"  ✅ Markov features added (v5 avec versions _A ET _B)")
+    print(f"     p_match_A: mean={np.mean(p_match_A):.4f}, std={np.std(p_match_A):.4f}")
+    print(f"     p_match_B: mean={np.mean(p_match_B):.4f}, std={np.std(p_match_B):.4f}")
+    
+    return df
+
+
+# ===============================================
+# SECTION 3: INTRA-TOURNAMENT (when/then natif)
+# ===============================================
+
+def add_intra_tournament_momentum(df: pl.DataFrame) -> pl.DataFrame:
+    """Momentum intra-tournoi - SELF-CONTAINED."""
+    print("\n[3/8] Adding Intra-Tournament Momentum features...")
+    
+    has_rounds = "rounds_played_approx_A" in df.columns
+    has_fatigue = "cumulative_fatigue_index_A" in df.columns
+    has_round = "round_ta" in df.columns
+    
+    print(f"  rounds_played_approx: {'✅' if has_rounds else '❌ (will create)'}")
+    print(f"  cumulative_fatigue: {'✅' if has_fatigue else '❌ (will create)'}")
+    print(f"  round_ta: {'✅' if has_round else '❌'}")
+    
+    if has_round:
+        df = df.with_columns([
+            get_round_difficulty_expr("round_ta").alias("round_difficulty")
+        ])
+        print("  ✅ round_difficulty created (when/then natif)")
+    
+    if not has_rounds and "round_difficulty" in df.columns:
+        df = df.with_columns([
+            (pl.col("round_difficulty") - 1).clip(0, 6).cast(pl.Int8).alias("rounds_played_approx_A"),
+            (pl.col("round_difficulty") - 1).clip(0, 6).cast(pl.Int8).alias("rounds_played_approx_B"),
+        ])
+        has_rounds = True
+        print("  ✅ rounds_played_approx created")
+    
+    if not has_fatigue and has_rounds:
+        df = df.with_columns([
+            (pl.col("rounds_played_approx_A") / 7.0).cast(pl.Float32).alias("cumulative_fatigue_index_A"),
+            (pl.col("rounds_played_approx_B") / 7.0).cast(pl.Float32).alias("cumulative_fatigue_index_B"),
+        ])
+        has_fatigue = True
+        print("  ✅ cumulative_fatigue_index created")
+    
+    if has_fatigue:
+        df = df.with_columns([
+            (pl.col("cumulative_fatigue_index_B") - pl.col("cumulative_fatigue_index_A"))
+            .cast(pl.Float32)
+            .alias("fatigue_momentum_A")
+        ])
+    
+    if has_rounds:
+        df = df.with_columns([
+            (pl.col("rounds_played_approx_A") - pl.col("rounds_played_approx_B"))
+            .cast(pl.Int8)
+            .alias("rounds_played_diff"),
+        ])
+        
+        if "round_difficulty" in df.columns:
+            df = df.with_columns([
+                (pl.col("rounds_played_approx_A") * pl.col("round_difficulty") / 10)
+                .cast(pl.Float32)
+                .alias("deep_run_confidence_A"),
+                (1 - pl.col("cumulative_fatigue_index_A").fill_nan(0).fill_null(0))
+                .cast(pl.Float32)
+                .alias("freshness_factor_A"),
+                (1 - pl.col("cumulative_fatigue_index_B").fill_nan(0).fill_null(0))
+                .cast(pl.Float32)
+                .alias("freshness_factor_B"),
+            ])
+    
+    return df
+
+
+# ===============================================
+# SECTION 4: FORM SLOPE
+# ===============================================
+
+def add_form_slope_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Form slope = short_term - long_term."""
+    print("\n[4/8] Adding Form Slope features...")
+    
+    for suffix in ["_A", "_B"]:
+        r5_wr = next((c for c in df.columns if "r5" in c.lower() and "win_rate" in c.lower() and c.endswith(suffix)), None)
+        r20_wr = next((c for c in df.columns if "r20" in c.lower() and "win_rate" in c.lower() and c.endswith(suffix)), None)
+        
+        if r5_wr and r20_wr:
+            df = df.with_columns([
+                ((pl.col(r5_wr).fill_nan(0.5).fill_null(0.5) - 
+                  pl.col(r20_wr).fill_nan(0.5).fill_null(0.5)) / 
+                 (pl.col(r20_wr).fill_nan(0.5).fill_null(0.5) + 0.01))
+                .clip(-1, 1)
+                .cast(pl.Float32)
+                .alias(f"form_slope{suffix}")
+            ])
+            print(f"  ✅ form_slope{suffix} from {r5_wr}, {r20_wr}")
+        else:
+            df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias(f"form_slope{suffix}")])
+            print(f"  ⚠️ form_slope{suffix} defaulted")
+    
+    if "form_slope_A" in df.columns and "form_slope_B" in df.columns:
+        df = df.with_columns([
+            (pl.col("form_slope_A") - pl.col("form_slope_B"))
+            .cast(pl.Float32)
+            .alias("form_slope_diff")
+        ])
+    
+    return df
+
+
+# ===============================================
+# SECTION 5: HANDEDNESS (Détection dynamique)
+# ===============================================
+
+def add_handedness_matchup(df: pl.DataFrame) -> pl.DataFrame:
+    """Handedness matchup - détection dynamique."""
+    print("\n[5/8] Adding Handedness matchup features...")
+    
+    has_hand_A = "hand_A" in df.columns
+    has_hand_B = "hand_B" in df.columns
+    
+    if not (has_hand_A and has_hand_B):
+        if PLAYERS_MASTER.exists():
+            print(f"  📁 Loading handedness from {PLAYERS_MASTER.name}...")
+            
+            players = pl.read_csv(PLAYERS_MASTER)
+            print(f"     Loaded {len(players)} players")
+            
+            id_col = "atp_id_ref" if "atp_id_ref" in players.columns else "generated_id"
+            hand_col = "plays_hand" if "plays_hand" in players.columns else None
+            
+            if hand_col and id_col:
+                players_hand = players.select([
+                    pl.col(id_col).cast(pl.Utf8).alias("player_id"),
+                    pl.col(hand_col).alias("hand_raw")
+                ]).unique()
+                
+                players_hand = players_hand.with_columns([
+                    pl.when(pl.col("hand_raw").str.to_lowercase().str.contains("left"))
+                      .then(pl.lit("L"))
+                      .when(pl.col("hand_raw").str.to_lowercase().str.contains("right"))
+                      .then(pl.lit("R"))
+                      .otherwise(pl.lit("R"))
+                      .alias("hand")
+                ]).drop("hand_raw")
+                
+                n_left = (players_hand["hand"] == "L").sum()
+                n_right = (players_hand["hand"] == "R").sum()
+                print(f"     Handedness: {n_right} Right, {n_left} Left ({100*n_left/(n_left+n_right+1):.1f}% lefties)")
+                
+                # Détection dynamique
+                winner_col = next((c for c in df.columns 
+                                   if "winner" in c.lower() and "id" in c.lower() 
+                                   and "name" not in c.lower()), None)
+                loser_col = next((c for c in df.columns 
+                                  if "loser" in c.lower() and "id" in c.lower()
+                                  and "name" not in c.lower()), None)
+                
+                print(f"     ID columns: winner={winner_col}, loser={loser_col}")
+                
+                if winner_col:
+                    df = df.with_columns([pl.col(winner_col).cast(pl.Utf8).alias("_winner_id_str")])
+                    players_A = players_hand.rename({"player_id": "_winner_id_str", "hand": "hand_A"})
+                    df = df.join(players_A, on="_winner_id_str", how="left")
+                    df = df.drop("_winner_id_str")
+                    has_hand_A = "hand_A" in df.columns
+                
+                if loser_col:
+                    df = df.with_columns([pl.col(loser_col).cast(pl.Utf8).alias("_loser_id_str")])
+                    players_B = players_hand.rename({"player_id": "_loser_id_str", "hand": "hand_B"})
+                    df = df.join(players_B, on="_loser_id_str", how="left")
+                    df = df.drop("_loser_id_str")
+                    has_hand_B = "hand_B" in df.columns
+                
+                if has_hand_A:
+                    df = df.with_columns([pl.col("hand_A").fill_null("R")])
+                if has_hand_B:
+                    df = df.with_columns([pl.col("hand_B").fill_null("R")])
+                
+                if has_hand_A and has_hand_B:
+                    lefty_A = (df["hand_A"] == "L").sum()
+                    lefty_B = (df["hand_B"] == "L").sum()
+                    print(f"     After merge: {lefty_A} lefties in A, {lefty_B} in B")
+    
+    if has_hand_A and has_hand_B:
+        df = df.with_columns([
+            pl.when((pl.col("hand_A") == "L") & (pl.col("hand_B") == "R"))
+              .then(pl.lit(0.03))
+              .when((pl.col("hand_A") == "R") & (pl.col("hand_B") == "L"))
+              .then(pl.lit(-0.03))
+              .otherwise(pl.lit(0.0))
+              .cast(pl.Float32)
+              .alias("handedness_advantage_A"),
+            ((pl.col("hand_A") == "L") | (pl.col("hand_B") == "L"))
+              .cast(pl.Int8)
+              .alias("is_lefty_matchup"),
+            ((pl.col("hand_A") == "L") & (pl.col("hand_B") == "L"))
+              .cast(pl.Int8)
+              .alias("is_both_lefty"),
+        ])
+        print(f"  ✅ Handedness features added")
+    else:
+        df = df.with_columns([
+            pl.lit(0.0).cast(pl.Float32).alias("handedness_advantage_A"),
+            pl.lit(0).cast(pl.Int8).alias("is_lefty_matchup"),
+            pl.lit(0).cast(pl.Int8).alias("is_both_lefty"),
+        ])
+        print("  ⚠️ Handedness defaulted")
+    
+    return df
+
+
+# ===============================================
+# SECTION 6: AGE-PEAK
+# ===============================================
+
+def add_age_peak_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Age-peak distance features - VERSION NASA STRICT.
+
+    ✅ FIX: N'autorise QUE age_at_match_A/B (pas de fallback dangereux)
+    ✅ NaN-safe + null-safe
+    """
+    print("\n[6/8] Adding Age-Peak features (NASA-safe STRICT)...")
+
+    PEAK_AGE = 27.0
+
+    # ✅ Whitelist STRICTE
+    age_A = "age_at_match_A" if "age_at_match_A" in df.columns else None
+    age_B = "age_at_match_B" if "age_at_match_B" in df.columns else None
+
+    print(f"  🔍 age_A column: {age_A}")
+    print(f"  🔍 age_B column: {age_B}")
+
+    if not (age_A and age_B):
+        print("  ⚠️ age_at_match_A/B not found - defaulting to null")
+        return df.with_columns([
+            pl.lit(1).cast(pl.Int8).alias("age_missing_A"),
+            pl.lit(1).cast(pl.Int8).alias("age_missing_B"),
+            pl.lit(None).cast(pl.Float32).alias("age_from_peak_A"),
+            pl.lit(None).cast(pl.Float32).alias("age_from_peak_B"),
+            pl.lit(None).cast(pl.Float32).alias("age_peak_advantage_A"),
+            pl.lit(0.0).cast(pl.Float32).alias("career_trajectory_advantage_A"),
+            pl.lit("unknown").alias("career_phase_A"),
+            pl.lit("unknown").alias("career_phase_B"),
+        ])
+
+    # Diagnostic
+    null_rate_A = df[age_A].is_null().mean()
+    nan_rate_A = df[age_A].is_nan().mean() if df[age_A].dtype.is_float() else 0.0
+    null_rate_B = df[age_B].is_null().mean()
+    nan_rate_B = df[age_B].is_nan().mean() if df[age_B].dtype.is_float() else 0.0
+
+    print(f"  📊 {age_A}: null={null_rate_A:.1%}, nan={nan_rate_A:.1%}")
+    print(f"  📊 {age_B}: null={null_rate_B:.1%}, nan={nan_rate_B:.1%}")
+
+    # Helpers
+    def is_missing(expr: pl.Expr) -> pl.Expr:
+        return expr.is_null() | expr.is_nan()
+
+    # Cast âge en float (safe)
+    df = df.with_columns([
+        pl.col(age_A).cast(pl.Float32).alias("_ageA"),
+        pl.col(age_B).cast(pl.Float32).alias("_ageB"),
+    ])
+
+    # Features
+    df = df.with_columns([
+        is_missing(pl.col("_ageA")).cast(pl.Int8).alias("age_missing_A"),
+        is_missing(pl.col("_ageB")).cast(pl.Int8).alias("age_missing_B"),
+
+        pl.when(is_missing(pl.col("_ageA")))
+          .then(pl.lit(None))
+          .otherwise((pl.col("_ageA") - PEAK_AGE).abs())
+          .cast(pl.Float32)
+          .alias("age_from_peak_A"),
+
+        pl.when(is_missing(pl.col("_ageB")))
+          .then(pl.lit(None))
+          .otherwise((pl.col("_ageB") - PEAK_AGE).abs())
+          .cast(pl.Float32)
+          .alias("age_from_peak_B"),
+
+        pl.when(is_missing(pl.col("_ageA")))
+          .then(pl.lit("unknown"))
+          .when(pl.col("_ageA") < 25).then(pl.lit("rising"))
+          .when(pl.col("_ageA") > 30).then(pl.lit("declining"))
+          .otherwise(pl.lit("peak"))
+          .alias("career_phase_A"),
+
+        pl.when(is_missing(pl.col("_ageB")))
+          .then(pl.lit("unknown"))
+          .when(pl.col("_ageB") < 25).then(pl.lit("rising"))
+          .when(pl.col("_ageB") > 30).then(pl.lit("declining"))
+          .otherwise(pl.lit("peak"))
+          .alias("career_phase_B"),
+    ])
+
+    df = df.with_columns([
+        (pl.col("age_from_peak_B") - pl.col("age_from_peak_A"))
+        .cast(pl.Float32)
+        .alias("age_peak_advantage_A"),
+
+        pl.when((pl.col("career_phase_A") == "rising") & (pl.col("career_phase_B") == "declining"))
+          .then(pl.lit(0.05))
+          .when((pl.col("career_phase_A") == "declining") & (pl.col("career_phase_B") == "rising"))
+          .then(pl.lit(-0.05))
+          .otherwise(pl.lit(0.0))
+          .cast(pl.Float32)
+          .alias("career_trajectory_advantage_A"),
+    ])
+
+    # Cleanup
+    df = df.drop(["_ageA", "_ageB"])
+
+    # Stats finales
+    missing_rate = df["age_missing_A"].mean()
+    peak_coverage = df["age_from_peak_A"].is_not_null().mean()
+    print(f"  ✅ Age-Peak features added (NASA-safe STRICT)")
+    print(f"     Missing rate: {missing_rate:.1%}")
+    print(f"     age_from_peak coverage: {peak_coverage:.1%}")
+
+    return df
+
+
+
+
+# ===============================================
+# SECTION 7: PRESSURE DIFFERENTIAL
+# ===============================================
+
+def add_pressure_differential(df: pl.DataFrame) -> pl.DataFrame:
+    """Pressure differential features."""
+    print("\n[7/8] Adding Pressure Differential features...")
+    
+    for suffix in ["_A", "_B"]:
+        bp_saved = find_col(df, ["bp_saved", "bpsaved"], suffix)
+        baseline = next((c for c in df.columns if "win_rate" in c.lower() and "r20" in c.lower() and c.endswith(suffix)), None)
+        
+        if bp_saved and baseline:
+            df = df.with_columns([
+                (pl.col(bp_saved).fill_nan(0.6).fill_null(0.6) - 
+                 pl.col(baseline).fill_nan(0.5).fill_null(0.5))
+                .cast(pl.Float32)
+                .alias(f"clutch_differential{suffix}")
+            ])
+            print(f"  ✅ clutch_differential{suffix} added")
+        else:
+            df = df.with_columns([pl.lit(0.0).cast(pl.Float32).alias(f"clutch_differential{suffix}")])
+            print(f"  ⚠️ clutch_differential{suffix} defaulted")
+    
+    if "clutch_differential_A" in df.columns and "clutch_differential_B" in df.columns:
+        df = df.with_columns([
+            (pl.col("clutch_differential_A") - pl.col("clutch_differential_B"))
+            .cast(pl.Float32)
+            .alias("clutch_advantage_A")
+        ])
+    
+    return df
+
+
+# ===============================================
+# SECTION 8: ROUND FEATURES
+# ===============================================
+
+def add_round_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Round-based features (when/then natif)."""
+    print("\n[8/8] Adding Round features...")
+    
+    if "round_ta" in df.columns:
+        round_expr = pl.col("round_ta").str.to_uppercase()
+        
+        df = df.with_columns([
+            pl.when(round_expr == "R128").then(1)
+              .when(round_expr == "R64").then(2)
+              .when(round_expr == "R32").then(3)
+              .when(round_expr == "R16").then(4)
+              .when(round_expr == "QF").then(5)
+              .when(round_expr == "SF").then(6)
+              .when(round_expr == "F").then(7)
+              .when(round_expr == "RR").then(3)
+              .otherwise(3)
+              .cast(pl.Int8)
+              .alias("round_ordinal"),
+            (round_expr.is_in(["SF", "F"])).cast(pl.Int8).alias("is_late_round"),
+            (round_expr == "F").cast(pl.Int8).alias("is_final"),
+        ])
+        print("  ✅ Round features added")
+    else:
+        print("  ⚠️ round_ta not found")
+    
+    return df
+
+
+# ===============================================
+# MAIN
+# ===============================================
+
+def main():
+    t0 = time.perf_counter()
+    
+    print("\n" + "=" * 70)
+    print("   PP_08B - ULTIMATE GOD SOTA FEATURES 2026 v5")
+    print("   TennisTitan - Markov _B fix + NaN handling")
+    print("=" * 70)
+    print(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+    
+    # Load
+    print("\n[0/8] Loading best SOTA file...")
+    input_path = None
+    for path in SOTA_CANDIDATES:
+        if path.exists():
+            input_path = path
+            print(f"  ✅ Using: {path.name}")
+            break
+    
+    if input_path is None:
+        print("  ❌ No SOTA file found!")
+        return None
+    
+    df = pl.read_parquet(input_path)
+    initial_cols = len(df.columns)
+    print(f"  Shape: {df.shape}")
+    
+    # ORDRE IMPORTANT: SRGS d'abord car Markov l'utilise!
+    df = add_srgs_features(df)
+    df = add_full_markov_features(df)
+    df = add_intra_tournament_momentum(df)
+    df = add_form_slope_features(df)
+    df = add_handedness_matchup(df)
+    df = add_age_peak_features(df)
+    df = add_pressure_differential(df)
+    df = add_round_features(df)
+    
+    # Save
+    output_path = ML_READY_DIR / "matches_ml_ready_SOTA_v5.parquet"
+    df.write_parquet(output_path, compression="zstd")
+    
+    new_cols = len(df.columns) - initial_cols
+    elapsed = time.perf_counter() - t0
+    
+    print(f"\n" + "=" * 70)
+    print(f"   ✅ PP_08 v5 COMPLETE!")
+    print(f"=" * 70)
+    print(f"   Input: {input_path.name} ({initial_cols} cols)")
+    print(f"   Output: {output_path.name} ({len(df.columns)} cols)")
+    print(f"   New features: +{new_cols}")
+    print(f"   ⏱️  Time: {elapsed:.1f}s")
+    
+    # Summary
+    print(f"\n📊 GOD SOTA FEATURES ADDED:")
+    feature_groups = [
+        ("srgs", "SRGS"),
+        ("markov", "Markov"),
+        ("momentum", "Momentum"),
+        ("form_slope", "Form Slope"),
+        ("handed", "Handedness"),
+        ("age_", "Age-Peak"),
+        ("clutch", "Clutch"),
+        ("round_", "Round"),
+    ]
+    
+    for prefix, name in feature_groups:
+        cols = [c for c in df.columns if prefix in c.lower()]
+        if cols:
+            print(f"   ✅ {name}: {len(cols)} features")
+    
+    # Validation Markov pairing
+    markov_A = [c for c in df.columns if c.startswith("markov_") and c.endswith("_A")]
+    markov_B = [c for c in df.columns if c.startswith("markov_") and c.endswith("_B")]
+    print(f"\n📋 MARKOV PAIRING CHECK:")
+    print(f"   _A features: {len(markov_A)} → {markov_A}")
+    print(f"   _B features: {len(markov_B)} → {markov_B}")
+    if len(markov_A) == len(markov_B):
+        print(f"   ✅ Markov features properly paired!")
+    else:
+        print(f"   ⚠️ Markov pairing mismatch!")
+    
+    print(f"""
+📋 CORRECTIONS v5:
+   ✅ Markov: Ajout des versions _B (p_set_B, p_match_B, edge_B)
+   ✅ fill_nan() + fill_null() partout
+   ✅ when/then natif
+   ✅ Détection dynamique IDs
+""")
+    
+    return df
+
+
+if __name__ == "__main__":
+    main()

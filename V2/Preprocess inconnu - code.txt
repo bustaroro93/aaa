@@ -1,0 +1,178 @@
+"""
+===============================================
+MERGE GLOBAL - TOUTES LES NOUVELLES FEATURES
+===============================================
+Merge tous les nouveaux modules dans ML_READY:
+- PP03B v2 (Backhand, Physical, Duration)
+- PP03C (Glicko vs Opponent Hand)
+- PP05B (SSI Multi-facteur)
+- PP07B (SET Dynamics)
+
+À exécuter APRÈS avoir lancé tous les modules individuels.
+===============================================
+"""
+
+import polars as pl
+from pathlib import Path
+import time
+from datetime import datetime
+
+# ===============================================
+# CONFIGURATION
+# ===============================================
+ROOT = Path.cwd()
+DATA_CLEAN = ROOT / "data_clean"
+FEATURES_DIR = DATA_CLEAN / "features"
+
+# Input ML_READY (le plus récent)
+ML_READY_DIR = DATA_CLEAN / "ml_ready"
+
+# Feature files to merge
+FEATURE_SOURCES = {
+    "PP03B": FEATURES_DIR / "player_attributes" / "player_attributes_v2_match_level.parquet",
+    "PP05B": FEATURES_DIR / "ssi_multi" / "ssi_multi_match_level.parquet",
+    "PP07B": FEATURES_DIR / "set_dynamics" / "set_dynamics_match_level.parquet",
+}
+
+
+def find_latest_ml_ready() -> Path:
+    """Trouve le fichier ML_READY le plus récent."""
+    files = list(ML_READY_DIR.glob("*.parquet"))
+    if not files:
+        return None
+    return sorted(files, key=lambda x: x.stat().st_mtime)[-1]
+
+
+def merge_feature_file(df: pl.DataFrame, feature_path: Path, name: str) -> pl.DataFrame:
+    """Merge un fichier de features."""
+    if not feature_path.exists():
+        print(f"  ⚠️ {name}: File not found - {feature_path}")
+        return df
+    
+    print(f"\n  📦 {name}: {feature_path.name}")
+    
+    features = pl.read_parquet(feature_path)
+    print(f"     Shape: {features.shape}")
+    
+    # Trouver la clé de jointure
+    possible_keys = ["custom_match_id", "match_id_ta_dedup", "match_id", "match_key"]
+    join_key = None
+    
+    for key in possible_keys:
+        if key in df.columns and key in features.columns:
+            join_key = key
+            break
+    
+    if join_key is None:
+        print(f"     ❌ No common join key found!")
+        return df
+    
+    print(f"     Join key: {join_key}")
+    
+    # Colonnes à exclure (déjà présentes ou IDs)
+    exclude = {join_key, "custom_match_id", "match_id_ta_dedup", "match_key",
+               "winner_id", "loser_id", "tourney_date_ta", "year"}
+    
+    # Colonnes à merger
+    feature_cols = [c for c in features.columns if c not in exclude]
+    
+    # Vérifier doublons
+    already = [c for c in feature_cols if c in df.columns]
+    new_cols = [c for c in feature_cols if c not in df.columns]
+    
+    if already:
+        print(f"     ⏭️ Skipping {len(already)} existing columns")
+    
+    print(f"     ✅ Adding {len(new_cols)} new columns")
+    
+    if not new_cols:
+        return df
+    
+    # Merge
+    features_to_merge = features.select([join_key] + new_cols)
+    df = df.join(features_to_merge, on=join_key, how="left")
+    
+    # Stats
+    for col in new_cols[:3]:
+        cov = df[col].is_not_null().mean() if df[col].dtype != pl.Utf8 else 1.0
+        print(f"        {col}: {100*cov:.1f}% coverage")
+    
+    if len(new_cols) > 3:
+        print(f"        ... and {len(new_cols) - 3} more")
+    
+    return df
+
+
+def main():
+    print("\n" + "=" * 70)
+    print("   MERGE GLOBAL - NOUVELLES FEATURES")
+    print("=" * 70)
+    print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+    
+    start = time.time()
+    
+    # 1. Find ML_READY
+    ml_ready_path = find_latest_ml_ready()
+    if ml_ready_path is None:
+        print("\n❌ No ML_READY file found!")
+        return
+    
+    print(f"\n[1] Loading ML_READY: {ml_ready_path.name}")
+    df = pl.read_parquet(ml_ready_path)
+    print(f"    Shape: {df.shape}")
+    
+    original_cols = len(df.columns)
+    
+    # 2. Merge each feature source
+    print("\n[2] Merging feature sources...")
+    
+    for name, path in FEATURE_SOURCES.items():
+        df = merge_feature_file(df, path, name)
+    
+    # 3. Summary
+    new_cols = len(df.columns) - original_cols
+    
+    print("\n" + "=" * 70)
+    print("   SUMMARY")
+    print("=" * 70)
+    print(f"  Original columns: {original_cols}")
+    print(f"  New columns: {new_cols}")
+    print(f"  Final columns: {len(df.columns)}")
+    print(f"  Shape: {df.shape}")
+    
+    # 4. Save
+    # Déterminer nouvelle version
+    current_name = ml_ready_path.stem
+    parts = current_name.split("_")
+    
+    # Chercher le numéro de version
+    new_version = "v99"
+    for i, p in enumerate(parts):
+        if p.startswith("v") and p[1:].isdigit():
+            new_version = f"v{int(p[1:]) + 1}"
+            parts[i] = new_version
+            break
+    
+    new_name = "_".join(parts)
+    output_path = ML_READY_DIR / f"{new_name}.parquet"
+    
+    print(f"\n[3] Saving: {output_path.name}")
+    df.write_parquet(output_path)
+    print(f"    ✅ Saved!")
+    
+    elapsed = time.time() - start
+    
+    print("\n" + "=" * 70)
+    print("   MERGE COMPLETE")
+    print("=" * 70)
+    print(f"   Input:  {ml_ready_path.name}")
+    print(f"   Output: {output_path.name}")
+    print(f"   Time:   {elapsed:.1f}s")
+    print("=" * 70)
+    
+    print(f"\n   ➡️  NEXT: Re-run PP09/PP10 with {output_path.name}")
+
+
+if __name__ == "__main__":
+    main()

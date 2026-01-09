@@ -1,0 +1,217 @@
+======================================================================
+   TENNISTITAN 2026 - PREPROCESS 2.1 GODMODE (FIXED)
+   Polars Edition - 3 Leakage Bugs Corrected
+======================================================================
+   ROOT: C:\Users\Administrateur\Tennis POLAR v3
+   MB_DIR: C:\Users\Administrateur\Tennis POLAR v3\data_clean\matches_base_scaled
+   GENDER: atp
+======================================================================
+
+   🔧 CORRECTIONS APPLIQUÉES:
+   1. win_streak_current: len().over() → cum_sum().over()
+   2. max_win_streak_30d: ajout shift(1) après rolling_max
+   3. streak_norm: min/max global → clip fixe [-20, 20]
+
+
+======================================================================
+SECTION A: RATINGS SRV/RET LAYER
+======================================================================
+[1/5] Loading matches_base...
+  Loaded: 544,245 rows
+[2/5] Cleaning % columns...
+  [w_rpw_f] non-null=185,920 | NaN rate=65.8%
+  [l_rpw_f] non-null=178,096 | NaN rate=67.3%
+[3/5] Computing surface biases...
+  Global bias: 0.00 (fixed, no lookahead)
+  Hard: 0.00 (fixed)
+  Clay: 0.00 (fixed)
+  Grass: 0.00 (fixed)
+  Carpet: 0.00 (fixed)
+  After sort: 544,245 rows
+[4/5] Computing SRV/RET ratings (sequential)...
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:383: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  .replace(ROUND_ORDER, default=4)
+  Processed 100,000 / 544,245
+  Processed 200,000 / 544,245
+  Processed 300,000 / 544,245
+  Processed 400,000 / 544,245
+  Processed 500,000 / 544,245
+  Generated 1,088,490 feature rows
+[5/5] Writing output...
+
+✅ ratings_srvret_layer → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\ratings_srvret_layer
+   Shape: (1088490, 38)
+   Time: 1260.9s
+
+======================================================================
+SECTION B: PSYCHOLOGICAL & MOMENTUM FEATURES (FIXED)
+======================================================================
+[1/4] Loading matches_base...
+  Loaded 543,971 rows
+[2/4] Creating long format...
+  Long format: 1,087,942 rows
+[3/4] Computing features...
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:991: DeprecationWarning: the argument `min_periods` for `Expr.rolling_sum` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_sum(window_size=w, min_periods=1)
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1040: DeprecationWarning: the argument `min_periods` for `Expr.rolling_max` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_max(window_size=10, min_periods=1)
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1047: DeprecationWarning: the argument `min_periods` for `Expr.rolling_max` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_max(window_size=10, min_periods=1)
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1068: DeprecationWarning: the argument `min_periods` for `Expr.rolling_mean` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_mean(window_size=w, min_periods=5)
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1087: DeprecationWarning: the argument `min_periods` for `Expr.rolling_mean` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  pl.col("upset_top10_prev").rolling_mean(window_size=20, min_periods=3).over("player_id").alias("upset_rate_vs_top10_r20"),
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1088: DeprecationWarning: the argument `min_periods` for `Expr.rolling_mean` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  pl.col("upset_top50_prev").rolling_mean(window_size=20, min_periods=5).over("player_id").alias("upset_rate_vs_top50_r20"),
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1110: DeprecationWarning: the argument `min_periods` for `Expr.rolling_mean` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  pl.col("tb_won_prev").rolling_mean(window_size=20, min_periods=5).over("player_id").alias("clutch_tb_r20"),
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1111: DeprecationWarning: the argument `min_periods` for `Expr.rolling_mean` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  pl.col("bp_save_prev").rolling_mean(window_size=10, min_periods=5).over("player_id").alias("clutch_bp_save_r10"),
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1129: DeprecationWarning: the argument `min_periods` for `Expr.rolling_mean` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  pl.col("comeback_prev").rolling_mean(window_size=20, min_periods=3).over("player_id").alias("comeback_rate_r20")
+[4/4] Writing output...
+
+✅ psychological_momentum → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\psychological_momentum
+   Shape: (1087942, 21)
+
+📊 SANITY CHECK (valeurs attendues réalistes):
+   win_streak_current: min=-37.0, max=45.0
+   win_streak_5: mean=2.46 (attendu: ~2.5)
+   upset_rate_r20: mean=0.167 (attendu: ~0.1-0.3)
+   clutch_score: mean=0.340 (attendu: ~0.4-0.6)
+   Time: 1.2s
+
+======================================================================
+SECTION C: ENVIRONMENTAL CONTEXT FEATURES
+======================================================================
+[1/3] Loading matches_base...
+  Loaded 544,245 rows
+[2/3] Computing features...
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1291: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  pl.col("tourney_slug_lower").replace(ALTITUDE_MAP, default=0).cast(pl.Int32).alias("altitude_m")
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1302: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  pl.col("tourney_slug_lower").replace(BALL_TYPE_MAP, default="unknown").alias("ball_type")
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1307: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  pl.col("ball_type").replace(ball_speed, default=0.70).cast(pl.Float32).alias("ball_speed_index"),
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1308: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  pl.col("ball_type").replace(ball_bounce, default=0.75).cast(pl.Float32).alias("ball_bounce_index"),
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1314: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  pl.col(surface_col).replace(SURFACE_BASE_SPEED, default=0.70).cast(pl.Float32).alias("court_speed_base")
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1353: DeprecationWarning: the `default` parameter for `replace` is deprecated. Use `replace_strict` instead to set a default while replacing values.
+(Deprecated in version 1.0.0)
+  pl.col("round_ta").cast(pl.Utf8).str.to_uppercase().replace(ROUND_TIME_PROXY, default=12).cast(pl.Int16).alias("estimated_match_hour")
+[3/3] Writing output...
+
+✅ environmental_context → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\environmental_context
+   Shape: (544245, 19)
+   Time: 0.9s
+
+======================================================================
+SECTION D: CHARTING STYLE FEATURES SOTA
+======================================================================
+[1/5] Loading charting_long...
+  Raw: 13,278,337 rows
+  After Overall filter: 12,930,959 rows
+[2/5] Pivoting charting stats...
+  Stats available: 27/27
+  Pivot shape: (14728, 29)
+[3/5] Loading participations...
+  Participations: 1,087,854 rows
+[4/5] Computing rolling features...
+  Join rate: 1.3%
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:1505: DeprecationWarning: the argument `min_periods` for `Expr.rolling_mean` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_mean(window_size=N, min_periods=1)
+[5/5] Writing output...
+
+✅ charting_style → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\charting_style
+   Shape: (1087854, 92)
+   Rolling features: 81
+   Derived features: 6
+   Time: 3.9s
+
+======================================================================
+SECTION A.5: BASE STATS ROLLING FEATURES
+======================================================================
+[1/6] Loading matches_base...
+  Loaded 543,971 rows
+[2/6] Identifying common stats (w_ AND l_)...
+  Common stats: 21/21
+[3/6] Cleaning percentage columns...
+[4/6] Creating long format...
+  Winner cols: ['custom_match_id', 'match_key', 'tourney_date_ta', 'year', 'player_id', 'ace', 'df', 'svpt', '1stIn', '1stWon', '2ndWon', 'bpSaved', 'bpFaced', 'ret_bp_converted', 'ret_bp_opportunities', 's_ace_p', 's_df_p', 's_1stIn_p', 's_1stWon_p', 's_2ndWon_p', 'ret_1stWon_p', 'ret_2ndWon_p', 'tpw_p', 'rpw_p', 'bp_conv_p', 'dr_p']
+  Loser cols: ['custom_match_id', 'match_key', 'tourney_date_ta', 'year', 'player_id', 'ace', 'df', 'svpt', '1stIn', '1stWon', '2ndWon', 'bpSaved', 'bpFaced', 'ret_bp_converted', 'ret_bp_opportunities', 's_ace_p', 's_df_p', 's_1stIn_p', 's_1stWon_p', 's_2ndWon_p', 'ret_1stWon_p', 'ret_2ndWon_p', 'tpw_p', 'rpw_p', 'bp_conv_p', 'dr_p']
+  Winner shape: (543971, 26)
+  Loser shape: (543971, 26)
+  Long format: 1,087,942 rows
+[5/6] Computing rolling features...
+C:\Users\Administrateur\AppData\Local\Temp\ipykernel_7196\2824816274.py:775: DeprecationWarning: the argument `min_periods` for `Expr.rolling_mean` is deprecated. It was renamed to `min_samples` in version 1.21.0.
+  .rolling_mean(window_size=N, min_periods=1)
+  Created 63 rolling features
+[6/6] Adding derived features...
+    ✅ r10_serve_strength computed
+    ✅ r10_return_strength computed
+  Derived features: 5
+  Writing output...
+
+✅ base_stats_rolling → C:\Users\Administrateur\Tennis POLAR v3\data_clean\features\base_stats_rolling
+   Shape: (1087942, 73)
+   Rolling features: 63
+   Derived features: 5
+   Coverage: 98.4%
+   Time: 3.3s
+
+📊 SANITY CHECK:
+   r10_s_ace_p: mean=0.061, std=0.041, coverage=56.3%
+   r10_s_1stWon_p: mean=0.686, std=0.074, coverage=49.8%
+   r10_rpw_p: mean=0.374, std=0.057, coverage=49.7%
+   r10_serve_strength: mean=0.442, std=0.037, coverage=100.0%
+   r10_return_strength: mean=0.387, std=0.041, coverage=100.0%
+
+======================================================================
+SECTION E: SANITY CHECKS
+======================================================================
+
+--- SRV/RET Layer ---
+  Rows: 1,088,490
+  ✅ SRV/RET checks
+
+--- Psychological Layer (FIXED) ---
+  Rows: 1,087,942
+  upset_rate_r20: 1,028,770 non-null
+  clutch_score: 1,087,942 non-null
+  mental_toughness_score: 1,087,942 non-null
+  win_streak_current: [-37.0, 45.0] (should be bounded)
+  ✅ Psychological checks
+
+--- Environmental Layer ---
+  Rows: 544,245
+  altitude_m > 0: 12,353
+  ✅ Environmental checks
+
+--- Charting Style Layer ---
+  Rows: 1,087,854
+  Rolling features: 81
+  ✅ Charting checks
+
+----------------------------------------
+🎉 Tous les sanity checks passés!
+
+======================================================================
+   PREPROCESS 2.1 COMPLET (FIXED)!
+======================================================================
+
+Features générées:
+  • ratings_srvret_layer: 65 fichiers
+  • psychological_momentum: 40 fichiers
+  • environmental_context: 65 fichiers
+  • charting_style: 36 fichiers
+
+⏱️  Temps total: 1272.0s (21.2 min)
+
+✅ Pipeline preprocess 03 terminé avec succès!
